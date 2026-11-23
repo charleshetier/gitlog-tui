@@ -1,0 +1,17 @@
+[package]
+name = "gitlogs-tui"
+version = "0.1.0"
+edition = "2024"
+description = "gitlog : graphe git interactif dans le terminal"
+
+[[bin]]
+name = "gitlog"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3.7", default-features = false }
+ratatui = "0.30"
+
+[profile.release]
+strip = true
