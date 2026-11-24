@@ -14,8 +14,9 @@ const MAX_BYTES: usize = 1000;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 /// Thème sombre aux teintes pastel : chacune reste lisible sur les fonds du diff.
+/// see https://docs.rs/two-face/latest/two_face/theme/enum.EmbeddedThemeName.html
 static THEME: LazyLock<Theme> =
-    LazyLock::new(|| two_face::theme::extra().get(EmbeddedThemeName::CatppuccinMocha).clone());
+    LazyLock::new(|| two_face::theme::extra().get(EmbeddedThemeName::Base16EightiesDark).clone());
 
 /// Où en est l'analyse d'une version du fichier : elle se poursuit d'une ligne à l'autre.
 #[derive(Clone, PartialEq)]
