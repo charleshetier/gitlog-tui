@@ -331,15 +331,18 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         }
 
         let lane_bg = if selected { LANE_SEL_BG } else { LANE_BG };
-        draw_graph_row(buf, area.x + 1, y, end, app.store.cells(row), graph_w as usize, nodes, lane_bg);
+        let oid = app.store.oid(row);
+        // Ce qui n'est pas encore commité reste en retrait : puce et nom en gris.
+        let grey = if selected { Color::Gray } else { DIM };
+        let tint = oid.is_worktree().then_some(grey);
+        draw_graph_row(buf, area.x + 1, y, end, app.store.cells(row), graph_w as usize, nodes, (lane_bg, tint));
 
         let color = palette(app.store.color(row));
-        let oid = app.store.oid(row);
         let meta = app.meta(row);
         let bright = if selected { Style::new().fg(Color::White) } else { Style::new() };
         if oid.is_worktree() {
-            // Ce qui n'est pas encore commité : ni hash, ni auteur, un nom en italique.
-            put(buf, text_x, y, end, &meta.subject, bright.add_modifier(Modifier::ITALIC));
+            // Ni hash, ni auteur : un nom en italique.
+            put(buf, text_x, y, end, &meta.subject, Style::new().fg(grey).add_modifier(Modifier::ITALIC));
             continue;
         }
         if show_hash {
@@ -727,7 +730,8 @@ fn put_code(
 }
 
 /// Dessine les cellules du graphe d'une ligne selon le style des commits.
-/// Chaque colonne active reçoit un fond `lane_bg`, large d'une cellule.
+/// Chaque colonne active reçoit un fond `lane_bg`, large d'une cellule. `tint`
+/// remplace la teinte des branches sur toute la ligne.
 #[allow(clippy::too_many_arguments)]
 fn draw_graph_row(
     buf: &mut Buffer,
@@ -737,7 +741,7 @@ fn draw_graph_row(
     cells: &[Cell],
     width: usize,
     nodes: NodeStyle,
-    lane_bg: Color,
+    (lane_bg, tint): (Color, Option<Color>),
 ) {
     let at = |i: usize| cells.get(i).copied().unwrap_or_default();
     for i in 0..width {
@@ -761,7 +765,7 @@ fn draw_graph_row(
             _ if cell.bits == 0 => continue,
             _ => (cell.glyph().encode_utf8(&mut glyph), cell.color, is_commit),
         };
-        let mut style = Style::new().fg(palette(color));
+        let mut style = Style::new().fg(tint.unwrap_or(palette(color)));
         if bold {
             style = style.add_modifier(Modifier::BOLD);
         }

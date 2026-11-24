@@ -626,7 +626,20 @@ fn uncommitted_changes_head_the_graph() {
     println!("{view}");
     let lines: Vec<&str> = view.lines().collect();
     assert!(lines[0].trim_end().ends_with("4 commits"), "{}", lines[0]);
-    assert!(lines[2].starts_with(" ● ") && lines[2].trim_end().ends_with("changes"), "{}", lines[2]);
+    assert!(lines[2].starts_with(" ● ") && lines[2].trim_end().ends_with("- changes -"), "{}", lines[2]);
+    // La puce et le nom sont en gris : plus clair sous la sélection, en retrait sinon.
+    let greys = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let name = lines[2].chars().position(|c| c == '-').unwrap() as u16;
+        (buffer[(1, 2)].fg, buffer[(name, 2)].fg, buffer[(1, 3)].fg)
+    };
+    use ratatui::style::Color;
+    assert_eq!(greys(&mut app), (Color::Gray, Color::Gray, Color::LightBlue));
+    app.apply(Action::Move(1));
+    assert_eq!(greys(&mut app), (Color::DarkGray, Color::DarkGray, Color::LightBlue));
+    app.apply(Action::Move(-1));
     assert!(lines[3].contains("Merge de feature"));
     assert_eq!(app.copy_target(), None, "pas de hash à copier");
 

@@ -316,7 +316,7 @@ impl App {
         let oid = self.store.oid(row);
         let meta = if oid.is_worktree() {
             // Ce qui n'est pas commité n'a ni auteur ni date : seulement un nom.
-            Meta { subject: "changes".to_string(), ..Meta::default() }
+            Meta { subject: "- changes -".to_string(), ..Meta::default() }
         } else {
             self.meta_reader.get(&oid)
         };
