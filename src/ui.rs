@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, FilesState, HierState, HitMap, NodeStyle};
+use crate::app::{App, FilesState, HierState, HitMap, NodeStyle, Prompt};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -152,8 +152,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let rule_top = area.y + 1;
     let body_y = area.y + 2;
-    let rule_bottom = area.bottom() - 2;
-    let body_h = rule_bottom - body_y;
+    // Pas de pied de page : le corps descend jusqu'au bas de l'écran, sauf la ligne
+    // du champ de recherche tant qu'une saisie ou une recherche est en cours.
+    let searching = app.hierarchy.is_none()
+        && (app.filter.is_some() || matches!(app.prompt, Some(Prompt::Input { .. })));
+    let body_h = area.bottom() - body_y - u16::from(searching);
+    let body_bottom = body_y + body_h;
     let dim = Style::new().fg(DIM);
     let two_way = app
         .pane
@@ -165,22 +169,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let split_at = if two_way { (area.width / 3).max(24).min(area.width / 2) } else { area.width / 2 };
     let divider = (app.pane.is_some() && app.hierarchy.is_none()).then(|| area.x + split_at);
 
-    for y in [rule_top, rule_bottom] {
-        for x in area.left()..area.right() {
-            put(buf, x, y, area.right(), "─", dim);
-        }
+    for x in area.left()..area.right() {
+        put(buf, x, rule_top, area.right(), "─", dim);
     }
     if let Some(x) = divider {
-        for y in area.y..rule_bottom {
+        for y in area.y..body_bottom {
             put(buf, x, y, area.right(), "│", dim);
         }
         put(buf, x, rule_top, area.right(), "┼", dim);
-        put(buf, x, rule_bottom, area.right(), "┴", dim);
     }
 
     if app.hierarchy.is_some() {
         draw_hierarchy(buf, app, Rect::new(area.x, area.y, area.width, 1), Rect::new(area.x, body_y, area.width, body_h));
-        draw_status(buf, app, Rect::new(area.x, area.bottom() - 1, area.width, 1));
+        draw_flash(buf, app, area);
         if app.help {
             draw_help(buf, area);
         }
@@ -201,7 +202,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_files(buf, app, body);
         }
     }
-    draw_status(buf, app, Rect::new(area.x, area.bottom() - 1, area.width, 1));
+    if searching {
+        draw_search_bar(buf, app, Rect::new(area.x, body_bottom, area.width, 1));
+    }
+    draw_flash(buf, app, area);
+    if let Some(Prompt::Kind { sign }) = app.prompt {
+        draw_search_menu(buf, Rect::new(area.x, body_y, area.width, body_h), sign);
+    }
     if app.help {
         draw_help(buf, area);
     }
@@ -231,6 +238,8 @@ fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
     let n = thousands(app.store.len());
     let count = if app.log_error.is_some() {
         "git error".to_string()
+    } else if app.log_done && app.store.len() == 1 {
+        "1 commit".to_string()
     } else if app.log_done {
         format!("{n} commits")
     } else if app.want_all {
@@ -259,7 +268,9 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     if len == 0 {
         let (text, style) = match &app.log_error {
             Some(err) => (err.clone(), Style::new().fg(Color::Red)),
+            None if app.log_done && app.filter.is_some() => ("No matching commits.".to_string(), dim),
             None if app.log_done => ("No commits.".to_string(), dim),
+            None if app.filter.is_some() => ("Searching…".to_string(), dim),
             None => ("Loading…".to_string(), dim),
         };
         put(buf, area.x + 1, area.y, end, &text, style);
@@ -751,12 +762,13 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("← →", "Scroll a diff sideways"),
     ("1 2 3", "Go to a level: graph, files, diff"),
     ("q", "Go back one level, quit from the graph"),
-    ("Esc", "Go back one level"),
+    ("Esc", "Go back one level, leave a search"),
     ("", ""),
     ("", "Actions"),
     ("y", "Copy the commit hash, or the file path when on a file"),
     ("h", "Branch hierarchy"),
-    ("s", "Commit style: dots or rail"),
+    ("s", "Search: c hash, m message, f file, h +h -h hunk"),
+    ("S", "Commit style: dots or rail"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),
     ("", ""),
@@ -767,21 +779,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Wheel", "Scroll the graph or the pane"),
 ];
 
-/// Panneau flottant des raccourcis, centré par-dessus la vue courante.
-fn draw_help(buf: &mut Buffer, area: Rect) {
-    let key_w = SHORTCUTS.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
-    let text_w = SHORTCUTS
-        .iter()
-        .map(|(keys, text)| if keys.is_empty() { width(text) } else { key_w + 2 + width(text) })
-        .max()
-        .unwrap_or(0);
-    let w = (text_w + 6).min(area.width);
-    let h = (SHORTCUTS.len() as u16 + 2).min(area.height);
-    let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+/// Cadre d'un panneau flottant : fond uni, titre en haut, rappel de fermeture en bas.
+fn draw_panel(buf: &mut Buffer, panel: Rect, title: &str, close: &str) {
+    if panel.is_empty() {
+        return;
+    }
     let base = Style::new().bg(PANEL_BG);
     let frame = base.fg(ACCENT);
     let (left, right, top, bottom) = (panel.x, panel.right() - 1, panel.y, panel.bottom() - 1);
-
     for y in top..=bottom {
         for x in left..=right {
             let symbol = match (x == left, x == right, y == top, y == bottom) {
@@ -797,9 +802,95 @@ fn draw_help(buf: &mut Buffer, area: Rect) {
             buf[(x, y)].set_symbol(symbol).set_style(frame);
         }
     }
-    put(buf, left + 2, top, right, " Keyboard shortcuts ", frame.add_modifier(Modifier::BOLD));
-    let close = " ? or Esc to close ";
+    put(buf, left + 2, top, right, title, frame.add_modifier(Modifier::BOLD));
     put_right(buf, left + 2, bottom, right.saturating_sub(1), close, base.fg(DIM));
+}
+
+/// Types de recherche du sous-menu : (touches, ce qui est examiné).
+const SEARCH_KINDS: &[(&str, &str)] = &[
+    ("c", "commit hash"),
+    ("m", "commit message"),
+    ("f", "file name"),
+    ("h", "hunk: any changed line"),
+    ("+h", "hunk: added lines"),
+    ("-h", "hunk: removed lines"),
+];
+
+/// Sous-menu de recherche, posé en bas à gauche au-dessus du champ de saisie.
+/// Après un `+` ou un `-`, seule la ligne qui peut encore suivre reste en évidence.
+fn draw_search_menu(buf: &mut Buffer, area: Rect, sign: Option<char>) {
+    let key_w = 2;
+    let text_w = SEARCH_KINDS.iter().map(|(_, text)| width(text)).max().unwrap_or(0);
+    let w = (key_w + 2 + text_w + 6).min(area.width);
+    let h = (SEARCH_KINDS.len() as u16 + 2).min(area.height);
+    let panel = Rect::new(area.x + 1.min(area.width - w), area.bottom() - h, w, h);
+    draw_panel(buf, panel, " Search ", " Esc to cancel ");
+    let base = Style::new().bg(PANEL_BG);
+    let (x0, right) = (panel.x + 3, panel.right() - 1);
+    for (i, (keys, text)) in SEARCH_KINDS.iter().enumerate().take(h.saturating_sub(2) as usize) {
+        let y = panel.y + 1 + i as u16;
+        let reachable = sign.is_none_or(|sign| keys.starts_with(sign));
+        let (key_style, text_style) = if reachable {
+            (base.fg(ACCENT).add_modifier(Modifier::BOLD), base)
+        } else {
+            (base.fg(DIM), base.fg(DIM))
+        };
+        put(buf, x0, y, right, keys, key_style);
+        put(buf, x0 + key_w + 2, y, right, text, text_style);
+    }
+}
+
+/// Champ de recherche, tout en bas : la saisie en cours, sinon la recherche appliquée
+/// et le nombre de commits trouvés.
+fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
+    let (kind, query, editing) = match (&app.prompt, &app.filter) {
+        (Some(Prompt::Input { kind, query }), _) => (*kind, query.as_str(), true),
+        (_, Some(filter)) => (filter.kind, filter.query.as_str(), false),
+        _ => return,
+    };
+    let base = Style::new().bg(PANEL_BG);
+    for x in area.left()..area.right() {
+        buf[(x, area.y)].reset();
+    }
+    buf.set_style(area, base);
+    let end = area.right() - 1;
+    let mut text_end = end;
+    if !editing {
+        let count = match app.store.len() {
+            _ if app.log_error.is_some() => "git error".to_string(),
+            n if !app.log_done => format!("searching… {}", thousands(n)),
+            0 => "no match".to_string(),
+            1 => "1 match".to_string(),
+            n => format!("{} matches", thousands(n)),
+        };
+        text_end = put_right(buf, area.x + 1, area.y, end, &count, base.fg(DIM)).saturating_sub(2);
+    }
+    let label = format!("{}:", kind.label());
+    let x = put(buf, area.x + 1, area.y, text_end, &label, base.fg(ACCENT).add_modifier(Modifier::BOLD)) + 1;
+    // Une saisie plus longue que le champ garde sa fin visible, curseur compris.
+    let room = text_end.saturating_sub(x + 1) as usize;
+    let length = query.chars().count();
+    let shown: String = query.chars().skip(length.saturating_sub(room)).collect();
+    let x = put(buf, x, area.y, text_end, &shown, base.fg(Color::White));
+    if editing {
+        put(buf, x, area.y, text_end, " ", Style::new().bg(Color::Gray));
+    }
+}
+
+/// Panneau flottant des raccourcis, centré par-dessus la vue courante.
+fn draw_help(buf: &mut Buffer, area: Rect) {
+    let key_w = SHORTCUTS.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
+    let text_w = SHORTCUTS
+        .iter()
+        .map(|(keys, text)| if keys.is_empty() { width(text) } else { key_w + 2 + width(text) })
+        .max()
+        .unwrap_or(0);
+    let w = (text_w + 6).min(area.width);
+    let h = (SHORTCUTS.len() as u16 + 2).min(area.height);
+    let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    draw_panel(buf, panel, " Keyboard shortcuts ", " ? or Esc to close ");
+    let base = Style::new().bg(PANEL_BG);
+    let (left, right, top) = (panel.x, panel.right() - 1, panel.y);
 
     let x0 = left + 3;
     for (i, (keys, text)) in SHORTCUTS.iter().enumerate().take(h.saturating_sub(2) as usize) {
@@ -813,27 +904,19 @@ fn draw_help(buf: &mut Buffer, area: Rect) {
     }
 }
 
-fn draw_status(buf: &mut Buffer, app: &mut App, area: Rect) {
-    // À droite, le rappel cliquable du panneau des raccourcis.
-    let help = "? help";
-    let help_x = put_right(buf, area.x + 1, area.y, area.right() - 1, help, Style::new().fg(DIM));
-    put(buf, help_x, area.y, area.right() - 1, "?", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
-    app.hit.help = Some(Rect::new(help_x, area.y, width(help), 1));
-    let end = help_x.saturating_sub(2);
-    if let Some(text) = app.flash() {
-        let style = Style::new().fg(Color::LightGreen).add_modifier(Modifier::BOLD);
-        put(buf, area.x + 1, area.y, end, text, style);
-        return;
+/// Message éphémère (copie, butée) : une pastille en bas à droite, par-dessus la vue.
+fn draw_flash(buf: &mut Buffer, app: &App, area: Rect) {
+    let Some(text) = app.flash() else { return };
+    let room = area.width.saturating_sub(4) as usize;
+    let text: String = text.chars().take(room).collect();
+    let text = format!(" {text} ");
+    let style = Style::new().fg(Color::LightGreen).bg(PANEL_BG).add_modifier(Modifier::BOLD);
+    let (y, end) = (area.bottom() - 1, area.right() - 1);
+    let x = end.saturating_sub(width(&text)).max(area.x);
+    for cell_x in x..end {
+        buf[(cell_x, y)].reset();
     }
-    let hints = match app.depth() {
-        _ if app.hierarchy.is_some() => {
-            "↑↓ move · Enter: go to the branch · h or q: back · green up to date · red needs rebase · gray merged"
-        }
-        1 => "↑↓ move · Enter or click: open the commit · y copy the hash · h hierarchy · s style · q quit",
-        2 => "↑↓ file · Enter or click: diff · n p next / previous commit · y copy the path · q close the pane",
-        _ => "↑↓ scroll · ←→ sideways · n p next / previous file · y copy the path · q back to the files",
-    };
-    put(buf, area.x + 1, area.y, end, hints, Style::new().fg(DIM));
+    put(buf, x, y, end, &text, style);
 }
 
 #[cfg(test)]

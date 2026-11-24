@@ -44,7 +44,8 @@ Usage: gitlog [OPTIONS] [PATH]
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       y copy the commit hash, or the path of the file under the cursor
       n p next / previous file in a diff, commit in the file list
-      h branch hierarchy · s commit style · ? all shortcuts
+      s search, then c hash · m message · f file name · h hunk · +h added · -h removed
+      h branch hierarchy · S commit style · ? all shortcuts
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
 
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
@@ -151,7 +152,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
 
 fn handle_event(app: &mut App, event: Event) -> bool {
     let action = match event {
-        Event::Key(key) if key.kind != KeyEventKind::Release => on_key(key),
+        Event::Key(key) if key.kind != KeyEventKind::Release => on_key(app, key),
         Event::Mouse(mouse) => on_mouse(app, mouse),
         Event::Resize(..) => return true,
         _ => None,
@@ -165,9 +166,19 @@ fn handle_event(app: &mut App, event: Event) -> bool {
     }
 }
 
-fn on_key(key: KeyEvent) -> Option<Action> {
+fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return (key.code == KeyCode::Char('c')).then_some(Action::Quit);
+    }
+    // Pendant la saisie d'une recherche, les lettres sont du texte, pas des raccourcis.
+    if app.prompt.is_some() && !app.help {
+        return Some(match key.code {
+            KeyCode::Char(c) => Action::PromptKey(c),
+            KeyCode::Backspace => Action::PromptBackspace,
+            KeyCode::Enter => Action::PromptSubmit,
+            KeyCode::Esc => Action::PromptCancel,
+            _ => return None,
+        });
     }
     Some(match key.code {
         KeyCode::Char('q') => Action::Back { quit: true },
@@ -182,7 +193,8 @@ fn on_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Left => Action::Horizontal(-4),
         KeyCode::Right => Action::Horizontal(4),
         KeyCode::Char('h') => Action::ToggleHierarchy,
-        KeyCode::Char('s') => Action::CycleNodes,
+        KeyCode::Char('s') => Action::Search,
+        KeyCode::Char('S') => Action::CycleNodes,
         KeyCode::Char('y') => Action::CopySelected,
         KeyCode::Char('n') => Action::Step(1),
         KeyCode::Char('p') => Action::Step(-1),
@@ -198,8 +210,8 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
     let pos = Position::new(mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // Un clic referme le panneau des raccourcis ; le « ? » de la barre d'état l'ouvre.
-            if app.help || hit.help.is_some_and(|rect| rect.contains(pos)) {
+            // Un clic referme le panneau des raccourcis.
+            if app.help {
                 return Some(Action::ToggleHelp);
             }
             if hit.folder.is_some_and(|rect| rect.contains(pos)) {

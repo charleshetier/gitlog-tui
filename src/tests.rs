@@ -287,7 +287,11 @@ fn copy_step_and_help_shortcuts() {
     assert_eq!(diff_file(&app), Some(0));
 
     // ? : panneau flottant, qui ne laisse passer que sa fermeture.
-    assert!(screen(&mut app, 110, 30).contains("? help"));
+    // Sans pied de page : la liste va jusqu'en bas, le message éphémère s'y superpose à droite.
+    let bottom = screen(&mut app, 110, 30);
+    let last = bottom.lines().last().unwrap();
+    assert!(last.trim_end().ends_with("Last file of the commit"), "{last}");
+    assert!(last.contains('│') && !bottom.contains('┴') && !bottom.contains("? help"));
     app.apply(Action::ToggleHelp);
     let help = screen(&mut app, 110, 30);
     println!("{help}");
@@ -298,6 +302,74 @@ fn copy_step_and_help_shortcuts() {
     assert!(!app.help && !app.should_quit);
     assert_eq!(app.depth(), 3);
     assert!(!screen(&mut app, 110, 30).contains("Keyboard shortcuts"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn search_filters_the_commits() {
+    let dir = make_repo("search");
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    screen(&mut app, 110, 20);
+    let second = app.store.oid(1);
+
+    // `s`, le type, le texte, Entrée : il ne reste que les commits trouvés.
+    let search = |app: &mut App, keys: &str, query: &str| -> Vec<String> {
+        app.apply(Action::Search);
+        for key in keys.chars().chain(query.chars()) {
+            app.apply(Action::PromptKey(key));
+        }
+        app.apply(Action::PromptSubmit);
+        assert!(app.prompt.is_none());
+        wait(app, "recherche", |app| app.log_done);
+        assert_eq!(app.log_error, None);
+        (0..app.store.len()).map(|row| app.meta(row).subject).collect()
+    };
+    assert_eq!(search(&mut app, "m", "SUITE"), ["Suite sur main"]);
+    assert_eq!(search(&mut app, "f", "B.tx"), ["Travail sur la branche"]);
+    assert_eq!(search(&mut app, "h", "quatre"), ["Travail sur la branche"]);
+    assert_eq!(search(&mut app, "+h", "quatre"), ["Travail sur la branche"]);
+    assert!(search(&mut app, "-h", "quatre").is_empty());
+    assert_eq!(search(&mut app, "-h", "deux"), ["Travail sur la branche"]);
+    assert_eq!(search(&mut app, "+h", "trois"), ["Squelette initial"]);
+    assert_eq!(search(&mut app, "+h", "deux").len(), 2, "sans casse : « deux » puis « DEUX »");
+    assert!(search(&mut app, "m", "a.b*c[").is_empty());
+    assert!(search(&mut app, "h", "a.b*c[").is_empty());
+
+    // Le champ reste en bas avec le nombre de résultats ; les lignes n'ont plus de graphe.
+    assert_eq!(search(&mut app, "c", &second.to_hex()[..9]).len(), 1);
+    assert_eq!(app.store.oid(0), second);
+    let found = screen(&mut app, 110, 20);
+    println!("{found}");
+    let lines: Vec<&str> = found.lines().collect();
+    assert!(lines[19].starts_with(" hash: ") && lines[19].trim_end().ends_with("1 match"), "{}", lines[19]);
+    assert!(lines[2].starts_with(" ● ") && lines[3].trim().is_empty());
+
+    // Le sous-menu attend un type ; `+` puis `h` ouvre le champ des lignes ajoutées.
+    app.apply(Action::Search);
+    let menu = screen(&mut app, 110, 20);
+    println!("{menu}");
+    assert!(menu.contains("╭─ Search ") && menu.contains("commit message") && menu.contains("-h"));
+    app.apply(Action::PromptKey('+'));
+    app.apply(Action::PromptKey('m'));
+    assert!(matches!(app.prompt, Some(crate::app::Prompt::Kind { sign: Some('+') })));
+    app.apply(Action::PromptKey('h'));
+    app.apply(Action::PromptKey('x'));
+    let typing = screen(&mut app, 110, 20);
+    assert!(typing.lines().last().unwrap().starts_with(" +hunk: x"), "{typing}");
+    // Échap abandonne la saisie et garde la recherche appliquée.
+    app.apply(Action::PromptCancel);
+    assert!(app.prompt.is_none() && app.filter.is_some());
+
+    // q sort de la recherche sans quitter, sur le même commit dans le graphe complet.
+    app.apply(Action::Back { quit: true });
+    assert!(app.filter.is_none() && !app.should_quit);
+    wait(&mut app, "retour au graphe", |app| app.log_done);
+    assert_eq!((app.store.len(), app.selected), (4, 1));
+    app.apply(Action::Back { quit: true });
+    assert!(app.should_quit);
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);

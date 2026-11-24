@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
@@ -14,7 +14,7 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 
 use crate::diff::{DiffLine, DiffParser, FileEntry, LineKind, parse_files};
-use crate::graph::{Batch, Layout, Oid};
+use crate::graph::{Batch, COMMIT, Cell, Layout, Oid};
 use crate::hierarchy::{self, Branch, BranchRow, Remote};
 
 /// Commits par lot envoyé à l'interface.
@@ -172,60 +172,224 @@ pub enum LogMsg {
     Error(String),
 }
 
+/// Ce qu'une recherche examine dans chaque commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKind {
+    /// Début du hash.
+    Hash,
+    Message,
+    /// Nom d'un fichier touché par le commit.
+    File,
+    /// Ligne ajoutée ou supprimée par le commit.
+    Hunk,
+    HunkAdded,
+    HunkRemoved,
+}
+
+impl SearchKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchKind::Hash => "hash",
+            SearchKind::Message => "message",
+            SearchKind::File => "file",
+            SearchKind::Hunk => "hunk",
+            SearchKind::HunkAdded => "+hunk",
+            SearchKind::HunkRemoved => "-hunk",
+        }
+    }
+}
+
+/// Recherche active : seuls les commits qui y répondent sont listés, sans casse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filter {
+    pub kind: SearchKind,
+    pub query: String,
+}
+
+/// Flux de `git log` en cours. Le lâcher arrête git, même s'il cherche encore.
+pub struct LogStream {
+    pub rx: Receiver<LogMsg>,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl Drop for LogStream {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.child.lock()
+            && let Some(child) = slot.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
+}
+
 /// Lit `git log` dans un thread et envoie les lignes du graphe par lots sur un
 /// canal borné. Quand l'interface ne consomme plus, le thread se bloque sur le
 /// canal, puis git sur son tube : rien n'est lu d'avance au-delà de la file.
-pub fn spawn_log(root: PathBuf) -> Receiver<LogMsg> {
+pub fn spawn_log(root: PathBuf, filter: Option<Filter>) -> LogStream {
     let (tx, rx) = mpsc::sync_channel(BATCH_QUEUE);
+    let child = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&child);
     thread::spawn(move || {
-        if let Err(err) = read_log(&root, &tx) {
+        if let Err(err) = read_log(&root, filter.as_ref(), &tx, &slot) {
             let _ = tx.send(LogMsg::Error(format!("{err:#}")));
         }
     });
-    rx
+    LogStream { rx, child }
 }
 
-fn read_log(root: &Path, tx: &SyncSender<LogMsg>) -> Result<()> {
-    let mut child = git(root)
-        .args(["log", "--all", "--date-order", "--format=%H %P"])
+/// Neutralise les caractères spéciaux d'une expression régulière de base.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '.' | '[' | '*' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Options de `git log` qui restreignent l'historique aux commits recherchés.
+/// Le hash et le signe d'un hunk sont vérifiés à la lecture, ligne par ligne.
+fn log_command(root: &Path, filter: Option<&Filter>) -> Command {
+    let mut cmd = git(root);
+    cmd.args(["log", "--all", "--date-order"]);
+    let Some(Filter { kind, query }) = filter else {
+        cmd.arg("--format=%H %P");
+        return cmd;
+    };
+    match kind {
+        SearchKind::Hash => cmd.arg("--format=%H"),
+        SearchKind::Message => cmd.args(["--format=%H", "-i", "--fixed-strings"]).arg(format!("--grep={query}")),
+        SearchKind::Hunk => cmd.args(["--format=%H", "-i"]).arg(format!("-G{}", regex_escape(query))),
+        // Le patch suit chaque hash, annoncé par un octet nul, pour y lire le signe des lignes.
+        SearchKind::HunkAdded | SearchKind::HunkRemoved => cmd
+            .args(["--format=%x00%H", "-i", "-p", "-U0", "--no-color", "--no-ext-diff"])
+            .arg(format!("-G{}", regex_escape(query))),
+        SearchKind::File => cmd
+            .args(["--format=%H", "--full-history", "--no-merges", "--"])
+            .arg(format!(":(icase)*{query}*")),
+    };
+    cmd
+}
+
+/// Lignes du graphe en cours d'envoi à l'interface.
+struct Sink<'a> {
+    tx: &'a SyncSender<LogMsg>,
+    layout: Layout,
+    batch: Batch,
+    /// Premier lot réduit pour afficher l'écran au plus tôt.
+    limit: usize,
+}
+
+impl Sink<'_> {
+    /// Ajoute un commit ; sans `parents`, c'est un résultat de recherche, hors graphe.
+    /// Renvoie faux quand l'interface n'écoute plus.
+    fn push(&mut self, oid: &Oid, parents: Option<&[Oid]>) -> bool {
+        match parents {
+            Some(parents) => {
+                let (col, cells) = self.layout.push(oid, parents);
+                self.batch.push(oid, col, cells);
+            }
+            None => self.batch.push(oid, 0, &[Cell { bits: COMMIT, color: 0 }]),
+        }
+        if self.batch.rows.len() < self.limit {
+            return true;
+        }
+        self.limit = BATCH_ROWS;
+        self.tx.send(LogMsg::Batch(std::mem::take(&mut self.batch))).is_ok()
+    }
+}
+
+fn read_log(
+    root: &Path,
+    filter: Option<&Filter>,
+    tx: &SyncSender<LogMsg>,
+    slot: &Mutex<Option<Child>>,
+) -> Result<()> {
+    let mut child = log_command(root, filter)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("cannot run git log")?;
-    let stdout = BufReader::new(child.stdout.take().context("git log has no output")?);
+    let mut stdout = BufReader::new(child.stdout.take().context("git log has no output")?);
+    let mut stderr = child.stderr.take();
+    // L'interface garde la main sur le processus pour pouvoir l'arrêter.
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
 
-    let mut layout = Layout::default();
-    let mut batch = Batch::default();
+    let needle = filter.map(|f| f.query.to_lowercase()).unwrap_or_default();
+    let kind = filter.map(|f| f.kind);
+    let sign = match kind {
+        Some(SearchKind::HunkAdded) => Some(b'+'),
+        Some(SearchKind::HunkRemoved) => Some(b'-'),
+        _ => None,
+    };
+    let mut sink = Sink { tx, layout: Layout::default(), batch: Batch::default(), limit: 64 };
     let mut parents: Vec<Oid> = Vec::new();
-    // Premier lot réduit pour afficher l'écran au plus tôt.
-    let mut limit = 64;
-    for line in stdout.lines() {
-        let line = line?;
-        let mut hashes = line.split(' ').filter(|s| !s.is_empty());
-        let Some(oid) = hashes.next().and_then(Oid::from_hex) else { continue };
-        parents.clear();
-        parents.extend(hashes.filter_map(Oid::from_hex));
-        let (col, cells) = layout.push(&oid, &parents);
-        batch.push(&oid, col, cells);
-        if batch.rows.len() >= limit {
-            limit = BATCH_ROWS;
-            if tx.send(LogMsg::Batch(std::mem::take(&mut batch))).is_err() {
-                // L'interface est partie : on arrête git.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(());
-            }
+    // Recherche par signe : commit dont le patch est en cours de lecture.
+    let mut candidate: Option<Oid> = None;
+    let mut in_hunk = false;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut listening = true;
+    while listening {
+        raw.clear();
+        if stdout.read_until(b'\n', &mut raw)? == 0 {
+            break;
         }
+        while matches!(raw.last(), Some(b'\n' | b'\r')) {
+            raw.pop();
+        }
+        if let Some(sign) = sign {
+            match raw.first() {
+                Some(0) => {
+                    candidate = std::str::from_utf8(&raw[1..]).ok().and_then(Oid::from_hex);
+                    in_hunk = false;
+                }
+                _ if raw.starts_with(b"diff --git ") => in_hunk = false,
+                Some(b'@') => in_hunk = true,
+                Some(first) if in_hunk && *first == sign && candidate.is_some() => {
+                    if String::from_utf8_lossy(&raw[1..]).to_lowercase().contains(&needle)
+                        && let Some(oid) = candidate.take()
+                    {
+                        listening = sink.push(&oid, None);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let line = String::from_utf8_lossy(&raw);
+        let mut hashes = line.split(' ').filter(|s| !s.is_empty());
+        let Some(hex) = hashes.next() else { continue };
+        let Some(oid) = Oid::from_hex(hex) else { continue };
+        listening = match kind {
+            None => {
+                parents.clear();
+                parents.extend(hashes.filter_map(Oid::from_hex));
+                sink.push(&oid, Some(&parents))
+            }
+            Some(SearchKind::Hash) if !hex.starts_with(&needle) => true,
+            Some(_) => sink.push(&oid, None),
+        };
     }
-    if !batch.rows.is_empty() {
-        let _ = tx.send(LogMsg::Batch(batch));
+
+    let child = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    let Some(mut child) = child else { return Ok(()) };
+    if !listening {
+        // L'interface est partie : on arrête git.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(());
     }
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
+    if !sink.batch.rows.is_empty() {
+        let _ = tx.send(LogMsg::Batch(sink.batch));
     }
-    if !child.wait()?.success() && !stderr.trim().is_empty() {
-        bail!("git log: {}", stderr.trim());
+    let mut message = String::new();
+    if let Some(err) = stderr.as_mut() {
+        let _ = err.read_to_string(&mut message);
+    }
+    if !child.wait()?.success() && !message.trim().is_empty() {
+        bail!("git log: {}", message.trim());
     }
     Ok(())
 }

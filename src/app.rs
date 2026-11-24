@@ -1,14 +1,14 @@
 //! État de l'application et actions qui le modifient.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::layout::Rect;
 
 use crate::diff::{DiffLine, FileEntry, SideBySide};
-use crate::git::{self, DiffMsg, DiffWorker, Label, LogMsg, Meta, MetaReader, Repo};
+use crate::git::{self, DiffMsg, DiffWorker, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
 use crate::graph::{GraphStore, Oid};
 use crate::hierarchy::BranchRow;
 
@@ -108,13 +108,19 @@ pub struct HitMap {
     pub file_top: usize,
     pub chips: Vec<(Rect, u8)>,
     pub pane_copy: Option<Rect>,
-    /// Rappel « ? » de la barre d'état, qui ouvre le panneau des raccourcis.
-    pub help: Option<Rect>,
     /// Nom du dossier et nom du dépôt dans l'en-tête : un clic copie le chemin ou l'URL.
     pub folder: Option<Rect>,
     pub remote: Option<Rect>,
     pub branches: Rect,
     pub branch_top: usize,
+}
+
+/// Recherche en cours de saisie.
+pub enum Prompt {
+    /// Sous-menu du type de recherche ; `sign` retient un `+` ou un `-` déjà tapé.
+    Kind { sign: Option<char> },
+    /// Champ de saisie, tout en bas de l'écran.
+    Input { kind: SearchKind, query: String },
 }
 
 pub enum Action {
@@ -146,6 +152,13 @@ pub enum Action {
     ToggleHierarchy,
     CycleNodes,
     ToggleHelp,
+    /// Ouvre le sous-menu de recherche.
+    Search,
+    /// Touches reçues tant qu'une recherche est en cours de saisie.
+    PromptKey(char),
+    PromptBackspace,
+    PromptSubmit,
+    PromptCancel,
 }
 
 pub struct App {
@@ -166,10 +179,13 @@ pub struct App {
     pub hierarchy: Option<Hierarchy>,
     /// Panneau flottant des raccourcis.
     pub help: bool,
+    pub prompt: Option<Prompt>,
+    /// Recherche appliquée : le graphe cède la place à la liste des commits trouvés.
+    pub filter: Option<Filter>,
     pub hit: HitMap,
     pub should_quit: bool,
     flash: Option<(String, Instant)>,
-    log_rx: Option<Receiver<LogMsg>>,
+    log: Option<LogStream>,
     goto_end: bool,
     /// Commit à atteindre dès qu'il sera chargé, et lignes déjà examinées.
     goto: Option<(Oid, usize)>,
@@ -182,7 +198,7 @@ pub struct App {
 impl App {
     pub fn new(repo: Repo, plain: bool) -> Result<App> {
         // Le flux démarre en premier : git parcourt pendant que les refs sont lues.
-        let log_rx = Some(git::spawn_log(repo.root.clone()));
+        let log = Some(git::spawn_log(repo.root.clone(), None));
         let labels = git::load_labels(&repo)?;
         Ok(App {
             meta_reader: MetaReader::new(&repo.root)?,
@@ -202,10 +218,12 @@ impl App {
             pane: None,
             hierarchy: None,
             help: false,
+            prompt: None,
+            filter: None,
             hit: HitMap::default(),
             should_quit: false,
             flash: None,
-            log_rx,
+            log,
             goto_end: false,
             goto: None,
             meta_cache: HashMap::new(),
@@ -282,8 +300,8 @@ impl App {
             if self.log_done || self.store.len() >= wanted {
                 break;
             }
-            let Some(rx) = &self.log_rx else { break };
-            match rx.try_recv() {
+            let Some(log) = &self.log else { break };
+            match log.rx.try_recv() {
                 Ok(LogMsg::Batch(batch)) => {
                     self.store.append(batch);
                     changed = true;
@@ -295,7 +313,7 @@ impl App {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.log_done = true;
-                    self.log_rx = None;
+                    self.log = None;
                     changed = true;
                 }
             }
@@ -383,6 +401,8 @@ impl App {
     fn goto_commit(&mut self, oid: Oid) {
         self.hierarchy = None;
         self.close_pane();
+        // Le commit est à chercher dans le graphe complet, pas parmi les résultats d'une recherche.
+        self.set_filter(None);
         match self.store.find(&oid, 0) {
             Some(row) => self.show_row(row),
             None if self.log_done => self.set_flash("This commit is not in the graph"),
@@ -463,6 +483,74 @@ impl App {
         } else {
             self.set_flash("Clipboard unavailable");
         }
+    }
+
+    /// Saisie d'une recherche : le sous-menu choisit le type, puis le champ reçoit le texte.
+    fn apply_in_prompt(&mut self, action: Action) {
+        let Some(prompt) = self.prompt.take() else { return };
+        self.prompt = match (prompt, action) {
+            (_, Action::Quit) => {
+                self.should_quit = true;
+                None
+            }
+            (_, Action::PromptCancel) => None,
+            (Prompt::Kind { sign }, Action::PromptKey(key)) => {
+                let kind = match (sign, key) {
+                    (None, 'c') => Some(SearchKind::Hash),
+                    (None, 'm') => Some(SearchKind::Message),
+                    (None, 'f') => Some(SearchKind::File),
+                    (None, 'h') => Some(SearchKind::Hunk),
+                    (Some('+'), 'h') => Some(SearchKind::HunkAdded),
+                    (Some('-'), 'h') => Some(SearchKind::HunkRemoved),
+                    _ => None,
+                };
+                match kind {
+                    Some(kind) => Some(Prompt::Input { kind, query: String::new() }),
+                    // `+` ou `-` attend son `h` ; toute autre touche laisse le menu en place.
+                    None if matches!(key, '+' | '-') => Some(Prompt::Kind { sign: Some(key) }),
+                    None => Some(Prompt::Kind { sign }),
+                }
+            }
+            (Prompt::Kind { .. }, Action::PromptBackspace) => Some(Prompt::Kind { sign: None }),
+            (Prompt::Input { kind, mut query }, Action::PromptKey(key)) => {
+                query.push(key);
+                Some(Prompt::Input { kind, query })
+            }
+            (Prompt::Input { kind, mut query }, Action::PromptBackspace) => {
+                query.pop();
+                Some(Prompt::Input { kind, query })
+            }
+            (Prompt::Input { kind, query }, Action::PromptSubmit) => {
+                let query = query.trim().to_string();
+                // Un champ vide revient au graphe complet.
+                self.set_filter((!query.is_empty()).then_some(Filter { kind, query }));
+                None
+            }
+            (prompt, _) => Some(prompt),
+        };
+    }
+
+    /// Applique ou retire une recherche : l'historique est relu depuis le début.
+    fn set_filter(&mut self, filter: Option<Filter>) {
+        if self.filter == filter {
+            return;
+        }
+        // En quittant une recherche, on retrouve le commit sélectionné dans le graphe complet.
+        let keep = (filter.is_none() && self.selected < self.store.len()).then(|| self.store.oid(self.selected));
+        self.close_pane();
+        self.store = GraphStore::default();
+        self.meta_cache.clear();
+        self.selected = 0;
+        self.top = 0;
+        self.log_done = false;
+        self.log_error = None;
+        self.goto_end = false;
+        self.goto = keep.map(|oid| (oid, 0));
+        self.want_all = self.goto.is_some();
+        // L'ancien flux est lâché en premier : son git s'arrête, même en pleine recherche.
+        self.log = None;
+        self.log = Some(git::spawn_log(self.repo.root.clone(), filter.clone()));
+        self.filter = filter;
     }
 
     /// Chemin du dossier du dépôt, avec les séparateurs du système.
@@ -604,6 +692,9 @@ impl App {
             }
             return;
         }
+        if self.prompt.is_some() {
+            return self.apply_in_prompt(action);
+        }
         if self.copy_from_header(&action) {
             return;
         }
@@ -615,6 +706,8 @@ impl App {
             Action::Back { quit } => match self.depth() {
                 3 => self.close_diff(),
                 2 => self.close_pane(),
+                // Une recherche active est un niveau de plus : on en sort d'abord.
+                _ if self.filter.is_some() => self.set_filter(None),
                 _ => self.should_quit = quit,
             },
             Action::Move(delta) => self.move_by(delta),
@@ -683,6 +776,13 @@ impl App {
                 }
             }
             Action::ToggleHierarchy => self.toggle_hierarchy(),
+            Action::Search => {
+                if self.pane.is_none() {
+                    self.prompt = Some(Prompt::Kind { sign: None });
+                }
+            }
+            // Hors saisie, ces touches n'arrivent pas jusqu'ici.
+            Action::PromptKey(_) | Action::PromptBackspace | Action::PromptSubmit | Action::PromptCancel => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,
