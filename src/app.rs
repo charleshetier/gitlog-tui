@@ -625,7 +625,7 @@ impl App {
         }
     }
 
-    /// `n` / `p` dans le fichier entier : modification suivante ou précédente.
+    /// `n` / `N` dans le fichier entier : modification suivante ou précédente.
     fn step_change(&mut self, delta: isize) {
         let Some(view) = self.pane.as_mut().and_then(|p| p.full.as_mut()) else { return };
         let top = view.top;
@@ -848,7 +848,7 @@ impl App {
         }
     }
 
-    /// `n` / `p` : fichier voisin dans un diff, commit voisin dans la liste des fichiers.
+    /// `n` / `N` : fichier voisin dans un diff, commit voisin dans la liste des fichiers.
     fn step(&mut self, delta: isize) {
         let neighbour = |value: usize, len: usize| value.saturating_add_signed(delta).min(len.saturating_sub(1));
         match self.depth() {

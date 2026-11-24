@@ -46,7 +46,7 @@ Usage: gitlog [OPTIONS] [PATH]
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       y copy the commit hash, or the path of the file under the cursor
       Enter on a diff opens the whole file in a floating window
-      n p next / previous commit (file list), file (diff), change (whole file)
+      n N next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       h branch hierarchy · S commit style · R refresh · ? all shortcuts
       o show or hide the remote branches (origin)
@@ -213,7 +213,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') => Action::ToggleRemotes,
         KeyCode::Char('y') => Action::CopySelected,
         KeyCode::Char('n') => Action::Step(1),
-        KeyCode::Char('p') => Action::Step(-1),
+        KeyCode::Char('N') => Action::Step(-1),
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char(c @ '1'..='4') => Action::GoLevel(c as u8 - b'0'),
         _ => return None,

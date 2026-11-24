@@ -264,7 +264,16 @@ fn copy_step_and_help_shortcuts() {
     app.apply(Action::Move(1));
     assert_eq!(app.copy_target().as_deref(), Some("b.txt"));
 
-    // n / p dans la liste des fichiers : commit suivant, précédent.
+    // Au clavier : n pour le suivant, N (Maj+n) pour le précédent ; p n'est plus une touche.
+    {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char, modifiers| crate::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
+        assert!(matches!(key('n', KeyModifiers::NONE), Some(Action::Step(1))));
+        assert!(matches!(key('N', KeyModifiers::SHIFT), Some(Action::Step(-1))));
+        assert!(key('p', KeyModifiers::NONE).is_none());
+    }
+
+    // n / N dans la liste des fichiers : commit suivant, précédent.
     app.apply(Action::Step(1));
     assert_eq!((app.depth(), app.selected), (2, 1));
     assert_eq!(app.pane.as_ref().map(|p| p.oid), Some(app.store.oid(1)));
@@ -273,7 +282,7 @@ fn copy_step_and_help_shortcuts() {
     assert_eq!((app.depth(), app.selected), (2, 0));
     assert_eq!(app.flash(), Some("First commit"));
 
-    // n / p dans un diff : fichier suivant, précédent, sans sortir du commit.
+    // n / N dans un diff : fichier suivant, précédent, sans sortir du commit.
     wait(&mut app, "fichiers", files_ready);
     app.apply(Action::Open);
     assert_eq!(diff_file(&app), Some(0));
@@ -346,12 +355,12 @@ fn whole_file_window() {
     assert_eq!(top, tops[0]);
     let first = screen(&mut app, 120, 24);
     println!("{first}");
-    assert!(first.contains("big.txt · change 1/3") && first.contains("n p changes"));
+    assert!(first.contains("big.txt · change 1/3") && first.contains("n N changes"));
     let changed = first.lines().find(|l| l.contains("LIGNE 5")).expect("ligne modifiée");
     assert!(changed.contains("5 ligne 5") && changed.contains("5 LIGNE 5"), "{changed}");
     assert!(first.contains("ligne 12"), "le contexte dépasse celui du diff");
 
-    // n et p sautent d'une modification à l'autre, sans sortir du fichier.
+    // n et N sautent d'une modification à l'autre, sans sortir du fichier.
     app.apply(Action::Step(1));
     assert_eq!(full(&app).0, tops[1]);
     let second = screen(&mut app, 120, 24);
@@ -374,7 +383,7 @@ fn whole_file_window() {
     app.apply(Action::Back { quit: false });
     assert_eq!(app.depth(), 3);
     assert_eq!(app.pane.as_ref().unwrap().diff.as_ref().unwrap().len(), hunks);
-    assert!(!screen(&mut app, 120, 24).contains("n p changes"));
+    assert!(!screen(&mut app, 120, 24).contains("n N changes"));
     app.apply(Action::GoLevel(4));
     assert_eq!(app.depth(), 4);
     app.apply(Action::GoLevel(2));

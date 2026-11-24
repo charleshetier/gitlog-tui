@@ -615,7 +615,7 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
     };
     let room = panel.width.saturating_sub(width(&count) + 9);
     let title = format!(" {} · {count} ", tail(path, room));
-    draw_panel(buf, panel, &title, " n p changes · Esc to close ");
+    draw_panel(buf, panel, &title, " n N changes · Esc to close ");
     // L'intérieur reprend le fond du terminal : les couleurs du diff y restent celles du volet.
     for y in inner.top()..inner.bottom() {
         for x in inner.left()..inner.right() {
@@ -945,7 +945,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("PgUp PgDn", "Move by one page"),
     ("g G  Home End", "Jump to the first / last item"),
     ("Enter", "Open the commit, the file diff, then the whole file"),
-    ("n p", "Next / previous commit, file or change, by level"),
+    ("n N", "Next / previous commit, file or change, by level"),
     ("← →", "Scroll a diff sideways"),
     ("1 2 3 4", "Go to a level: graph, files, diff, whole file"),
     ("q", "Go back one level, quit from the graph"),
