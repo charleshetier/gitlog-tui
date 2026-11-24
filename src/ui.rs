@@ -1,6 +1,7 @@
 //! Rendu : seules les lignes visibles sont lues et dessinées, et chaque zone
 //! cliquable est mémorisée pour traduire les clics en actions.
 
+use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -10,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::app::{App, DiffView, FilesState, HierState, HitMap, NodeStyle, Prompt};
-use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE};
+use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
 use crate::hierarchy::{Remote, Sync};
@@ -39,12 +40,29 @@ const PANEL_BG: Color = Color::Indexed(235);
 const ACCENT: Color = Color::LightBlue;
 const REMOTE_BG: Color = Color::Indexed(240);
 const CHIP_BG: Color = Color::Indexed(238);
-const ADD_BG: Color = Color::Indexed(22);
-const DEL_BG: Color = Color::Indexed(52);
+/// Fonds d'un diff : les lignes ajoutées et retirées et, plus soutenus, les
+/// passages modifiés au sein d'une ligne.
+#[derive(Clone, Copy)]
+struct Tones {
+    add: Color,
+    del: Color,
+    add_mark: Color,
+    del_mark: Color,
+}
+const TONES: Tones = Tones {
+    add: Color::Indexed(22),
+    del: Color::Indexed(52),
+    add_mark: Color::Indexed(28),
+    del_mark: Color::Indexed(88),
+};
 /// Les mêmes fonds sous la coloration syntaxique : plus sombres, pour que chaque
 /// teinte du thème y reste lisible. Aucune couleur de la palette n'est aussi sombre.
-const ADD_SYNTAX_BG: Color = Color::Rgb(0, 40, 0);
-const DEL_SYNTAX_BG: Color = Color::Rgb(63, 0, 1);
+const SYNTAX_TONES: Tones = Tones {
+    add: Color::Rgb(0, 40, 0),
+    del: Color::Rgb(63, 0, 1),
+    add_mark: Color::Rgb(0, 88, 0),
+    del_mark: Color::Rgb(128, 0, 8),
+};
 const DIM: Color = Color::DarkGray;
 /// Fond du côté sans vis-à-vis dans le diff en deux colonnes.
 const VOID_BG: Color = Color::Indexed(235);
@@ -561,7 +579,7 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
 /// les deux versions du fichier existent, en une seule sinon.
 fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: bool) {
     let dim = Style::new().fg(DIM);
-    let (add_bg, del_bg) = if syntax { (ADD_SYNTAX_BG, DEL_SYNTAX_BG) } else { (ADD_BG, DEL_BG) };
+    let tones = if syntax { SYNTAX_TONES } else { TONES };
     let x0 = area.x + 1;
     let end = area.right() - 1;
     if diff.lines.is_empty() {
@@ -571,7 +589,7 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     }
     if let Some(sides) = &diff.sides {
         diff.top = diff.top.min(sides.rows.len().saturating_sub(1));
-        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x, (add_bg, del_bg));
+        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x, tones);
         return;
     }
     diff.top = diff.top.min(diff.lines.len() - 1);
@@ -591,8 +609,8 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
                 put(buf, x0, y, end, &line.text, dim.add_modifier(Modifier::ITALIC));
                 continue;
             }
-            LineKind::Add => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(add_bg)),
-            LineKind::Del => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(del_bg)),
+            LineKind::Add => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(tones.add)),
+            LineKind::Del => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(tones.del)),
             LineKind::Ctx => {}
         }
         let (sign, sign_color) = match line.kind {
@@ -603,32 +621,59 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
         let numbers = format!("{} {}", number(line.old), number(line.new));
         let mut x = put(buf, x0, y, end, &numbers, Style::new().fg(Color::Gray));
         x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
-        put_code(buf, x + 1, y, end, line, diff.x);
+        put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
     }
 }
 
-/// Écrit le texte d'une ligne de diff à partir du caractère `skip`, segment par
-/// segment quand elle porte une coloration syntaxique.
-fn put_code(buf: &mut Buffer, mut x: u16, y: u16, end: u16, line: &DiffLine, mut skip: usize) {
-    // Octet où commence le caractère de rang `n`.
-    let byte_at = |text: &str, n: usize| text.char_indices().nth(n).map_or(text.len(), |(at, _)| at);
-    let mut rest = line.text.as_str();
-    for &(len, color) in &line.tints {
-        let (segment, after) = rest.split_at(byte_at(rest, len as usize));
-        rest = after;
-        if skip >= len as usize {
-            skip -= len as usize;
+/// Écrit le texte d'une ligne de diff à partir du caractère `skip`. Le texte est
+/// découpé là où change la teinte syntaxique ou le fond : `marks` désigne, en
+/// rangs de caractères, les passages modifiés, qui reçoivent le fond `mark_bg`.
+fn put_code(
+    buf: &mut Buffer,
+    mut x: u16,
+    y: u16,
+    end: u16,
+    line: &DiffLine,
+    skip: usize,
+    (marks, mark_bg): (&[Range<usize>], Color),
+) {
+    let text = line.text.as_str();
+    // Octet de chaque caractère, puis la fin du texte.
+    let offsets: Vec<usize> = text.char_indices().map(|(at, _)| at).chain([text.len()]).collect();
+    let count = offsets.len() - 1;
+    let mut cuts = vec![skip.min(count), count];
+    let mut tint_end = 0;
+    for &(len, _) in &line.tints {
+        tint_end += len as usize;
+        cuts.push(tint_end.min(count));
+    }
+    cuts.extend(marks.iter().flat_map(|mark| [mark.start.min(count), mark.end.min(count)]));
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut tints = line.tints.iter();
+    let (mut tint_end, mut color) = (0, None);
+    for cut in cuts.windows(2) {
+        let (from, to) = (cut[0], cut[1]);
+        while from >= tint_end {
+            // Sans coloration, ou au-delà de ses segments : la couleur de texte du terminal.
+            (tint_end, color) = match tints.next() {
+                Some(&(len, color)) => (tint_end + len as usize, color),
+                None => (usize::MAX, None),
+            };
+        }
+        if from < skip {
             continue;
         }
-        let style = color.map_or(Style::new(), |[r, g, b]| Style::new().fg(Color::Rgb(r, g, b)));
-        x = put(buf, x, y, end, &segment[byte_at(segment, skip)..], style);
-        skip = 0;
+        let mut style = color.map_or(Style::new(), |[r, g, b]| Style::new().fg(Color::Rgb(r, g, b)));
+        if marks.iter().any(|mark| mark.contains(&from)) {
+            style = style.bg(mark_bg);
+        }
+        x = put(buf, x, y, end, &text[offsets[from]..offsets[to]], style);
         if x >= end {
             return;
         }
     }
-    // Sans coloration, ou au-delà de ses segments : la couleur de texte du terminal.
-    put(buf, x, y, end, &rest[byte_at(rest, skip)..], Style::new());
 }
 
 /// Dessine les cellules du graphe d'une ligne selon le style des commits.
@@ -684,7 +729,7 @@ fn draw_sides(
     lines: &[DiffLine],
     rows: &[(u32, u32)],
     skip: usize,
-    (add_bg, del_bg): (Color, Color),
+    tones: Tones,
 ) {
     let dim = Style::new().fg(DIM);
     let x0 = area.x + 1;
@@ -699,16 +744,19 @@ fn draw_sides(
         .unwrap_or(0);
     let num_w = max_no.to_string().len().max(3);
 
-    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Option<Color>| {
+    // `changed` : fond d'une ligne modifiée, puis ses passages modifiés et leur fond.
+    type Changed<'a> = Option<(Color, &'a [Range<usize>], Color)>;
+    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed| {
         let Some((line, number)) = content else {
             buf.set_style(bg_area, Style::new().bg(VOID_BG));
             return;
         };
-        if let Some(bg) = changed {
+        let (bg, marks, mark_bg) = changed.unwrap_or((Color::Reset, &[], Color::Reset));
+        if changed.is_some() {
             buf.set_style(bg_area, Style::new().bg(bg));
         }
         let x = put(buf, x, y, end, &format!("{number:>num_w$}"), Style::new().fg(Color::Gray));
-        put_code(buf, x + 1, y, end, line, skip);
+        put_code(buf, x + 1, y, end, line, skip, (marks, mark_bg));
     };
 
     for (i, &(l, r)) in rows.iter().enumerate() {
@@ -732,8 +780,15 @@ fn draw_sides(
         let changed = l != r;
         let left_area = Rect::new(area.x, y, mid - area.x, 1);
         let right_area = Rect::new(mid + 1, y, area.right() - mid - 1, 1);
-        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), changed.then_some(del_bg));
-        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), changed.then_some(add_bg));
+        // Une ligne retirée face à celle qui la remplace : ce qui change entre les deux ressort.
+        let (old_marks, new_marks) = match (left, right) {
+            (Some(old), Some(new)) if changed => inline_changes(&old.text, &new.text),
+            _ => Default::default(),
+        };
+        let removed = changed.then_some((tones.del, old_marks.as_slice(), tones.del_mark));
+        let added = changed.then_some((tones.add, new_marks.as_slice(), tones.add_mark));
+        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed);
+        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added);
         put(buf, mid, y, end, "│", dim);
     }
 }

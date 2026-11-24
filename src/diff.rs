@@ -1,5 +1,7 @@
 //! Analyse des sorties de `git show` : liste des fichiers d'un commit et diff unifié.
 
+use std::ops::Range;
+
 /// Longueur maximale conservée pour une ligne de diff (fichiers minifiés).
 const MAX_LINE_CHARS: usize = 2000;
 /// Largeur d'une tabulation à l'affichage.
@@ -171,6 +173,97 @@ impl SideBySide {
     }
 }
 
+/// Au-delà de ce nombre de comparaisons, le milieu des deux lignes est tenu pour
+/// entièrement modifié : seuls le début et la fin communs sont écartés.
+const MAX_INLINE_CELLS: usize = 40_000;
+
+/// Passages modifiés au sein de deux lignes en vis-à-vis, l'ancienne puis la
+/// nouvelle, en rangs de caractères. La comparaison se fait mot à mot. Deux
+/// lignes sans aucun mot commun n'ont pas de passage à distinguer : tout y change.
+pub fn inline_changes(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let (a, b): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let (words_a, words_b) = (words(&a), words(&b));
+    let same = |i: usize, j: usize| a[words_a[i].clone()] == b[words_b[j].clone()];
+
+    // Début et fin communs : la plupart des retouches sont locales.
+    let shortest = words_a.len().min(words_b.len());
+    let head = (0..shortest).take_while(|&i| same(i, i)).count();
+    let tail = (0..shortest - head)
+        .take_while(|&i| same(words_a.len() - 1 - i, words_b.len() - 1 - i))
+        .count();
+    let (mid_a, mid_b) = (&words_a[head..words_a.len() - tail], &words_b[head..words_b.len() - tail]);
+
+    // Plus longue suite commune de mots dans ce qui reste.
+    let mut kept_a = vec![false; mid_a.len()];
+    let mut kept_b = vec![false; mid_b.len()];
+    if mid_a.len() * mid_b.len() <= MAX_INLINE_CELLS {
+        let width = mid_b.len() + 1;
+        let mut longest = vec![0u16; (mid_a.len() + 1) * width];
+        for i in (0..mid_a.len()).rev() {
+            for j in (0..mid_b.len()).rev() {
+                longest[i * width + j] = if same(head + i, head + j) {
+                    longest[(i + 1) * width + j + 1] + 1
+                } else {
+                    longest[(i + 1) * width + j].max(longest[i * width + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < mid_a.len() && j < mid_b.len() {
+            if same(head + i, head + j) {
+                kept_a[i] = true;
+                kept_b[j] = true;
+                i += 1;
+                j += 1;
+            } else if longest[(i + 1) * width + j] >= longest[i * width + j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    let solid = |word: &Range<usize>| !a[word.start].is_whitespace();
+    let common = words_a[..head].iter().any(solid)
+        || words_a[words_a.len() - tail..].iter().any(solid)
+        || mid_a.iter().zip(&kept_a).any(|(word, &kept)| kept && solid(word));
+    if !common {
+        return (Vec::new(), Vec::new());
+    }
+    (changed_ranges(&a, mid_a, &kept_a), changed_ranges(&b, mid_b, &kept_b))
+}
+
+/// Découpe une ligne en mots : identifiants, suites d'espaces, et chaque autre
+/// caractère seul.
+fn words(chars: &[char]) -> Vec<Range<usize>> {
+    let class = |c: char| match c {
+        c if c.is_alphanumeric() || c == '_' => 1,
+        c if c.is_whitespace() => 2,
+        _ => 0,
+    };
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        match out.last_mut() {
+            Some(last) if class(c) != 0 && class(chars[last.start]) == class(c) => last.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
+}
+
+/// Réunit les mots modifiés qui se suivent ; un espace resté entre deux d'entre
+/// eux ne les sépare pas.
+fn changed_ranges(chars: &[char], words: &[Range<usize>], kept: &[bool]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (word, _) in words.iter().zip(kept).filter(|&(_, &kept)| !kept) {
+        match out.last_mut() {
+            Some(last) if chars[last.end..word.start].iter().all(|c| c.is_whitespace()) => last.end = word.end,
+            _ => out.push(word.clone()),
+        }
+    }
+    out
+}
+
 /// Extrait les numéros de départ de `@@ -a,b +c,d @@`.
 fn parse_hunk_header(raw: &str) -> Option<(u32, u32)> {
     let mut parts = raw.split(' ');
@@ -267,6 +360,66 @@ index 1111111..2222222 100644
         let lines: Vec<DiffLine> = diff.lines().filter_map(|l| parser.feed(l)).collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].kind, LineKind::Meta);
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    /// Les passages modifiés, rendus en texte.
+    fn changes(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
+        let text = |line: &str, ranges: Vec<Range<usize>>| -> Vec<String> {
+            let chars: Vec<char> = line.chars().collect();
+            ranges.into_iter().map(|range| chars[range].iter().collect()).collect()
+        };
+        let (a, b) = inline_changes(old, new);
+        (text(old, a), text(new, b))
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_edited_words_stand_out() {
+        assert_eq!(
+            changes("    let area = 2;", "    let head = 3;"),
+            (strings(&["area", "2"]), strings(&["head", "3"]))
+        );
+        assert_eq!(changes("    \"hello\"", "    \"bonjour\""), (strings(&["hello"]), strings(&["bonjour"])));
+        // Les caractères accentués comptent pour un seul rang.
+        assert_eq!(changes("é = côté;", "é = cité;"), (strings(&["côté"]), strings(&["cité"])));
+    }
+
+    #[test]
+    fn an_insertion_marks_one_side_only() {
+        assert_eq!(
+            changes("fn draw(buf: &mut Buffer)", "fn draw(buf: &mut Buffer, area: Rect)"),
+            (strings(&[]), strings(&[", area: Rect"]))
+        );
+    }
+
+    #[test]
+    fn neighbouring_changes_are_joined() {
+        // L'espace entre deux mots modifiés ne coupe pas le passage.
+        assert_eq!(changes("return old value;", "return new result;"), (strings(&["old value"]), strings(&["new result"])));
+    }
+
+    #[test]
+    fn unrelated_lines_have_no_inner_change() {
+        assert_eq!(changes("    alpha beta", "    gamma delta"), (strings(&[]), strings(&[])));
+        assert_eq!(changes("same", "same"), (strings(&[]), strings(&[])));
+        assert_eq!(changes("", "added"), (strings(&[]), strings(&[])));
+    }
+
+    #[test]
+    fn very_long_lines_keep_their_common_ends() {
+        let old = format!("start {} end", "a b ".repeat(300));
+        let new = format!("start {} end", "c d ".repeat(300));
+        let (a, b) = inline_changes(&old, &new);
+        assert_eq!((a.len(), b.len()), (1, 1));
+        assert_eq!(a[0].start, "start ".len());
     }
 }
 

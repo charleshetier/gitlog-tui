@@ -438,6 +438,10 @@ fn syntax_colours_the_diff() {
     let (added, added_bg) = colours(&buffer, "\"bonjour\"");
     assert!(rgb(removed) && removed == added);
     assert_eq!((removed_bg, added_bg), (Color::Rgb(63, 0, 1), Color::Rgb(0, 40, 0)));
+    // Dans la ligne modifiée, seul le mot qui change porte le fond soutenu.
+    assert_eq!(colours(&buffer, "hello\"").1, Color::Rgb(128, 0, 8));
+    assert_eq!(colours(&buffer, "bonjour\"").1, Color::Rgb(0, 88, 0));
+    assert_eq!(colours(&buffer, "\" ").1, Color::Rgb(63, 0, 1));
     // Le défilement horizontal emporte les teintes avec le texte.
     app.apply(Action::Horizontal(4));
     let buffer = draw(&mut app);
@@ -459,6 +463,7 @@ fn syntax_colours_the_diff() {
     let buffer = draw(&mut app);
     assert_eq!(colours(&buffer, "fn hello").0, Color::Reset);
     assert_eq!(colours(&buffer, "\"bonjour\""), (Color::Reset, Color::Indexed(22)));
+    assert_eq!(colours(&buffer, "bonjour\""), (Color::Reset, Color::Indexed(28)));
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);
