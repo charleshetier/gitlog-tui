@@ -854,17 +854,24 @@ fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
     }
     buf.set_style(area, base);
     let end = area.right() - 1;
-    let mut text_end = end;
-    if !editing {
-        let count = match app.store.len() {
+    // À droite : le nombre de commits trouvés, quand la liste répond bien au texte affiché.
+    let applied = app.filter.as_ref().is_some_and(|f| f.kind == kind && f.query == query.trim());
+    let status = if applied {
+        match app.store.len() {
             _ if app.log_error.is_some() => "git error".to_string(),
+            _ if app.stale => "searching…".to_string(),
             n if !app.log_done => format!("searching… {}", thousands(n)),
             0 => "no match".to_string(),
             1 => "1 match".to_string(),
             n => format!("{} matches", thousands(n)),
-        };
-        text_end = put_right(buf, area.x + 1, area.y, end, &count, base.fg(DIM)).saturating_sub(2);
-    }
+        }
+    } else if editing && !kind.is_live() {
+        // Trop lourde pour suivre la frappe : cette recherche attend la validation.
+        "Enter to search".to_string()
+    } else {
+        String::new()
+    };
+    let text_end = put_right(buf, area.x + 1, area.y, end, &status, base.fg(DIM)).saturating_sub(2);
     let label = format!("{}:", kind.label());
     let x = put(buf, area.x + 1, area.y, text_end, &label, base.fg(ACCENT).add_modifier(Modifier::BOLD)) + 1;
     // Une saisie plus longue que le champ garde sa fin visible, curseur compris.

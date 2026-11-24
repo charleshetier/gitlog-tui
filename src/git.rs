@@ -199,11 +199,27 @@ impl SearchKind {
     }
 }
 
+impl SearchKind {
+    /// Assez rapide pour être relancée pendant la frappe. Une recherche dans les
+    /// hunks recalcule tous les diffs de l'historique : elle attend Entrée.
+    pub fn is_live(self) -> bool {
+        matches!(self, SearchKind::Hash | SearchKind::Message | SearchKind::File)
+    }
+}
+
 /// Recherche active : seuls les commits qui y répondent sont listés, sans casse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
     pub kind: SearchKind,
     pub query: String,
+}
+
+impl Filter {
+    /// Recherche du texte saisi, ou aucune s'il est vide.
+    pub fn new(kind: SearchKind, query: &str) -> Option<Filter> {
+        let query = query.trim();
+        (!query.is_empty()).then(|| Filter { kind, query: query.to_string() })
+    }
 }
 
 /// Flux de `git log` en cours. Le lâcher arrête git, même s'il cherche encore.

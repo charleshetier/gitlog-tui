@@ -347,6 +347,34 @@ fn search_filters_the_commits() {
     assert!(lines[19].starts_with(" hash: ") && lines[19].trim_end().ends_with("1 match"), "{}", lines[19]);
     assert!(lines[2].starts_with(" ● ") && lines[3].trim().is_empty());
 
+    // Recherche en direct : sans Entrée, la liste suit la frappe après une courte pause.
+    app.apply(Action::Search);
+    for key in "msuite".chars() {
+        app.apply(Action::PromptKey(key));
+    }
+    assert_eq!(app.filter.as_ref().map(|f| f.query.as_str()), Some(&second.to_hex()[..9]), "pas avant la pause");
+    assert_eq!(app.store.len(), 1, "l'ancienne liste reste affichée en attendant");
+    wait(&mut app, "recherche en direct", |app| {
+        app.log_done && app.filter.as_ref().is_some_and(|f| f.query == "suite")
+    });
+    assert!(app.prompt.is_some() && !app.stale);
+    assert_eq!(app.meta(0).subject, "Suite sur main");
+    let live = screen(&mut app, 110, 20);
+    let last = live.lines().last().unwrap();
+    assert!(last.starts_with(" message: suite") && last.trim_end().ends_with("1 match"), "{last}");
+    // Champ vidé : retour au graphe complet, toujours sans quitter la saisie.
+    for _ in 0..5 {
+        app.apply(Action::PromptBackspace);
+    }
+    wait(&mut app, "champ vidé", |app| app.log_done && app.filter.is_none());
+    assert_eq!(app.store.len(), 4);
+    // Échap abandonne : la recherche d'avant l'ouverture du menu revient, sur son commit.
+    app.apply(Action::PromptCancel);
+    assert!(app.prompt.is_none());
+    wait(&mut app, "recherche rétablie", |app| app.log_done);
+    assert_eq!(app.filter.as_ref().map(|f| f.query.as_str()), Some(&second.to_hex()[..9]));
+    assert_eq!((app.store.len(), app.store.oid(app.selected)), (1, second));
+
     // Le sous-menu attend un type ; `+` puis `h` ouvre le champ des lignes ajoutées.
     app.apply(Action::Search);
     let menu = screen(&mut app, 110, 20);
@@ -358,7 +386,9 @@ fn search_filters_the_commits() {
     app.apply(Action::PromptKey('h'));
     app.apply(Action::PromptKey('x'));
     let typing = screen(&mut app, 110, 20);
-    assert!(typing.lines().last().unwrap().starts_with(" +hunk: x"), "{typing}");
+    let last = typing.lines().last().unwrap();
+    assert!(last.starts_with(" +hunk: x") && last.trim_end().ends_with("Enter to search"), "{last}");
+    assert_eq!(app.filter.as_ref().map(|f| f.kind), Some(crate::git::SearchKind::Hash), "les hunks attendent Entrée");
     // Échap abandonne la saisie et garde la recherche appliquée.
     app.apply(Action::PromptCancel);
     assert!(app.prompt.is_none() && app.filter.is_some());

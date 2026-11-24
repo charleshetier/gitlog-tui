@@ -19,6 +19,8 @@ const BATCHES_PER_TICK: usize = 64;
 /// Entrées du cache de métadonnées avant remise à zéro.
 const META_CACHE: usize = 4096;
 const FLASH: Duration = Duration::from_millis(1500);
+/// Pause dans la frappe avant de lancer une recherche en direct : un seul git par mot tapé.
+const LIVE_DELAY: Duration = Duration::from_millis(200);
 
 /// Dessin d'un commit dans le graphe. Un terminal ne superpose pas une puce
 /// et une ligne dans la même cellule : le rail est l'autre façon de les relier.
@@ -182,6 +184,12 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// Recherche appliquée : le graphe cède la place à la liste des commits trouvés.
     pub filter: Option<Filter>,
+    /// La liste affichée est encore celle du flux précédent, en attendant les résultats.
+    pub stale: bool,
+    /// Instant où la recherche en cours de frappe sera lancée.
+    live_at: Option<Instant>,
+    /// Recherche et commit d'avant l'ouverture du menu, rétablis si la saisie est abandonnée.
+    before_search: Option<(Option<Filter>, Option<Oid>)>,
     pub hit: HitMap,
     pub should_quit: bool,
     flash: Option<(String, Instant)>,
@@ -220,6 +228,9 @@ impl App {
             help: false,
             prompt: None,
             filter: None,
+            stale: false,
+            live_at: None,
+            before_search: None,
             hit: HitMap::default(),
             should_quit: false,
             flash: None,
@@ -269,9 +280,27 @@ impl App {
         }
     }
 
+    /// Lignes reçues du flux en cours ; celles d'un flux remplacé ne comptent pas.
+    fn loaded_rows(&self) -> usize {
+        if self.stale { 0 } else { self.store.len() }
+    }
+
+    /// Au premier signe du nouveau flux, la liste de l'ancien est enfin vidée.
+    fn drop_stale(&mut self) {
+        if std::mem::take(&mut self.stale) {
+            self.store = GraphStore::default();
+            self.meta_cache.clear();
+            self.selected = 0;
+            self.top = 0;
+        }
+    }
+
     /// Vrai tant qu'un travail de fond peut encore changer l'écran.
     pub fn busy(&self) -> bool {
-        let loading_log = !self.log_done && self.store.len() < self.wanted_rows();
+        if self.live_at.is_some() {
+            return true;
+        }
+        let loading_log = !self.log_done && self.loaded_rows() < self.wanted_rows();
         let loading_pane = self.pane.as_ref().is_some_and(|p| {
             matches!(p.files, FilesState::Loading) || p.diff.as_ref().is_some_and(|d| !d.done)
         });
@@ -284,7 +313,17 @@ impl App {
 
     /// Absorbe ce que les threads de fond ont produit. Renvoie vrai s'il faut redessiner.
     pub fn tick(&mut self) -> bool {
-        let mut changed = self.pump_log();
+        let mut changed = false;
+        // La saisie s'est calmée : la recherche en cours de frappe est lancée.
+        if self.live_at.is_some_and(|at| at <= Instant::now()) {
+            self.live_at = None;
+            if let Some(Prompt::Input { kind, query }) = &self.prompt {
+                let filter = Filter::new(*kind, query);
+                self.set_filter(filter, None, true);
+                changed = true;
+            }
+        }
+        changed |= self.pump_log();
         changed |= self.pump_worker();
         if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() >= FLASH) {
             self.flash = None;
@@ -297,21 +336,24 @@ impl App {
         let mut changed = false;
         let wanted = self.wanted_rows();
         for _ in 0..BATCHES_PER_TICK {
-            if self.log_done || self.store.len() >= wanted {
+            if self.log_done || self.loaded_rows() >= wanted {
                 break;
             }
             let Some(log) = &self.log else { break };
             match log.rx.try_recv() {
                 Ok(LogMsg::Batch(batch)) => {
+                    self.drop_stale();
                     self.store.append(batch);
                     changed = true;
                 }
                 Ok(LogMsg::Error(err)) => {
+                    self.drop_stale();
                     self.log_error = Some(err);
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.drop_stale();
                     self.log_done = true;
                     self.log = None;
                     changed = true;
@@ -402,7 +444,7 @@ impl App {
         self.hierarchy = None;
         self.close_pane();
         // Le commit est à chercher dans le graphe complet, pas parmi les résultats d'une recherche.
-        self.set_filter(None);
+        self.set_filter(None, None, false);
         match self.store.find(&oid, 0) {
             Some(row) => self.show_row(row),
             None if self.log_done => self.set_flash("This commit is not in the graph"),
@@ -488,12 +530,21 @@ impl App {
     /// Saisie d'une recherche : le sous-menu choisit le type, puis le champ reçoit le texte.
     fn apply_in_prompt(&mut self, action: Action) {
         let Some(prompt) = self.prompt.take() else { return };
+        // Les recherches rapides se relancent d'elles-mêmes, un instant après la dernière frappe.
+        let live = |kind: SearchKind| kind.is_live().then(|| Instant::now() + LIVE_DELAY);
         self.prompt = match (prompt, action) {
             (_, Action::Quit) => {
                 self.should_quit = true;
                 None
             }
-            (_, Action::PromptCancel) => None,
+            (_, Action::PromptCancel) => {
+                // Abandon : retour à la recherche, et au commit, d'avant l'ouverture du menu.
+                self.live_at = None;
+                if let Some((filter, oid)) = self.before_search.take() {
+                    self.set_filter(filter, oid, false);
+                }
+                None
+            }
             (Prompt::Kind { sign }, Action::PromptKey(key)) => {
                 let kind = match (sign, key) {
                     (None, 'c') => Some(SearchKind::Hash),
@@ -514,38 +565,50 @@ impl App {
             (Prompt::Kind { .. }, Action::PromptBackspace) => Some(Prompt::Kind { sign: None }),
             (Prompt::Input { kind, mut query }, Action::PromptKey(key)) => {
                 query.push(key);
+                self.live_at = live(kind);
                 Some(Prompt::Input { kind, query })
             }
             (Prompt::Input { kind, mut query }, Action::PromptBackspace) => {
                 query.pop();
+                self.live_at = live(kind);
                 Some(Prompt::Input { kind, query })
             }
             (Prompt::Input { kind, query }, Action::PromptSubmit) => {
-                let query = query.trim().to_string();
-                // Un champ vide revient au graphe complet.
-                self.set_filter((!query.is_empty()).then_some(Filter { kind, query }));
+                // Entrée lance la recherche sans attendre ; un champ vide revient au graphe complet.
+                self.live_at = None;
+                self.before_search = None;
+                self.set_filter(Filter::new(kind, &query), None, kind.is_live());
                 None
             }
             (prompt, _) => Some(prompt),
         };
     }
 
+    /// Commit sélectionné, s'il y en a un.
+    fn selected_oid(&self) -> Option<Oid> {
+        (self.selected < self.store.len()).then(|| self.store.oid(self.selected))
+    }
+
     /// Applique ou retire une recherche : l'historique est relu depuis le début.
-    fn set_filter(&mut self, filter: Option<Filter>) {
+    /// `goto` est le commit à retrouver dans la nouvelle liste. `soft` garde l'ancienne
+    /// liste à l'écran jusqu'aux premiers résultats, pour une saisie sans clignotement.
+    fn set_filter(&mut self, filter: Option<Filter>, goto: Option<Oid>, soft: bool) {
         if self.filter == filter {
             return;
         }
-        // En quittant une recherche, on retrouve le commit sélectionné dans le graphe complet.
-        let keep = (filter.is_none() && self.selected < self.store.len()).then(|| self.store.oid(self.selected));
         self.close_pane();
-        self.store = GraphStore::default();
-        self.meta_cache.clear();
-        self.selected = 0;
-        self.top = 0;
+        // Avec un commit à retrouver, l'ancienne liste fausserait la recherche de sa ligne.
+        self.stale = soft && goto.is_none();
+        if !self.stale {
+            self.store = GraphStore::default();
+            self.meta_cache.clear();
+            self.selected = 0;
+            self.top = 0;
+        }
         self.log_done = false;
         self.log_error = None;
         self.goto_end = false;
-        self.goto = keep.map(|oid| (oid, 0));
+        self.goto = goto.map(|oid| (oid, 0));
         self.want_all = self.goto.is_some();
         // L'ancien flux est lâché en premier : son git s'arrête, même en pleine recherche.
         self.log = None;
@@ -707,7 +770,8 @@ impl App {
                 3 => self.close_diff(),
                 2 => self.close_pane(),
                 // Une recherche active est un niveau de plus : on en sort d'abord.
-                _ if self.filter.is_some() => self.set_filter(None),
+                // En la quittant, on retrouve le commit sélectionné dans le graphe complet.
+                _ if self.filter.is_some() => self.set_filter(None, self.selected_oid(), false),
                 _ => self.should_quit = quit,
             },
             Action::Move(delta) => self.move_by(delta),
@@ -778,6 +842,7 @@ impl App {
             Action::ToggleHierarchy => self.toggle_hierarchy(),
             Action::Search => {
                 if self.pane.is_none() {
+                    self.before_search = Some((self.filter.clone(), self.selected_oid()));
                     self.prompt = Some(Prompt::Kind { sign: None });
                 }
             }
