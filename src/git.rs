@@ -537,7 +537,10 @@ impl DiffWorker {
                         stream_diff(&root, id, &oid, &paths, (full, syntax), &latest_in_thread, &msg_tx)
                     }
                     DiffReq::Hierarchy { id } => {
-                        let result = load_hierarchy(&repo).map_err(|e| format!("{e:#}"));
+                        // Le dépôt est relu : la branche courante a pu changer hors de gitlog.
+                        let result = Repo::open(&repo.root)
+                            .and_then(|repo| load_hierarchy(&repo))
+                            .map_err(|e| format!("{e:#}"));
                         msg_tx.send(DiffMsg::Hierarchy { id, result }).is_ok()
                     }
                 };

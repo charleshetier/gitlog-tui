@@ -906,6 +906,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("h", "Branch hierarchy"),
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
     ("S", "Commit style: dots or rail"),
+    ("R", "Refresh: reload the commits, branches and tags"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),
     ("", ""),

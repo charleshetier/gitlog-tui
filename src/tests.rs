@@ -470,6 +470,87 @@ fn syntax_colours_the_diff() {
 }
 
 #[test]
+fn refresh_reloads_the_repository() {
+    use crate::git::Head;
+
+    let dir = make_repo("refresh");
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    screen(&mut app, 100, 12);
+    let before = app.store.len();
+    app.apply(Action::Move(2));
+    let kept = app.store.oid(2);
+
+    // Le dépôt bouge hors de gitlog : une branche, un commit.
+    git(&dir, &["checkout", "-q", "-b", "later"]);
+    std::fs::write(dir.join("f.txt"), "plus tard\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Commit venu d'ailleurs"]);
+    assert!(!screen(&mut app, 100, 12).contains("Commit venu d'ailleurs"));
+
+    app.apply(Action::Refresh);
+    assert_eq!(app.flash(), Some("Refreshed"));
+    // L'ancienne liste reste à l'écran jusqu'à l'arrivée de la nouvelle.
+    assert_eq!(app.store.len(), before);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    assert_eq!(app.store.len(), before + 1);
+    assert_eq!(app.repo.head, Head::Branch("later".to_string()));
+    // Le commit sélectionné l'est toujours, une ligne plus bas.
+    assert_eq!((app.selected, app.store.oid(app.selected)), (3, kept));
+    let view = screen(&mut app, 100, 12);
+    assert!(view.contains("Commit venu d'ailleurs") && view.contains("later"), "{view}");
+
+    // Plus bas dans l'historique, la ligne sélectionnée ne bouge pas à l'écran.
+    screen(&mut app, 100, 6);
+    app.apply(Action::Bottom);
+    let top = app.top;
+    assert!(app.selected == 4 && top > 0, "la liste a défilé : {top}");
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "Encore un"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    assert_eq!((app.selected, app.top), (5, top + 1));
+    git(&dir, &["reset", "-q", "--hard", "HEAD~1"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    app.apply(Action::Top);
+    app.apply(Action::Move(3));
+    screen(&mut app, 100, 12);
+    assert_eq!((app.top, app.store.oid(app.selected)), (0, kept));
+
+    // Un volet ouvert le reste, sur le même commit.
+    app.apply(Action::Open);
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    assert_eq!((app.depth(), app.pane.as_ref().map(|p| p.oid)), (2, Some(kept)));
+    assert_eq!(app.store.oid(app.selected), kept);
+    app.apply(Action::GoLevel(1));
+
+    // Le commit affiché disparaît de l'historique : le volet se referme.
+    app.apply(Action::Top);
+    app.apply(Action::Open);
+    assert_eq!(app.depth(), 2);
+    git(&dir, &["reset", "-q", "--hard", "HEAD~1"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    assert_eq!((app.depth(), app.store.len()), (1, before));
+    assert_eq!(app.flash(), Some("This commit is not in the graph"));
+
+    // Dans la hiérarchie des branches, les branches sont relues elles aussi.
+    app.apply(Action::ToggleHierarchy);
+    let ready = |app: &App| app.hierarchy.as_ref().is_some_and(|h| !matches!(h.state, HierState::Loading));
+    wait(&mut app, "hiérarchie", ready);
+    assert!(!screen(&mut app, 100, 12).contains("toute-neuve"));
+    git(&dir, &["branch", "toute-neuve"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "hiérarchie", ready);
+    assert!(screen(&mut app, 100, 12).contains("toute-neuve"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn search_filters_the_commits() {
     let dir = make_repo("search");
     let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();

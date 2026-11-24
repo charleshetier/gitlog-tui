@@ -183,6 +183,8 @@ pub enum Action {
     Horizontal(isize),
     ToggleHierarchy,
     CycleNodes,
+    /// Relit le dépôt : branche courante, refs et historique.
+    Refresh,
     ToggleHelp,
     /// Ouvre le sous-menu de recherche.
     Search,
@@ -229,6 +231,8 @@ pub struct App {
     goto_end: bool,
     /// Commit à atteindre dès qu'il sera chargé, et lignes déjà examinées.
     goto: Option<(Oid, usize)>,
+    /// Écart entre la ligne sélectionnée et le haut de l'écran, à rétablir après un rafraîchissement.
+    keep_offset: Option<usize>,
     meta_reader: MetaReader,
     meta_cache: HashMap<usize, Meta>,
     diffs: DiffWorker,
@@ -270,6 +274,7 @@ impl App {
             log,
             goto_end: false,
             goto: None,
+            keep_offset: None,
             meta_cache: HashMap::new(),
             clipboard: None,
         })
@@ -396,13 +401,21 @@ impl App {
                 }
             }
         }
-        if let Some((oid, scanned)) = self.goto {
+        // Tant que l'ancienne liste est à l'écran, le commit n'est pas à y chercher.
+        if let Some((oid, scanned)) = self.goto.filter(|_| !self.stale) {
             if let Some(row) = self.store.find(&oid, scanned) {
                 self.goto = None;
                 self.show_row(row);
+                // Après un rafraîchissement, la ligne revient à la hauteur où elle était.
+                if let Some(offset) = self.keep_offset.take() {
+                    self.top = row.saturating_sub(offset);
+                }
                 changed = true;
             } else if self.log_done {
                 self.goto = None;
+                self.keep_offset = None;
+                // Le volet montrait ce commit : il n'a plus de ligne à laquelle se rattacher.
+                self.close_pane();
                 self.set_flash("This commit is not in the graph");
                 changed = true;
             } else {
@@ -687,8 +700,16 @@ impl App {
             return;
         }
         self.close_pane();
-        // Avec un commit à retrouver, l'ancienne liste fausserait la recherche de sa ligne.
-        self.stale = soft && goto.is_none();
+        self.filter = filter;
+        // Un commit à retrouver passe avant le confort de la saisie : la liste repart de zéro.
+        self.restart_log(goto, soft && goto.is_none());
+    }
+
+    /// Relit l'historique depuis le début, avec la recherche en place. `goto` est le
+    /// commit à retrouver ; `soft` garde l'ancienne liste à l'écran jusqu'aux
+    /// premières lignes de la nouvelle.
+    fn restart_log(&mut self, goto: Option<Oid>, soft: bool) {
+        self.stale = soft;
         if !self.stale {
             self.store = GraphStore::default();
             self.meta_cache.clear();
@@ -702,8 +723,31 @@ impl App {
         self.want_all = self.goto.is_some();
         // L'ancien flux est lâché en premier : son git s'arrête, même en pleine recherche.
         self.log = None;
-        self.log = Some(git::spawn_log(self.repo.root.clone(), filter.clone()));
-        self.filter = filter;
+        self.log = Some(git::spawn_log(self.repo.root.clone(), self.filter.clone()));
+    }
+
+    /// `R` : relit le dépôt, que d'autres commandes ont pu faire bouger. La branche
+    /// courante, les refs et l'historique sont rechargés ; la recherche, le commit
+    /// sélectionné et le volet ouvert restent en place.
+    fn refresh(&mut self) {
+        let reloaded = Repo::open(&self.repo.root).and_then(|repo| Ok((git::load_labels(&repo)?, repo)));
+        match reloaded {
+            Ok((labels, repo)) => {
+                self.repo = repo;
+                self.labels = labels;
+            }
+            Err(err) => return self.set_flash(format!("Refresh failed: {err:#}")),
+        }
+        if self.hierarchy.is_some() {
+            self.hierarchy = None;
+            self.toggle_hierarchy();
+        }
+        // Le commit affiché garde sa place à l'écran, même si sa ligne change. En haut de
+        // l'historique, la vue y reste : c'est là qu'arrivent les nouveaux commits.
+        let current = self.pane.as_ref().map(|pane| pane.oid).or_else(|| self.selected_oid());
+        self.keep_offset = current.filter(|_| self.top > 0).map(|_| self.selected.saturating_sub(self.top));
+        self.restart_log(current, true);
+        self.set_flash("Refreshed");
     }
 
     /// Chemin du dossier du dépôt, avec les séparateurs du système.
@@ -852,6 +896,10 @@ impl App {
         if self.copy_from_header(&action) {
             return;
         }
+        // Valable dans toutes les vues, hiérarchie des branches comprise.
+        if matches!(action, Action::Refresh) {
+            return self.refresh();
+        }
         if self.hierarchy.is_some() {
             return self.apply_in_hierarchy(action);
         }
@@ -942,6 +990,8 @@ impl App {
             }
             // Hors saisie, ces touches n'arrivent pas jusqu'ici.
             Action::PromptKey(_) | Action::PromptBackspace | Action::PromptSubmit | Action::PromptCancel => {}
+            // Traitée plus haut, dans toutes les vues.
+            Action::Refresh => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,
