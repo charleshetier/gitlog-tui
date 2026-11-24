@@ -49,6 +49,7 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       n p next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       h branch hierarchy · S commit style · R refresh · ? all shortcuts
+      o show or hide the remote branches (origin)
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
 
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
@@ -209,6 +210,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('s') => Action::Search,
         KeyCode::Char('S') => Action::CycleNodes,
         KeyCode::Char('R') => Action::Refresh,
+        KeyCode::Char('o') => Action::ToggleRemotes,
         KeyCode::Char('y') => Action::CopySelected,
         KeyCode::Char('n') => Action::Step(1),
         KeyCode::Char('p') => Action::Step(-1),

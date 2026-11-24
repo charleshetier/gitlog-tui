@@ -434,9 +434,11 @@ fn syntax_colours_the_diff() {
     let (comment, _) = colours(&buffer, "// greeting");
     assert!(rgb(keyword) && rgb(comment) && keyword != comment, "{keyword:?} {comment:?}");
     // La modification garde son fond, assombri sous les teintes ; le texte y est coloré aussi.
-    let (removed, removed_bg) = colours(&buffer, "\"hello\"");
-    let (added, added_bg) = colours(&buffer, "\"bonjour\"");
-    assert!(rgb(removed) && removed == added);
+    // La teinte est lue dans la chaîne : selon le thème, ses guillemets n'en ont pas.
+    let (_, removed_bg) = colours(&buffer, "\"hello\"");
+    let (_, added_bg) = colours(&buffer, "\"bonjour\"");
+    let (removed, added) = (colours(&buffer, "hello\"").0, colours(&buffer, "bonjour\"").0);
+    assert!(rgb(removed) && removed == added, "{removed:?} {added:?}");
     assert_eq!((removed_bg, added_bg), (Color::Rgb(63, 0, 1), Color::Rgb(0, 40, 0)));
     // Dans la ligne modifiée, seul le mot qui change porte le fond soutenu.
     assert_eq!(colours(&buffer, "hello\"").1, Color::Rgb(128, 0, 8));
@@ -447,7 +449,7 @@ fn syntax_colours_the_diff() {
     let buffer = draw(&mut app);
     assert!(!screen(&mut app, 120, 24).contains("pub fn hello"));
     assert_eq!(colours(&buffer, "fn hello").0, keyword);
-    assert_eq!(colours(&buffer, "\"bonjour\"").0, added);
+    assert_eq!(colours(&buffer, "bonjour\"").0, added);
 
     // Le fichier entier est coloré de la même façon.
     app.apply(Action::Horizontal(-4));
@@ -559,6 +561,39 @@ fn search_narrows_the_commit_details() {
     search(&mut app, "m", "trois");
     assert_eq!(files(&mut app).1, 0);
     assert_eq!(hunks(&mut app).0, 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remote_branches_are_shortened_and_hidden() {
+    let dir = make_repo("remotes");
+    // origin/main suit main ; origin/feature est resté en arrière de feature.
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "main"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/feature", "v0.1.0"]);
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+
+    // Sur la ligne de sa branche locale, la branche distante se réduit à « &origin ».
+    let view = screen(&mut app, 110, 12);
+    println!("{view}");
+    let line = |view: &str, subject: &str| view.lines().find(|l| l.contains(subject)).unwrap().to_string();
+    assert!(line(&view, "Merge de feature").contains("◀ main  ◀ &origin  Merge de feature"), "{view}");
+    assert!(!view.contains("origin/main"));
+    // Ailleurs, elle garde son nom entier.
+    assert!(line(&view, "Squelette initial").contains("◀ origin/feature "), "{view}");
+    assert!(line(&view, "Travail sur la branche").contains("◀ feature  Travail"), "{view}");
+
+    // `o` masque les branches distantes, puis les rend.
+    app.apply(Action::ToggleRemotes);
+    assert_eq!(app.flash(), Some("Remote branches hidden"));
+    let view = screen(&mut app, 110, 12);
+    assert!(!view.contains("origin"), "{view}");
+    assert!(view.contains("◀ main  Merge de feature") && view.contains("◀ v0.1.0 "), "{view}");
+    app.apply(Action::ToggleRemotes);
+    assert_eq!(app.flash(), Some("Remote branches shown"));
+    assert!(screen(&mut app, 110, 12).contains("&origin"));
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);

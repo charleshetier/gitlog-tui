@@ -356,7 +356,7 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
 
         let mut x = text_x;
         if let Some(labels) = app.labels.get(&oid) {
-            x = draw_labels(buf, x, y, text_end, labels, color, app.plain);
+            x = draw_labels(buf, x, y, text_end, labels, color, app.plain, app.show_remotes);
         }
         put(buf, x, y, text_end, &meta.subject, bright);
     }
@@ -366,7 +366,39 @@ fn copy_icon(plain: bool) -> &'static str {
     if plain { COPY_PLAIN } else { COPY }
 }
 
+/// Étiquettes d'un commit avec leur texte, dans l'ordre d'affichage. Une branche
+/// distante posée sur le même commit que la branche locale du même nom la suit,
+/// réduite à « &origin » : son nom n'apprendrait rien de plus. `remotes` à faux
+/// écarte les branches distantes.
+fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label)> {
+    // Le dépôt distant, si `remote` est la branche `local` chez lui.
+    let twin = |local: &Label, remote: &Label| -> Option<String> {
+        let (origin, branch) = remote.name.split_once('/')?;
+        (remote.kind == RefKind::Remote && local.kind == RefKind::Local && branch == local.name)
+            .then(|| format!("&{origin}"))
+    };
+    let mut out: Vec<(String, &Label)> = Vec::new();
+    for label in labels {
+        match label.kind {
+            RefKind::Local => {
+                out.push((label.name.clone(), label));
+                if remotes {
+                    out.extend(labels.iter().filter_map(|remote| Some((twin(label, remote)?, remote))));
+                }
+            }
+            RefKind::Remote => {
+                if remotes && !labels.iter().any(|local| twin(local, label).is_some()) {
+                    out.push((label.name.clone(), label));
+                }
+            }
+            RefKind::Tag => out.push((label.name.clone(), label)),
+        }
+    }
+    out
+}
+
 /// Étiquettes en flèche pointant vers le commit, à gauche.
+#[allow(clippy::too_many_arguments)]
 fn draw_labels(
     buf: &mut Buffer,
     mut x: u16,
@@ -375,13 +407,15 @@ fn draw_labels(
     labels: &[Label],
     color: Color,
     plain: bool,
+    remotes: bool,
 ) -> u16 {
     let arrow = if plain { ARROW_PLAIN } else { ARROW };
-    for (i, label) in labels.iter().enumerate() {
-        let name: String = if label.name.chars().count() > 32 {
-            label.name.chars().take(31).chain(['…']).collect()
+    let labels = label_texts(labels, remotes);
+    for (i, (name, label)) in labels.iter().enumerate() {
+        let name: String = if name.chars().count() > 32 {
+            name.chars().take(31).chain(['…']).collect()
         } else {
-            label.name.clone()
+            name.clone()
         };
         let remaining = labels.len() - i;
         // Place gardée pour le compteur « +N » des étiquettes non affichées.
@@ -911,6 +945,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
     ("S", "Commit style: dots or rail"),
     ("R", "Refresh: reload the commits, branches and tags"),
+    ("o", "Show or hide the remote branches (origin)"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),
     ("", ""),

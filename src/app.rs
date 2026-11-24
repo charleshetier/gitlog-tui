@@ -187,6 +187,8 @@ pub enum Action {
     CycleNodes,
     /// Relit le dépôt : branche courante, refs et historique.
     Refresh,
+    /// Affiche ou masque les étiquettes des branches distantes.
+    ToggleRemotes,
     ToggleHelp,
     /// Ouvre le sous-menu de recherche.
     Search,
@@ -203,6 +205,8 @@ pub struct App {
     /// Coloration syntaxique des diffs ; demande un terminal 24 bits.
     pub syntax: bool,
     pub node_style: NodeStyle,
+    /// Étiquettes des branches distantes (`origin/…`) visibles dans le graphe.
+    pub show_remotes: bool,
     pub store: GraphStore,
     pub labels: HashMap<Oid, Vec<Label>>,
     pub log_done: bool,
@@ -253,6 +257,7 @@ impl App {
             plain,
             syntax: true,
             node_style: NodeStyle::Dots,
+            show_remotes: true,
             store: GraphStore::default(),
             labels,
             log_done: false,
@@ -926,6 +931,11 @@ impl App {
         if matches!(action, Action::Refresh) {
             return self.refresh();
         }
+        if matches!(action, Action::ToggleRemotes) {
+            self.show_remotes = !self.show_remotes;
+            let state = if self.show_remotes { "shown" } else { "hidden" };
+            return self.set_flash(format!("Remote branches {state}"));
+        }
         if self.hierarchy.is_some() {
             return self.apply_in_hierarchy(action);
         }
@@ -1016,8 +1026,8 @@ impl App {
             }
             // Hors saisie, ces touches n'arrivent pas jusqu'ici.
             Action::PromptKey(_) | Action::PromptBackspace | Action::PromptSubmit | Action::PromptCancel => {}
-            // Traitée plus haut, dans toutes les vues.
-            Action::Refresh => {}
+            // Traitées plus haut, dans toutes les vues.
+            Action::Refresh | Action::ToggleRemotes => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,
