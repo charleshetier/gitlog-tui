@@ -202,6 +202,12 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
             if app.help || hit.help.is_some_and(|rect| rect.contains(pos)) {
                 return Some(Action::ToggleHelp);
             }
+            if hit.folder.is_some_and(|rect| rect.contains(pos)) {
+                return Some(Action::CopyFolder);
+            }
+            if hit.remote.is_some_and(|rect| rect.contains(pos)) {
+                return Some(Action::CopyRemote);
+            }
             if let Some((_, level)) = hit.chips.iter().find(|(rect, _)| rect.contains(pos)) {
                 return Some(Action::GoLevel(*level));
             }

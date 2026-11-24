@@ -57,8 +57,21 @@ pub enum Head {
 #[derive(Clone, Debug)]
 pub struct Repo {
     pub root: PathBuf,
+    /// Nom du dossier racine.
     pub name: String,
+    /// Nom du dépôt distant, tiré de l'URL de `origin`.
+    pub remote_name: Option<String>,
+    /// URL du remote `origin`.
+    pub remote_url: Option<String>,
     pub head: Head,
+}
+
+/// Nom du dépôt dans une URL de remote : `https://hôte/qui/nom.git`, `git@hôte:qui/nom.git`.
+fn repo_name(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches(['/', '\\']);
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let name = url.rsplit(['/', '\\', ':']).next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 impl Repo {
@@ -85,7 +98,12 @@ impl Repo {
             (Ok(branch), Some(_)) => Head::Branch(branch.trim().to_string()),
             (Err(_), Some(oid)) => Head::Detached(oid),
         };
-        Ok(Repo { root, name, head })
+        let remote_url = output(&root, &["remote", "get-url", "origin"])
+            .ok()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        let remote_name = remote_url.as_deref().and_then(repo_name);
+        Ok(Repo { root, name, remote_name, remote_url, head })
     }
 }
 
@@ -544,6 +562,15 @@ fn load_hierarchy(repo: &Repo) -> Result<(Vec<BranchRow>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_name_from_remote_url() {
+        assert_eq!(repo_name("https://example.com/alice/gitlog-tui.git\n").as_deref(), Some("gitlog-tui"));
+        assert_eq!(repo_name("git@example.com:alice/gitlog-tui.git").as_deref(), Some("gitlog-tui"));
+        assert_eq!(repo_name("ssh://example.com/alice/tools/").as_deref(), Some("tools"));
+        assert_eq!(repo_name("C:\\repos\\bare.git").as_deref(), Some("bare"));
+        assert_eq!(repo_name(""), None);
+    }
 
     #[test]
     fn commit_object_is_parsed() {

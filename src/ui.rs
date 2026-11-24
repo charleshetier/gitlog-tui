@@ -49,6 +49,11 @@ const ARROW: &str = "\u{e0b2}";
 const ARROW_PLAIN: &str = "◀";
 const COPY: &str = "\u{f0c5}";
 const COPY_PLAIN: &str = "⧉";
+/// Glyphe « code fork » de Font Awesome (Nerd Font), de la même famille que l'icône dossier.
+const REPO: &str = "\u{f126}";
+const REPO_PLAIN: &str = "◆";
+const FOLDER: &str = "\u{f07b}";
+const FOLDER_PLAIN: &str = "⌂";
 
 fn palette(index: u8) -> Color {
     PALETTE[index as usize % PALETTE.len()]
@@ -202,7 +207,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_header(buf: &mut Buffer, app: &App, area: Rect) {
+/// Titre de l'en-tête : le dossier puis le dépôt distant, chacun derrière son icône.
+/// Sans dépôt distant, le dossier tient lieu de titre. Renvoie la colonne suivante.
+/// Un clic sur l'un ou l'autre copie le chemin du dossier ou l'URL du remote.
+fn draw_title(buf: &mut Buffer, app: &mut App, x: u16, y: u16, end: u16) -> u16 {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let (repo_icon, folder_icon) = if app.plain { (REPO_PLAIN, FOLDER_PLAIN) } else { (REPO, FOLDER) };
+    let folder_x = x;
+    let x = put(buf, x, y, end, folder_icon, Style::new().fg(DIM));
+    let x = put(buf, x + 1, y, end, &app.repo.name, bold);
+    app.hit.folder = Some(Rect::new(folder_x, y, x - folder_x, 1));
+    let Some(remote) = &app.repo.remote_name else { return x };
+    let remote_x = x + 2;
+    let x = put(buf, remote_x, y, end, repo_icon, Style::new().fg(ACCENT));
+    let x = put(buf, x + 1, y, end, remote, bold);
+    app.hit.remote = Some(Rect::new(remote_x, y, x.saturating_sub(remote_x), 1));
+    x
+}
+
+fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
     let end = area.right() - 1;
     let dim = Style::new().fg(DIM);
     let n = thousands(app.store.len());
@@ -218,8 +241,7 @@ fn draw_header(buf: &mut Buffer, app: &App, area: Rect) {
     let count_x = put_right(buf, area.x + 10, area.y, end, &count, dim);
 
     let text_end = count_x.saturating_sub(2);
-    let mut x = put(buf, area.x + 1, area.y, text_end, "gitlog", Style::new().add_modifier(Modifier::BOLD));
-    x = put(buf, x + 2, area.y, text_end, &app.repo.name, dim);
+    let x = draw_title(buf, app, area.x + 1, area.y, text_end);
     let head = match &app.repo.head {
         Head::Branch(name) => format!(" · HEAD on {name}"),
         Head::Detached(oid) => format!(" · detached HEAD at {}", oid.short()),
@@ -630,8 +652,7 @@ fn draw_hierarchy(buf: &mut Buffer, app: &mut App, header: Rect, body: Rect) {
     let plain = app.plain;
     app.pane_height = body.height as usize;
 
-    let mut x = put(buf, header.x + 1, header.y, end, "gitlog", Style::new().add_modifier(Modifier::BOLD));
-    x = put(buf, x + 2, header.y, end, &app.repo.name, dim);
+    let x = draw_title(buf, app, header.x + 1, header.y, end);
     put(buf, x, header.y, end, " · branch hierarchy", dim);
 
     let Some(view) = &mut app.hierarchy else { return };
@@ -742,6 +763,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("", "Mouse"),
     ("Click", "Open a commit or a file"),
     ("Click copy icon", "Copy the hash of the open commit"),
+    ("Click header", "On the folder: copy its path; on the repo: its URL"),
     ("Wheel", "Scroll the graph or the pane"),
 ];
 

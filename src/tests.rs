@@ -71,6 +71,7 @@ fn screen(app: &mut App, width: u16, height: u16) -> String {
 #[test]
 fn three_levels_end_to_end() {
     let dir = make_repo("levels");
+    git(&dir, &["remote", "add", "origin", "https://example.com/alice/demo.git"]);
     let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
     wait(&mut app, "historique", |app| app.log_done);
     assert_eq!(app.store.len(), 4);
@@ -80,6 +81,17 @@ fn three_levels_end_to_end() {
     println!("{level1}");
     let lines: Vec<&str> = level1.lines().collect();
     assert!(lines[0].contains("HEAD on main") && lines[0].contains("4 commits"));
+    // En-tête : le dossier puis le dépôt distant, chacun derrière son icône.
+    assert!(lines[0].starts_with(" ⌂ gitlog-test-levels-"), "{}", lines[0]);
+    assert!(lines[0].contains("  ◆ demo · HEAD on main"), "{}", lines[0]);
+    // Les deux noms sont cliquables : chemin du dossier, URL du remote.
+    let (folder, remote) = (app.hit.folder.unwrap(), app.hit.remote.unwrap());
+    assert_eq!((folder.x, folder.y, remote.y), (1, 0, 0));
+    assert_eq!(remote.width, 6, "icône, espace, « demo »");
+    assert!(folder.right() < remote.x);
+    assert_eq!(app.repo.remote_url.as_deref(), Some("https://example.com/alice/demo.git"));
+    assert!(app.folder_path().ends_with(&format!("gitlog-test-levels-{}", std::process::id())));
+    assert_eq!(app.folder_path().contains('/'), !cfg!(windows));
     assert!(lines[2].contains("●─╮") && lines[2].contains("◀ main ") && lines[2].contains("Merge de feature"));
     assert!(!lines[2].contains("⧉") && lines[2].contains("Alice"));
     assert!(level1.contains("◀ feature ") && level1.contains("◀ v0.1.0 "));

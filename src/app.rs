@@ -110,6 +110,9 @@ pub struct HitMap {
     pub pane_copy: Option<Rect>,
     /// Rappel « ? » de la barre d'état, qui ouvre le panneau des raccourcis.
     pub help: Option<Rect>,
+    /// Nom du dossier et nom du dépôt dans l'en-tête : un clic copie le chemin ou l'URL.
+    pub folder: Option<Rect>,
+    pub remote: Option<Rect>,
     pub branches: Rect,
     pub branch_top: usize,
 }
@@ -131,6 +134,10 @@ pub enum Action {
     CopySelected,
     /// Copie le hash du commit affiché, quel que soit le niveau.
     CopyHash,
+    /// Copie le chemin du dossier du dépôt.
+    CopyFolder,
+    /// Copie l'URL du remote `origin`.
+    CopyRemote,
     /// Élément voisin : fichier dans un diff, commit dans la liste des fichiers.
     Step(isize),
     ScrollGraph(isize),
@@ -458,6 +465,25 @@ impl App {
         }
     }
 
+    /// Chemin du dossier du dépôt, avec les séparateurs du système.
+    pub fn folder_path(&self) -> String {
+        let path = self.repo.root.display().to_string();
+        if cfg!(windows) { path.replace('/', "\\") } else { path }
+    }
+
+    /// Copies déclenchées depuis l'en-tête, valables dans toutes les vues.
+    fn copy_from_header(&mut self, action: &Action) -> bool {
+        let text = match action {
+            Action::CopyFolder => Some(self.folder_path()),
+            Action::CopyRemote => self.repo.remote_url.clone(),
+            _ => return false,
+        };
+        if let Some(text) = text {
+            self.copy(text);
+        }
+        true
+    }
+
     /// Hash du commit affiché : celui du volet, sinon celui de la ligne sélectionnée.
     fn current_hash(&self) -> Option<String> {
         match &self.pane {
@@ -578,6 +604,9 @@ impl App {
             }
             return;
         }
+        if self.copy_from_header(&action) {
+            return;
+        }
         if self.hierarchy.is_some() {
             return self.apply_in_hierarchy(action);
         }
@@ -623,7 +652,8 @@ impl App {
                 self.open_commit(row);
             }
             Action::ClickFile(index) => self.open_file(index),
-            Action::ClickBranch(_) | Action::ToggleHelp => {}
+            // Déjà traitées plus haut, quelle que soit la vue.
+            Action::ClickBranch(_) | Action::ToggleHelp | Action::CopyFolder | Action::CopyRemote => {}
             Action::CopySelected => {
                 if let Some(text) = self.copy_target() {
                     self.copy(text);
