@@ -221,6 +221,22 @@ impl Filter {
         let query = query.trim();
         (!query.is_empty()).then(|| Filter { kind, query: query.to_string() })
     }
+
+    /// Vrai si la recherche porte sur le contenu d'un commit : elle restreint alors
+    /// aussi le détail du commit, fichiers et hunks.
+    pub fn narrows_detail(&self) -> bool {
+        self.kind == SearchKind::File || self.hunk_signs().is_some()
+    }
+
+    /// Signes des lignes de diff où une recherche dans les hunks lit le texte.
+    fn hunk_signs(&self) -> Option<&'static [u8]> {
+        match self.kind {
+            SearchKind::Hunk => Some(b"+-"),
+            SearchKind::HunkAdded => Some(b"+"),
+            SearchKind::HunkRemoved => Some(b"-"),
+            SearchKind::Hash | SearchKind::Message | SearchKind::File => None,
+        }
+    }
 }
 
 /// Flux de `git log` en cours. Le lâcher arrête git, même s'il cherche encore.
@@ -491,16 +507,29 @@ fn parse_commit(raw: &str) -> Meta {
     meta
 }
 
+/// Demande du diff d'un fichier.
+pub struct FileReq {
+    pub oid: Oid,
+    /// Chemin du fichier dans ce commit, puis l'ancien s'il a été renommé.
+    pub paths: Vec<String>,
+    /// Le fichier entier, contexte compris, et non les seuls hunks.
+    pub full: bool,
+    /// Avec la coloration syntaxique.
+    pub syntax: bool,
+    /// Recherche active : seuls les hunks qui y répondent sont gardés.
+    pub filter: Option<Filter>,
+}
+
 pub enum DiffReq {
-    Files { id: u64, oid: Oid },
-    /// `full` : le fichier entier, contexte compris, et non les seuls hunks ;
-    /// `syntax` : avec la coloration syntaxique.
-    File { id: u64, oid: Oid, paths: Vec<String>, full: bool, syntax: bool },
+    /// `filter` : recherche active, qui ne garde que les fichiers concernés.
+    Files { id: u64, oid: Oid, filter: Option<Filter> },
+    File { id: u64, req: FileReq },
     Hierarchy { id: u64 },
 }
 
 pub enum DiffMsg {
-    Files { id: u64, result: Result<Vec<FileEntry>, String> },
+    /// Fichiers du commit et nombre de ceux qu'une recherche a écartés.
+    Files { id: u64, result: Result<(Vec<FileEntry>, usize), String> },
     Lines { id: u64, lines: Vec<DiffLine>, done: bool },
     /// Lignes de l'arbre des branches et nombre de branches laissées de côté.
     Hierarchy { id: u64, result: Result<(Vec<BranchRow>, usize), String> },
@@ -529,13 +558,11 @@ impl DiffWorker {
                     req = newer;
                 }
                 let sent = match req {
-                    DiffReq::Files { id, oid } => {
-                        let result = list_files(&root, &oid).map_err(|e| format!("{e:#}"));
+                    DiffReq::Files { id, oid, filter } => {
+                        let result = list_files(&root, &oid, filter.as_ref()).map_err(|e| format!("{e:#}"));
                         msg_tx.send(DiffMsg::Files { id, result }).is_ok()
                     }
-                    DiffReq::File { id, oid, paths, full, syntax } => {
-                        stream_diff(&root, id, &oid, &paths, (full, syntax), &latest_in_thread, &msg_tx)
-                    }
+                    DiffReq::File { id, req } => stream_diff(&root, id, &req, &latest_in_thread, &msg_tx),
                     DiffReq::Hierarchy { id } => {
                         // Le dépôt est relu : la branche courante a pu changer hors de gitlog.
                         let result = Repo::open(&repo.root)
@@ -556,15 +583,15 @@ impl DiffWorker {
         self.latest.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    pub fn request_files(&self, oid: Oid) -> u64 {
+    pub fn request_files(&self, oid: Oid, filter: Option<Filter>) -> u64 {
         let id = self.next_id();
-        let _ = self.tx.send(DiffReq::Files { id, oid });
+        let _ = self.tx.send(DiffReq::Files { id, oid, filter });
         id
     }
 
-    pub fn request_file(&self, oid: Oid, paths: Vec<String>, full: bool, syntax: bool) -> u64 {
+    pub fn request_file(&self, req: FileReq) -> u64 {
         let id = self.next_id();
-        let _ = self.tx.send(DiffReq::File { id, oid, paths, full, syntax });
+        let _ = self.tx.send(DiffReq::File { id, req });
         id
     }
 
@@ -583,31 +610,171 @@ impl DiffWorker {
 /// Options communes : un merge est comparé à son premier parent.
 const SHOW_ARGS: [&str; 5] = ["show", "--format=", "--diff-merges=first-parent", "-M", "--no-color"];
 
-fn list_files(root: &Path, oid: &Oid) -> Result<Vec<FileEntry>> {
+/// Fichiers d'un commit. Une recherche sur les fichiers ou les hunks ne garde que
+/// ceux qui y répondent ; le second nombre compte les fichiers écartés.
+fn list_files(root: &Path, oid: &Oid, filter: Option<&Filter>) -> Result<(Vec<FileEntry>, usize)> {
     let hex = oid.to_hex();
     let mut args = SHOW_ARGS.to_vec();
     args.extend(["--raw", "--numstat", "--no-abbrev", hex.as_str()]);
-    Ok(parse_files(&output(root, &args)?))
+    let mut files = parse_files(&output(root, &args)?);
+    let Some(filter) = filter.filter(|f| f.narrows_detail()) else {
+        return Ok((files, 0));
+    };
+    let needle = filter.query.to_lowercase();
+    let keep: Vec<bool> = match filter.hunk_signs() {
+        None => {
+            let named = |path: &String| path.to_lowercase().contains(&needle);
+            files.iter().map(|file| named(&file.path) || file.old_path.as_ref().is_some_and(named)).collect()
+        }
+        Some(signs) => {
+            let matching = files_with_hunk(root, &hex, &filter.query, &needle, signs)?;
+            files.iter().map(|file| matching.contains(&file.path)).collect()
+        }
+    };
+    // Aucun fichier retenu (un merge, comparé à son seul premier parent) : la liste reste entière.
+    if !keep.contains(&true) {
+        return Ok((files, 0));
+    }
+    let total = files.len();
+    let mut keep = keep.into_iter();
+    files.retain(|_| keep.next().unwrap_or(false));
+    let hidden = total - files.len();
+    Ok((files, hidden))
+}
+
+/// Chemins des fichiers d'un commit dont une ligne ajoutée ou retirée, selon
+/// `signs`, contient `needle`. git désigne d'abord les fichiers candidats, puis
+/// leur patch, dans le même ordre, donne le signe de chaque ligne.
+fn files_with_hunk(root: &Path, hex: &str, query: &str, needle: &str, signs: &[u8]) -> Result<Vec<String>> {
+    let pickaxe = format!("-G{}", regex_escape(query));
+    let mut common = SHOW_ARGS.to_vec();
+    common.extend(["--no-ext-diff", "-i", pickaxe.as_str()]);
+
+    let mut args = common.clone();
+    args.extend(["--name-only", "-z", hex]);
+    let names = output(root, &args)?;
+    let names: Vec<&str> = names.split('\0').filter(|name| !name.is_empty()).collect();
+    if signs.len() > 1 {
+        return Ok(names.into_iter().map(String::from).collect());
+    }
+
+    let mut args = common;
+    args.extend(["-p", "-U0", hex]);
+    let patch = git(root).args(&args).stderr(Stdio::null()).output()?;
+    let mut matching: Vec<String> = Vec::new();
+    // Rang du fichier dont le patch est en cours de lecture.
+    let mut file = 0usize;
+    let mut in_hunk = false;
+    for line in patch.stdout.split(|&byte| byte == b'\n') {
+        if line.starts_with(b"diff --git ") {
+            file += 1;
+            in_hunk = false;
+        } else if line.first() == Some(&b'@') {
+            in_hunk = true;
+        } else if in_hunk
+            && line.first().is_some_and(|sign| signs.contains(sign))
+            && String::from_utf8_lossy(&line[1..]).to_lowercase().contains(needle)
+            && let Some(name) = names.get(file.wrapping_sub(1))
+            && matching.last().map(String::as_str) != Some(name)
+        {
+            matching.push(name.to_string());
+        }
+    }
+    Ok(matching)
+}
+
+/// Tri des hunks d'un diff selon une recherche : un hunk n'est transmis que si
+/// l'une de ses lignes y répond.
+struct HunkSieve {
+    needle: String,
+    signs: &'static [u8],
+    in_hunk: bool,
+    /// Hunk en cours de lecture, et s'il répond déjà à la recherche.
+    pending: Vec<DiffLine>,
+    matched: bool,
+    kept: usize,
+    hidden: usize,
+    /// Hunks écartés, gardés de côté tant qu'aucun n'a répondu : sans aucun
+    /// hunk retenu, le diff est montré en entier.
+    spare: Vec<DiffLine>,
+}
+
+impl HunkSieve {
+    fn new(filter: &Filter) -> Option<HunkSieve> {
+        Some(HunkSieve {
+            needle: filter.query.to_lowercase(),
+            signs: filter.hunk_signs()?,
+            in_hunk: false,
+            pending: Vec::new(),
+            matched: false,
+            kept: 0,
+            hidden: 0,
+            spare: Vec::new(),
+        })
+    }
+
+    /// Reçoit une ligne du diff, `raw` étant son texte brut, signe compris ;
+    /// ce qui est bon à afficher rejoint `out`.
+    fn push(&mut self, line: DiffLine, raw: &str, out: &mut Vec<DiffLine>) {
+        if line.kind == LineKind::Hunk {
+            self.close(out);
+            self.in_hunk = true;
+        }
+        if !self.in_hunk {
+            // Avant le premier hunk : renommage, fichier binaire.
+            return out.push(line);
+        }
+        let searched = matches!(line.kind, LineKind::Add | LineKind::Del)
+            && raw.as_bytes().first().is_some_and(|sign| self.signs.contains(sign));
+        if searched && raw.get(1..).is_some_and(|body| body.to_lowercase().contains(&self.needle)) {
+            self.matched = true;
+        }
+        self.pending.push(line);
+        if self.matched {
+            out.append(&mut self.pending);
+        }
+    }
+
+    /// Fin du hunk en cours : transmis s'il répond à la recherche, écarté sinon.
+    fn close(&mut self, out: &mut Vec<DiffLine>) {
+        if !self.in_hunk {
+            return;
+        }
+        if std::mem::take(&mut self.matched) {
+            out.append(&mut self.pending);
+            self.kept += 1;
+            self.spare = Vec::new();
+        } else {
+            self.hidden += 1;
+            if self.kept == 0 {
+                self.spare.append(&mut self.pending);
+            }
+            self.pending.clear();
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<DiffLine>) {
+        self.close(out);
+        if self.kept == 0 {
+            out.append(&mut self.spare);
+        } else if self.hidden > 0 {
+            let plural = if self.hidden > 1 { "s" } else { "" };
+            let text = format!("— {} other hunk{plural} hidden by the search —", self.hidden);
+            out.push(DiffLine { kind: LineKind::Meta, old: 0, new: 0, text, tints: Vec::new() });
+        }
+    }
 }
 
 /// Lit le diff d'un fichier ligne à ligne et l'envoie par tranches.
 /// Renvoie `false` si l'interface n'écoute plus.
-fn stream_diff(
-    root: &Path,
-    id: u64,
-    oid: &Oid,
-    paths: &[String],
-    (full, syntax): (bool, bool),
-    latest: &AtomicU64,
-    tx: &Sender<DiffMsg>,
-) -> bool {
+fn stream_diff(root: &Path, id: u64, req: &FileReq, latest: &AtomicU64, tx: &Sender<DiffMsg>) -> bool {
     let meta = |text: String| DiffLine { kind: LineKind::Meta, old: 0, new: 0, text, tints: Vec::new() };
     // Un contexte plus long que tout fichier : le diff porte alors le fichier entier.
-    let context = if full { "-U1000000" } else { "-U3" };
+    let context = if req.full { "-U1000000" } else { "-U3" };
     let spawned = git(root)
         .args(SHOW_ARGS)
-        .args(["--no-ext-diff", context, oid.to_hex().as_str(), "--"])
-        .args(paths)
+        .args(["--no-ext-diff", context, req.oid.to_hex().as_str(), "--"])
+        .args(&req.paths)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();
@@ -621,9 +788,12 @@ fn stream_diff(
     let mut reader = BufReader::new(child.stdout.take().expect("stdout is piped"));
     let mut parser = DiffParser::default();
     // Le premier chemin est celui du fichier dans ce commit : il donne la grammaire.
-    let mut colors = paths.first().filter(|_| syntax).and_then(|path| Colorizer::for_path(path));
+    let mut colors = req.paths.first().filter(|_| req.syntax).and_then(|path| Colorizer::for_path(path));
+    // Le fichier entier se lit sans tri : il sert à voir les hunks dans leur contexte.
+    let mut sieve = req.filter.as_ref().filter(|_| !req.full).and_then(HunkSieve::new);
     let mut chunk: Vec<DiffLine> = Vec::new();
     let mut total = 0usize;
+    let mut truncated = false;
     let mut raw: Vec<u8> = Vec::new();
     let mut alive = true;
     loop {
@@ -634,22 +804,23 @@ fn stream_diff(
         }
         let text = String::from_utf8_lossy(&raw);
         if let Some(mut line) = parser.feed(&text) {
+            let text = text.trim_end_matches(['\n', '\r']);
             if let Some(colors) = &mut colors {
                 match line.kind {
                     LineKind::Hunk => colors.reset(),
                     LineKind::Meta => {}
-                    kind => {
-                        // Le contenu brut, sans le signe du diff ni la fin de ligne.
-                        let body = text.trim_end_matches(['\n', '\r']).get(1..).unwrap_or("");
-                        line.tints = colors.line(kind, body);
-                    }
+                    // Le contenu brut, sans le signe du diff.
+                    kind => line.tints = colors.line(kind, text.get(1..).unwrap_or("")),
                 }
             }
-            chunk.push(line);
+            match &mut sieve {
+                Some(sieve) => sieve.push(line, text, &mut chunk),
+                None => chunk.push(line),
+            }
             total += 1;
         }
         if total >= MAX_DIFF_LINES {
-            chunk.push(meta(format!("— diff truncated at {MAX_DIFF_LINES} lines —")));
+            truncated = true;
             let _ = child.kill();
             break;
         }
@@ -668,6 +839,12 @@ fn stream_diff(
         }
     }
     let _ = child.wait();
+    if let Some(sieve) = &mut sieve {
+        sieve.finish(&mut chunk);
+    }
+    if truncated {
+        chunk.push(meta(format!("— diff truncated at {MAX_DIFF_LINES} lines —")));
+    }
     if total == 0 && chunk.is_empty() {
         chunk.push(meta("No differences to show.".to_string()));
     }

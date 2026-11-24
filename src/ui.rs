@@ -475,7 +475,11 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
     let added: u32 = files.iter().filter_map(|f| f.added).sum();
     let deleted: u32 = files.iter().filter_map(|f| f.deleted).sum();
     let plural = if files.len() > 1 { "s" } else { "" };
-    let summary = format!("{} file{plural} changed", files.len());
+    // Une recherche a pu écarter des fichiers : le décompte le dit.
+    let summary = match pane.hidden_files {
+        0 => format!("{} file{plural} changed", files.len()),
+        hidden => format!("{} of {} files match the search", files.len(), files.len() + hidden),
+    };
     put(buf, x0, area.y + 2, end, &summary, dim);
     put_right(buf, x0, area.y + 2, end, &format!("{plain_minus}{deleted}"), red);
     put_right(buf, x0, area.y + 2, end.saturating_sub(8), &format!("+{added}"), green);

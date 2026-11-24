@@ -8,7 +8,7 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 
 use crate::diff::{DiffLine, FileEntry, LineKind, SideBySide};
-use crate::git::{self, DiffMsg, DiffWorker, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
+use crate::git::{self, DiffMsg, DiffWorker, FileReq, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
 use crate::graph::{GraphStore, Oid};
 use crate::hierarchy::BranchRow;
 
@@ -100,6 +100,8 @@ pub struct Pane {
     pub oid: Oid,
     pub meta: Meta,
     pub files: FilesState,
+    /// Fichiers du commit que la recherche active a écartés de la liste.
+    pub hidden_files: usize,
     pub file_sel: usize,
     pub file_top: usize,
     pub diff: Option<DiffView>,
@@ -439,7 +441,10 @@ impl App {
                 DiffMsg::Files { id, result } => {
                     if let Some(pane) = self.pane.as_mut().filter(|p| p.req == id) {
                         pane.files = match result {
-                            Ok(files) => FilesState::Ready(files),
+                            Ok((files, hidden)) => {
+                                pane.hidden_files = hidden;
+                                FilesState::Ready(files)
+                            }
                             Err(err) => FilesState::Failed(err),
                         };
                         changed = true;
@@ -510,6 +515,12 @@ impl App {
         }
     }
 
+    /// Recherche sur les fichiers ou les hunks : elle restreint aussi le détail
+    /// d'un commit à ce qui y répond.
+    fn detail_filter(&self) -> Option<Filter> {
+        self.filter.clone().filter(Filter::narrows_detail)
+    }
+
     fn open_commit(&mut self, row: usize) {
         if row >= self.store.len() {
             return;
@@ -519,12 +530,13 @@ impl App {
         if self.pane.as_ref().is_some_and(|p| p.oid == oid && p.diff.is_none()) {
             return;
         }
-        let req = self.diffs.request_files(oid);
+        let req = self.diffs.request_files(oid, self.detail_filter());
         let meta = self.meta(row);
         self.pane = Some(Pane {
             oid,
             meta,
             files: FilesState::Loading,
+            hidden_files: 0,
             file_sel: 0,
             file_top: 0,
             diff: None,
@@ -534,13 +546,20 @@ impl App {
     }
 
     fn open_file(&mut self, index: usize) {
+        let filter = self.detail_filter();
         let Some(pane) = &mut self.pane else { return };
         let FilesState::Ready(files) = &pane.files else { return };
         let Some(file) = files.get(index) else { return };
         // Deux colonnes quand les deux versions existent ; une seule pour un ajout ou une suppression.
         let two_way = !matches!(file.status, 'A' | 'D');
         pane.file_sel = index;
-        let req = self.diffs.request_file(pane.oid, file_paths(file), false, self.syntax);
+        let req = self.diffs.request_file(FileReq {
+            oid: pane.oid,
+            paths: file_paths(file),
+            full: false,
+            syntax: self.syntax,
+            filter,
+        });
         pane.full = None;
         pane.diff = Some(DiffView {
             file: index,
@@ -561,7 +580,14 @@ impl App {
         // Les deux lectures passent par le même fil : le diff doit d'abord être complet.
         let Some(diff) = pane.diff.as_ref().filter(|d| d.done) else { return };
         let Some(file) = files.get(diff.file) else { return };
-        let req = self.diffs.request_file(pane.oid, file_paths(file), true, self.syntax);
+        // Le fichier entier se lit sans tri, même pendant une recherche.
+        let req = self.diffs.request_file(FileReq {
+            oid: pane.oid,
+            paths: file_paths(file),
+            full: true,
+            syntax: self.syntax,
+            filter: None,
+        });
         pane.full = Some(DiffView {
             file: diff.file,
             lines: Vec::new(),

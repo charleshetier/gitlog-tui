@@ -470,6 +470,101 @@ fn syntax_colours_the_diff() {
 }
 
 #[test]
+fn search_narrows_the_commit_details() {
+    // Un commit qui touche trois fichiers ; `notes.txt` change à deux endroits éloignés.
+    let dir = std::env::temp_dir().join(format!("gitlog-test-narrow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let notes = |edit: &dyn Fn(u32) -> String| (1..=40).map(edit).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(dir.join("notes.txt"), notes(&|n| format!("ligne {n}"))).unwrap();
+    std::fs::write(dir.join("old.txt"), "garde\nAiguille perdue\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "rien\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    let edited = notes(&|n| match n {
+        5 => "une aiguille ici".to_string(),
+        35 => "autre chose".to_string(),
+        n => format!("ligne {n}"),
+    });
+    std::fs::write(dir.join("notes.txt"), edited).unwrap();
+    std::fs::write(dir.join("old.txt"), "garde\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "rien\ndu tout\n").unwrap();
+    git(&dir, &["commit", "-q", "-am", "Trois fichiers"]);
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    screen(&mut app, 120, 24);
+    let search = |app: &mut App, keys: &str, query: &str| {
+        app.apply(Action::GoLevel(1));
+        app.apply(Action::Search);
+        for key in keys.chars().chain(query.chars()) {
+            app.apply(Action::PromptKey(key));
+        }
+        app.apply(Action::PromptSubmit);
+        wait(app, "recherche", |app| app.log_done);
+        assert_eq!(app.meta(0).subject, "Trois fichiers");
+    };
+    // Ouvre le premier commit trouvé : ses fichiers, puis le nombre de ceux qui sont écartés.
+    let files = |app: &mut App| -> (Vec<String>, usize) {
+        app.apply(Action::Open);
+        wait(app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+        let pane = app.pane.as_ref().unwrap();
+        let FilesState::Ready(files) = &pane.files else { unreachable!() };
+        (files.iter().map(|f| f.path.clone()).collect(), pane.hidden_files)
+    };
+    // Ouvre le fichier sélectionné : les en-têtes de hunk et les messages de son diff.
+    let hunks = |app: &mut App| -> (usize, Vec<String>) {
+        app.apply(Action::Open);
+        wait(app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+        let diff = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
+        let count = diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Hunk).count();
+        let metas = diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Meta).map(|l| l.text.clone());
+        (count, metas.collect())
+    };
+    let names = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // Sans recherche : tout le commit.
+    assert_eq!(files(&mut app), (names(&["notes.txt", "old.txt", "other.txt"]), 0));
+    assert_eq!(hunks(&mut app), (2, names(&[])));
+
+    // Recherche dans les hunks : les fichiers concernés, et leurs seuls hunks concernés.
+    search(&mut app, "h", "aiguille");
+    assert_eq!(files(&mut app), (names(&["notes.txt", "old.txt"]), 1));
+    let view = screen(&mut app, 120, 24);
+    assert!(view.contains("2 of 3 files match the search"), "{view}");
+    assert_eq!(hunks(&mut app), (1, names(&["— 1 other hunk hidden by the search —"])));
+    let view = screen(&mut app, 120, 24);
+    assert!(view.contains("une aiguille ici") && !view.contains("autre chose"), "{view}");
+    // La fenêtre du fichier entier n'est pas triée.
+    app.apply(Action::Open);
+    wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
+    let full = app.pane.as_ref().unwrap().full.as_ref().unwrap();
+    assert!(full.len() >= 40 && full.change_tops().count() == 2);
+
+    // Par signe : la ligne ajoutée est dans un fichier, la ligne retirée dans un autre.
+    search(&mut app, "+h", "AIGUILLE");
+    assert_eq!(files(&mut app), (names(&["notes.txt"]), 2));
+    assert_eq!(hunks(&mut app).0, 1);
+    search(&mut app, "-h", "aiguille");
+    assert_eq!(files(&mut app), (names(&["old.txt"]), 2));
+    assert_eq!(hunks(&mut app), (1, names(&[])));
+
+    // Recherche par fichier : les fichiers du nom cherché, leur diff en entier.
+    search(&mut app, "f", "NOTES");
+    assert_eq!(files(&mut app), (names(&["notes.txt"]), 2));
+    assert_eq!(hunks(&mut app), (2, names(&[])));
+
+    // Une recherche dans les messages ne trie pas le détail.
+    search(&mut app, "m", "trois");
+    assert_eq!(files(&mut app).1, 0);
+    assert_eq!(hunks(&mut app).0, 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn refresh_reloads_the_repository() {
     use crate::git::Head;
 
