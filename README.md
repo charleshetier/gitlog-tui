@@ -33,4 +33,6 @@ Press `?` inside `gitlog` for the list of shortcuts, or run `gitlog --help`.
 
 The icons expect a [Nerd Font](https://www.nerdfonts.com). Without one, use `gitlog --plain` or set `GITLOG_PLAIN=1`.
 
+Diffs are syntax highlighted on terminals with 24-bit colours: always on Windows, elsewhere when `COLORTERM` is `truecolor` or `24bit`. Use `gitlog --no-syntax` to turn it off.
+
 The branch hierarchy view (`h`) needs git 2.41 or newer.

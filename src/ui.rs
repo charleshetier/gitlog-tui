@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, FilesState, HierState, HitMap, NodeStyle, Prompt};
+use crate::app::{App, DiffView, FilesState, HierState, HitMap, NodeStyle, Prompt};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -41,6 +41,10 @@ const REMOTE_BG: Color = Color::Indexed(240);
 const CHIP_BG: Color = Color::Indexed(238);
 const ADD_BG: Color = Color::Indexed(22);
 const DEL_BG: Color = Color::Indexed(52);
+/// Les mêmes fonds sous la coloration syntaxique : plus sombres, pour que chaque
+/// teinte du thème y reste lisible. Aucune couleur de la palette n'est aussi sombre.
+const ADD_SYNTAX_BG: Color = Color::Rgb(0, 40, 0);
+const DEL_SYNTAX_BG: Color = Color::Rgb(63, 0, 1);
 const DIM: Color = Color::DarkGray;
 /// Fond du côté sans vis-à-vis dans le diff en deux colonnes.
 const VOID_BG: Color = Color::Indexed(235);
@@ -196,7 +200,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_pane_header(buf, app, Rect::new(x + 1, area.y, pane_w, 1));
         let body = Rect::new(x + 1, body_y, pane_w, body_h);
         app.hit.pane = body;
-        if app.depth() == 3 {
+        if app.depth() >= 3 {
             draw_diff(buf, app, body);
         } else {
             draw_files(buf, app, body);
@@ -204,6 +208,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if searching {
         draw_search_bar(buf, app, Rect::new(area.x, body_bottom, area.width, 1));
+    }
+    if app.depth() == 4 {
+        draw_full(buf, app, area);
     }
     draw_flash(buf, app, area);
     if let Some(Prompt::Kind { sign }) = app.prompt {
@@ -507,10 +514,56 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
 /// Niveau 3 : diff unifié du fichier, avec numéros de ligne.
 fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.pane_height = area.height as usize;
+    let syntax = app.syntax;
+    if let Some(diff) = app.pane.as_mut().and_then(|p| p.diff.as_mut()) {
+        draw_diff_view(buf, diff, area, syntax);
+    }
+}
+
+/// Niveau 4 : le fichier entier dans une fenêtre flottante, modifications en place.
+fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
+    let panel = Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), area.height.saturating_sub(2));
+    if panel.width < 12 || panel.height < 3 {
+        return;
+    }
+    let inner = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, panel.height - 2);
+    app.pane_height = inner.height as usize;
+    let syntax = app.syntax;
+    let Some(pane) = &mut app.pane else { return };
+    let Some(full) = &mut pane.full else { return };
+    let path = match &pane.files {
+        FilesState::Ready(files) => files.get(full.file).map_or("", |f| f.path.as_str()),
+        _ => "",
+    };
+    // Position parmi les modifications : celles déjà atteintes ou dépassées.
+    let total = full.change_tops().count();
+    let reached = full.change_tops().take_while(|&top| top <= full.top).count();
+    let count = match (reached, total) {
+        (_, 0) if !full.done => "loading…".to_string(),
+        (_, 0) => "no change".to_string(),
+        (0, 1) => "1 change".to_string(),
+        (0, n) => format!("{n} changes"),
+        (i, n) => format!("change {i}/{n}"),
+    };
+    let room = panel.width.saturating_sub(width(&count) + 9);
+    let title = format!(" {} · {count} ", tail(path, room));
+    draw_panel(buf, panel, &title, " n p changes · Esc to close ");
+    // L'intérieur reprend le fond du terminal : les couleurs du diff y restent celles du volet.
+    for y in inner.top()..inner.bottom() {
+        for x in inner.left()..inner.right() {
+            buf[(x, y)].reset();
+        }
+    }
+    draw_diff_view(buf, full, inner, syntax);
+}
+
+/// Lignes d'un diff à partir de sa position de défilement : en deux colonnes quand
+/// les deux versions du fichier existent, en une seule sinon.
+fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: bool) {
     let dim = Style::new().fg(DIM);
+    let (add_bg, del_bg) = if syntax { (ADD_SYNTAX_BG, DEL_SYNTAX_BG) } else { (ADD_BG, DEL_BG) };
     let x0 = area.x + 1;
     let end = area.right() - 1;
-    let Some(diff) = app.pane.as_mut().and_then(|p| p.diff.as_mut()) else { return };
     if diff.lines.is_empty() {
         let text = if diff.done { "No differences to show." } else { "Loading diff…" };
         put(buf, x0, area.y, end, text, dim);
@@ -518,7 +571,7 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     }
     if let Some(sides) = &diff.sides {
         diff.top = diff.top.min(sides.rows.len().saturating_sub(1));
-        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x);
+        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x, (add_bg, del_bg));
         return;
     }
     diff.top = diff.top.min(diff.lines.len() - 1);
@@ -538,8 +591,8 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
                 put(buf, x0, y, end, &line.text, dim.add_modifier(Modifier::ITALIC));
                 continue;
             }
-            LineKind::Add => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(ADD_BG)),
-            LineKind::Del => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(DEL_BG)),
+            LineKind::Add => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(add_bg)),
+            LineKind::Del => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(del_bg)),
             LineKind::Ctx => {}
         }
         let (sign, sign_color) = match line.kind {
@@ -550,9 +603,32 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
         let numbers = format!("{} {}", number(line.old), number(line.new));
         let mut x = put(buf, x0, y, end, &numbers, Style::new().fg(Color::Gray));
         x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
-        let text: String = line.text.chars().skip(diff.x).collect();
-        put(buf, x + 1, y, end, &text, Style::new());
+        put_code(buf, x + 1, y, end, line, diff.x);
     }
+}
+
+/// Écrit le texte d'une ligne de diff à partir du caractère `skip`, segment par
+/// segment quand elle porte une coloration syntaxique.
+fn put_code(buf: &mut Buffer, mut x: u16, y: u16, end: u16, line: &DiffLine, mut skip: usize) {
+    // Octet où commence le caractère de rang `n`.
+    let byte_at = |text: &str, n: usize| text.char_indices().nth(n).map_or(text.len(), |(at, _)| at);
+    let mut rest = line.text.as_str();
+    for &(len, color) in &line.tints {
+        let (segment, after) = rest.split_at(byte_at(rest, len as usize));
+        rest = after;
+        if skip >= len as usize {
+            skip -= len as usize;
+            continue;
+        }
+        let style = color.map_or(Style::new(), |[r, g, b]| Style::new().fg(Color::Rgb(r, g, b)));
+        x = put(buf, x, y, end, &segment[byte_at(segment, skip)..], style);
+        skip = 0;
+        if x >= end {
+            return;
+        }
+    }
+    // Sans coloration, ou au-delà de ses segments : la couleur de texte du terminal.
+    put(buf, x, y, end, &rest[byte_at(rest, skip)..], Style::new());
 }
 
 /// Dessine les cellules du graphe d'une ligne selon le style des commits.
@@ -602,7 +678,14 @@ fn draw_graph_row(
 }
 
 /// Diff en deux colonnes : l'ancienne version à gauche, la nouvelle à droite.
-fn draw_sides(buf: &mut Buffer, area: Rect, lines: &[DiffLine], rows: &[(u32, u32)], skip: usize) {
+fn draw_sides(
+    buf: &mut Buffer,
+    area: Rect,
+    lines: &[DiffLine],
+    rows: &[(u32, u32)],
+    skip: usize,
+    (add_bg, del_bg): (Color, Color),
+) {
     let dim = Style::new().fg(DIM);
     let x0 = area.x + 1;
     let end = area.right() - 1;
@@ -625,8 +708,7 @@ fn draw_sides(buf: &mut Buffer, area: Rect, lines: &[DiffLine], rows: &[(u32, u3
             buf.set_style(bg_area, Style::new().bg(bg));
         }
         let x = put(buf, x, y, end, &format!("{number:>num_w$}"), Style::new().fg(Color::Gray));
-        let text: String = line.text.chars().skip(skip).collect();
-        put(buf, x + 1, y, end, &text, Style::new());
+        put_code(buf, x + 1, y, end, line, skip);
     };
 
     for (i, &(l, r)) in rows.iter().enumerate() {
@@ -650,8 +732,8 @@ fn draw_sides(buf: &mut Buffer, area: Rect, lines: &[DiffLine], rows: &[(u32, u3
         let changed = l != r;
         let left_area = Rect::new(area.x, y, mid - area.x, 1);
         let right_area = Rect::new(mid + 1, y, area.right() - mid - 1, 1);
-        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), changed.then_some(DEL_BG));
-        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), changed.then_some(ADD_BG));
+        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), changed.then_some(del_bg));
+        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), changed.then_some(add_bg));
         put(buf, mid, y, end, "│", dim);
     }
 }
@@ -757,10 +839,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("↑ ↓  j k", "Move the selection, scroll a diff"),
     ("PgUp PgDn", "Move by one page"),
     ("g G  Home End", "Jump to the first / last item"),
-    ("Enter", "Open the commit, then the file diff"),
-    ("n p", "Next / previous file in a diff, commit in the file list"),
+    ("Enter", "Open the commit, the file diff, then the whole file"),
+    ("n p", "Next / previous commit, file or change, by level"),
     ("← →", "Scroll a diff sideways"),
-    ("1 2 3", "Go to a level: graph, files, diff"),
+    ("1 2 3 4", "Go to a level: graph, files, diff, whole file"),
     ("q", "Go back one level, quit from the graph"),
     ("Esc", "Go back one level, leave a search"),
     ("", ""),

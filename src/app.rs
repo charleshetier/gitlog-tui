@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::layout::Rect;
 
-use crate::diff::{DiffLine, FileEntry, SideBySide};
+use crate::diff::{DiffLine, FileEntry, LineKind, SideBySide};
 use crate::git::{self, DiffMsg, DiffWorker, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
 use crate::graph::{GraphStore, Oid};
 use crate::hierarchy::BranchRow;
@@ -19,6 +19,8 @@ const BATCHES_PER_TICK: usize = 64;
 /// Entrées du cache de métadonnées avant remise à zéro.
 const META_CACHE: usize = 4096;
 const FLASH: Duration = Duration::from_millis(1500);
+/// Lignes de contexte gardées au-dessus d'une modification atteinte par `n` ou `p`.
+const CHANGE_MARGIN: usize = 3;
 /// Pause dans la frappe avant de lancer une recherche en direct : un seul git par mot tapé.
 const LIVE_DELAY: Duration = Duration::from_millis(200);
 
@@ -56,6 +58,8 @@ pub struct DiffView {
     pub done: bool,
     pub top: usize,
     pub x: usize,
+    /// Fichier entier : se placer sur la première modification dès qu'elle arrive.
+    seek: bool,
     req: u64,
 }
 
@@ -63,6 +67,22 @@ impl DiffView {
     /// Nombre de lignes affichables dans la vue courante.
     pub fn len(&self) -> usize {
         self.sides.as_ref().map_or(self.lines.len(), |s| s.rows.len())
+    }
+
+    /// Vrai si la ligne affichée porte une modification.
+    fn changed(&self, row: usize) -> bool {
+        match &self.sides {
+            Some(sides) => sides.rows.get(row).is_some_and(|(left, right)| left != right),
+            None => self.lines.get(row).is_some_and(|l| matches!(l.kind, LineKind::Add | LineKind::Del)),
+        }
+    }
+
+    /// Position de défilement de chaque bloc de modifications, dans l'ordre :
+    /// le bloc s'affiche sous quelques lignes de contexte.
+    pub fn change_tops(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len())
+            .filter(|&row| self.changed(row) && (row == 0 || !self.changed(row - 1)))
+            .map(|row| row.saturating_sub(CHANGE_MARGIN))
     }
 
     fn append(&mut self, lines: Vec<DiffLine>) {
@@ -83,6 +103,8 @@ pub struct Pane {
     pub file_sel: usize,
     pub file_top: usize,
     pub diff: Option<DiffView>,
+    /// Niveau 4 : le fichier entier du diff ouvert, dans une fenêtre flottante.
+    pub full: Option<DiffView>,
     req: u64,
 }
 
@@ -115,6 +137,14 @@ pub struct HitMap {
     pub remote: Option<Rect>,
     pub branches: Rect,
     pub branch_top: usize,
+}
+
+/// Chemins à donner à git pour un fichier : pour un renommage, l'ancien chemin
+/// lui permet de retrouver le lien.
+fn file_paths(file: &FileEntry) -> Vec<String> {
+    let mut paths = vec![file.path.clone()];
+    paths.extend(file.old_path.clone());
+    paths
 }
 
 /// Recherche en cours de saisie.
@@ -166,6 +196,8 @@ pub enum Action {
 pub struct App {
     pub repo: Repo,
     pub plain: bool,
+    /// Coloration syntaxique des diffs ; demande un terminal 24 bits.
+    pub syntax: bool,
     pub node_style: NodeStyle,
     pub store: GraphStore,
     pub labels: HashMap<Oid, Vec<Label>>,
@@ -213,6 +245,7 @@ impl App {
             diffs: DiffWorker::new(repo.clone()),
             repo,
             plain,
+            syntax: true,
             node_style: NodeStyle::Dots,
             store: GraphStore::default(),
             labels,
@@ -246,6 +279,7 @@ impl App {
     pub fn depth(&self) -> u8 {
         match &self.pane {
             None => 1,
+            Some(pane) if pane.full.is_some() => 4,
             Some(pane) if pane.diff.is_some() => 3,
             Some(_) => 2,
         }
@@ -302,7 +336,9 @@ impl App {
         }
         let loading_log = !self.log_done && self.loaded_rows() < self.wanted_rows();
         let loading_pane = self.pane.as_ref().is_some_and(|p| {
-            matches!(p.files, FilesState::Loading) || p.diff.as_ref().is_some_and(|d| !d.done)
+            matches!(p.files, FilesState::Loading)
+                || p.diff.as_ref().is_some_and(|d| !d.done)
+                || p.full.as_ref().is_some_and(|d| !d.done)
         });
         let loading_tree = self
             .hierarchy
@@ -397,10 +433,16 @@ impl App {
                     }
                 }
                 DiffMsg::Lines { id, lines, done } => {
-                    let diff = self.pane.as_mut().and_then(|p| p.diff.as_mut());
-                    if let Some(diff) = diff.filter(|d| d.req == id) {
-                        diff.append(lines);
-                        diff.done = done;
+                    let Some(pane) = &mut self.pane else { continue };
+                    let views = [pane.full.as_mut(), pane.diff.as_mut()];
+                    if let Some(view) = views.into_iter().flatten().find(|d| d.req == id) {
+                        view.append(lines);
+                        view.done = done;
+                        let first = if view.seek { view.change_tops().next() } else { None };
+                        if let Some(first) = first {
+                            view.top = first;
+                            view.seek = false;
+                        }
                         changed = true;
                     }
                 }
@@ -473,6 +515,7 @@ impl App {
             file_sel: 0,
             file_top: 0,
             diff: None,
+            full: None,
             req,
         });
     }
@@ -481,13 +524,11 @@ impl App {
         let Some(pane) = &mut self.pane else { return };
         let FilesState::Ready(files) = &pane.files else { return };
         let Some(file) = files.get(index) else { return };
-        // Pour un renommage, l'ancien chemin permet à git de retrouver le lien.
-        let mut paths = vec![file.path.clone()];
-        paths.extend(file.old_path.clone());
         // Deux colonnes quand les deux versions existent ; une seule pour un ajout ou une suppression.
         let two_way = !matches!(file.status, 'A' | 'D');
         pane.file_sel = index;
-        let req = self.diffs.request_file(pane.oid, paths);
+        let req = self.diffs.request_file(pane.oid, file_paths(file), false, self.syntax);
+        pane.full = None;
         pane.diff = Some(DiffView {
             file: index,
             lines: Vec::new(),
@@ -495,15 +536,64 @@ impl App {
             done: false,
             top: 0,
             x: 0,
+            seek: false,
             req,
         });
     }
 
-    fn close_diff(&mut self) {
+    /// Niveau 4 : le fichier entier du diff ouvert, modifications en place.
+    fn open_full(&mut self) {
+        let Some(pane) = &mut self.pane else { return };
+        let FilesState::Ready(files) = &pane.files else { return };
+        // Les deux lectures passent par le même fil : le diff doit d'abord être complet.
+        let Some(diff) = pane.diff.as_ref().filter(|d| d.done) else { return };
+        let Some(file) = files.get(diff.file) else { return };
+        let req = self.diffs.request_file(pane.oid, file_paths(file), true, self.syntax);
+        pane.full = Some(DiffView {
+            file: diff.file,
+            lines: Vec::new(),
+            sides: diff.sides.is_some().then(SideBySide::default),
+            done: false,
+            top: 0,
+            x: 0,
+            seek: true,
+            req,
+        });
+    }
+
+    fn close_full(&mut self) {
         if let Some(pane) = &mut self.pane
-            && pane.diff.take().is_some()
+            && let Some(full) = pane.full.take()
+            && !full.done
         {
             self.diffs.cancel();
+        }
+    }
+
+    /// `n` / `p` dans le fichier entier : modification suivante ou précédente.
+    fn step_change(&mut self, delta: isize) {
+        let Some(view) = self.pane.as_mut().and_then(|p| p.full.as_mut()) else { return };
+        let top = view.top;
+        let target = if delta > 0 {
+            view.change_tops().find(|&t| t > top)
+        } else {
+            view.change_tops().take_while(|&t| t < top).last()
+        };
+        match target {
+            Some(target) => view.top = target,
+            None if delta < 0 => self.set_flash("First change"),
+            // Tant que le fichier arrive, la suite peut encore en contenir.
+            None if view.done => self.set_flash("Last change"),
+            None => {}
+        }
+    }
+
+    fn close_diff(&mut self) {
+        if let Some(pane) = &mut self.pane {
+            let full = pane.full.take().is_some();
+            if pane.diff.take().is_some() || full {
+                self.diffs.cancel();
+            }
         }
     }
 
@@ -659,6 +749,7 @@ impl App {
     fn step(&mut self, delta: isize) {
         let neighbour = |value: usize, len: usize| value.saturating_add_signed(delta).min(len.saturating_sub(1));
         match self.depth() {
+            4 => self.step_change(delta),
             3 => {
                 let Some(pane) = &self.pane else { return };
                 let FilesState::Ready(files) = &pane.files else { return };
@@ -698,7 +789,7 @@ impl App {
                 self.selected = step(self.selected, self.store.len());
                 self.ensure_visible();
             }
-            Some(pane) => match &mut pane.diff {
+            Some(pane) => match pane.full.as_mut().or(pane.diff.as_mut()) {
                 Some(diff) => diff.top = step(diff.top, diff.len()),
                 None => {
                     if let FilesState::Ready(files) = &pane.files {
@@ -767,6 +858,7 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Back { quit } => match self.depth() {
+                4 => self.close_full(),
                 3 => self.close_diff(),
                 2 => self.close_pane(),
                 // Une recherche active est un niveau de plus : on en sort d'abord.
@@ -795,13 +887,15 @@ impl App {
                     let index = self.pane.as_ref().map_or(0, |p| p.file_sel);
                     self.open_file(index);
                 }
+                3 => self.open_full(),
                 _ => {}
             },
             Action::GoLevel(level) => match (level, self.depth()) {
                 (1, _) => self.close_pane(),
                 (2, 1) => self.open_commit(self.selected),
-                (2, 3) => self.close_diff(),
-                (3, 2) => self.apply(Action::Open),
+                (2, 3 | 4) => self.close_diff(),
+                (3, 4) => self.close_full(),
+                (3, 2) | (4, 3) => self.apply(Action::Open),
                 _ => {}
             },
             Action::ClickCommit(row) => {
@@ -835,7 +929,7 @@ impl App {
                 None => {}
             },
             Action::Horizontal(delta) => {
-                if let Some(diff) = self.pane.as_mut().and_then(|p| p.diff.as_mut()) {
+                if let Some(diff) = self.pane.as_mut().and_then(|p| p.full.as_mut().or(p.diff.as_mut())) {
                     diff.x = diff.x.saturating_add_signed(delta);
                 }
             }

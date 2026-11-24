@@ -2,6 +2,8 @@
 
 /// Longueur maximale conservée pour une ligne de diff (fichiers minifiés).
 const MAX_LINE_CHARS: usize = 2000;
+/// Largeur d'une tabulation à l'affichage.
+pub const TAB_WIDTH: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -56,6 +58,10 @@ pub enum LineKind {
     Meta,
 }
 
+/// Segment d'une ligne colorée : nombre de caractères et teinte RVB (`None` : la
+/// couleur de texte du terminal).
+pub type Tint = (u16, Option<[u8; 3]>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
@@ -63,6 +69,8 @@ pub struct DiffLine {
     pub old: u32,
     pub new: u32,
     pub text: String,
+    /// Coloration syntaxique : segments couvrant `text` dans l'ordre ; vide sans coloration.
+    pub tints: Vec<Tint>,
 }
 
 /// Analyseur de diff unifié alimenté ligne à ligne, pour suivre le flux de git.
@@ -76,7 +84,7 @@ pub struct DiffParser {
 impl DiffParser {
     pub fn feed(&mut self, raw: &str) -> Option<DiffLine> {
         let raw = raw.trim_end_matches(['\n', '\r']);
-        let line = |kind, old, new, text: &str| Some(DiffLine { kind, old, new, text: clean(text) });
+        let line = |kind, old, new, text: &str| Some(DiffLine { kind, old, new, text: clean(text), tints: Vec::new() });
 
         if raw.starts_with("diff --") {
             self.in_hunk = false;
@@ -184,7 +192,7 @@ fn clean(text: &str) -> String {
             break;
         }
         match c {
-            '\t' => out.push_str("    "),
+            '\t' => out.extend([' '; TAB_WIDTH]),
             c if c.is_control() => out.push(' '),
             c => out.push(c),
         }

@@ -308,6 +308,163 @@ fn copy_step_and_help_shortcuts() {
 }
 
 #[test]
+fn whole_file_window() {
+    // Un fichier de 60 lignes, dont trois endroits changent : seul le fichier entier les relie.
+    let dir = std::env::temp_dir().join(format!("gitlog-test-full-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let lines = |edit: &dyn Fn(u32) -> String| (1..=60).map(edit).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(dir.join("big.txt"), lines(&|n| format!("ligne {n}"))).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    let edited = lines(&|n| if n == 5 || n == 50 { format!("LIGNE {n}") } else { format!("ligne {n}") });
+    std::fs::write(dir.join("big.txt"), edited + "ligne 61\n").unwrap();
+    git(&dir, &["commit", "-q", "-am", "Trois retouches"]);
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    screen(&mut app, 120, 24);
+    app.apply(Action::Open);
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+    app.apply(Action::Open);
+    wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    let hunks = app.pane.as_ref().unwrap().diff.as_ref().unwrap().len();
+    assert!(hunks < 40, "le diff ne porte que les hunks : {hunks} lignes");
+
+    // Entrée sur le diff : le fichier entier, placé sur la première modification.
+    app.apply(Action::Open);
+    assert_eq!(app.depth(), 4);
+    wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
+    let full = |app: &App| {
+        let view = app.pane.as_ref().unwrap().full.as_ref().unwrap();
+        (view.top, view.change_tops().collect::<Vec<_>>(), view.len())
+    };
+    let (top, tops, len) = full(&app);
+    assert!(len > 61, "{len} lignes");
+    assert_eq!(tops.len(), 3);
+    assert_eq!(top, tops[0]);
+    let first = screen(&mut app, 120, 24);
+    println!("{first}");
+    assert!(first.contains("big.txt · change 1/3") && first.contains("n p changes"));
+    let changed = first.lines().find(|l| l.contains("LIGNE 5")).expect("ligne modifiée");
+    assert!(changed.contains("5 ligne 5") && changed.contains("5 LIGNE 5"), "{changed}");
+    assert!(first.contains("ligne 12"), "le contexte dépasse celui du diff");
+
+    // n et p sautent d'une modification à l'autre, sans sortir du fichier.
+    app.apply(Action::Step(1));
+    assert_eq!(full(&app).0, tops[1]);
+    let second = screen(&mut app, 120, 24);
+    assert!(second.contains("change 2/3") && second.contains("LIGNE 50") && second.contains("ligne 47"));
+    app.apply(Action::Step(1));
+    app.apply(Action::Step(1));
+    assert_eq!(full(&app).0, tops[2]);
+    assert_eq!(app.flash(), Some("Last change"));
+    app.apply(Action::Step(-1));
+    app.apply(Action::Step(-1));
+    app.apply(Action::Step(-1));
+    assert_eq!(full(&app).0, tops[0]);
+    assert_eq!(app.flash(), Some("First change"));
+    // Le défilement et la copie visent la fenêtre et son fichier.
+    app.apply(Action::Move(2));
+    assert_eq!(full(&app).0, tops[0] + 2);
+    assert_eq!(app.copy_target().as_deref(), Some("big.txt"));
+
+    // Échap referme la fenêtre : le diff du niveau 3 est toujours là, intact.
+    app.apply(Action::Back { quit: false });
+    assert_eq!(app.depth(), 3);
+    assert_eq!(app.pane.as_ref().unwrap().diff.as_ref().unwrap().len(), hunks);
+    assert!(!screen(&mut app, 120, 24).contains("n p changes"));
+    app.apply(Action::GoLevel(4));
+    assert_eq!(app.depth(), 4);
+    app.apply(Action::GoLevel(2));
+    assert_eq!(app.depth(), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn syntax_colours_the_diff() {
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    let dir = std::env::temp_dir().join(format!("gitlog-test-syntax-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let source = |word: &str| format!("// greeting\npub fn hello() -> &'static str {{\n    \"{word}\"\n}}\n");
+    std::fs::write(dir.join("lib.rs"), source("hello")).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    std::fs::write(dir.join("lib.rs"), source("bonjour")).unwrap();
+    git(&dir, &["commit", "-q", "-am", "Edit"]);
+
+    let draw = |app: &mut App| -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    // Couleurs de texte et de fond de la première cellule de `needle` à l'écran.
+    let colours = |buffer: &Buffer, needle: &str| -> (Color, Color) {
+        let needle: Vec<char> = needle.chars().collect();
+        for y in 0..24 {
+            let row: Vec<char> = (0..120).map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+            if let Some(x) = row.windows(needle.len()).position(|w| w == needle.as_slice()) {
+                let cell = &buffer[(x as u16, y)];
+                return (cell.fg, cell.bg);
+            }
+        }
+        panic!("« {} » n'est pas à l'écran", needle.iter().collect::<String>());
+    };
+    let open_diff = |app: &mut App| {
+        app.apply(Action::Open);
+        wait(app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+        app.apply(Action::Open);
+        wait(app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    };
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    draw(&mut app);
+    open_diff(&mut app);
+    let buffer = draw(&mut app);
+    let rgb = |color: Color| matches!(color, Color::Rgb(..));
+    let (keyword, _) = colours(&buffer, "fn hello");
+    let (comment, _) = colours(&buffer, "// greeting");
+    assert!(rgb(keyword) && rgb(comment) && keyword != comment, "{keyword:?} {comment:?}");
+    // La modification garde son fond, assombri sous les teintes ; le texte y est coloré aussi.
+    let (removed, removed_bg) = colours(&buffer, "\"hello\"");
+    let (added, added_bg) = colours(&buffer, "\"bonjour\"");
+    assert!(rgb(removed) && removed == added);
+    assert_eq!((removed_bg, added_bg), (Color::Rgb(63, 0, 1), Color::Rgb(0, 40, 0)));
+    // Le défilement horizontal emporte les teintes avec le texte.
+    app.apply(Action::Horizontal(4));
+    let buffer = draw(&mut app);
+    assert!(!screen(&mut app, 120, 24).contains("pub fn hello"));
+    assert_eq!(colours(&buffer, "fn hello").0, keyword);
+    assert_eq!(colours(&buffer, "\"bonjour\"").0, added);
+
+    // Le fichier entier est coloré de la même façon.
+    app.apply(Action::Horizontal(-4));
+    app.apply(Action::Open);
+    wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
+    let buffer = draw(&mut app);
+    assert_eq!(colours(&buffer, "// greeting").0, comment);
+    app.apply(Action::GoLevel(1));
+
+    // Sans coloration : le texte et les fonds d'origine.
+    app.syntax = false;
+    open_diff(&mut app);
+    let buffer = draw(&mut app);
+    assert_eq!(colours(&buffer, "fn hello").0, Color::Reset);
+    assert_eq!(colours(&buffer, "\"bonjour\""), (Color::Reset, Color::Indexed(22)));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn search_filters_the_commits() {
     let dir = make_repo("search");
     let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();

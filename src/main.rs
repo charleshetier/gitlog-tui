@@ -5,6 +5,7 @@ mod diff;
 mod git;
 mod graph;
 mod hierarchy;
+mod syntax;
 #[cfg(test)]
 mod tests;
 mod ui;
@@ -38,12 +39,14 @@ Usage: gitlog [OPTIONS] [PATH]
   PATH         repository folder (default: the current folder)
   --plain      standard glyphs, without a Powerline or Nerd Font
                (also: environment variable GITLOG_PLAIN=1)
+  --no-syntax  diffs without syntax highlighting (it needs a 24-bit terminal)
   --dump N     print the first N rows of the graph as text, without the interface
   -h, --help   show this help
 
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       y copy the commit hash, or the path of the file under the cursor
-      n p next / previous file in a diff, commit in the file list
+      Enter on a diff opens the whole file in a floating window
+      n p next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       h branch hierarchy · S commit style · ? all shortcuts
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
@@ -56,13 +59,21 @@ const WHEEL: isize = 3;
 struct Args {
     dir: PathBuf,
     plain: bool,
+    syntax: bool,
     dump: Option<usize>,
+}
+
+/// La coloration syntaxique emploie des couleurs 24 bits : tous les terminaux de
+/// Windows 10 et suivants les affichent, les autres l'annoncent par `COLORTERM`.
+fn truecolor() -> bool {
+    cfg!(windows) || std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit")
 }
 
 fn parse_args() -> Result<Option<Args>> {
     let mut args = Args {
         dir: PathBuf::from("."),
         plain: std::env::var_os("GITLOG_PLAIN").is_some_and(|v| !v.is_empty() && v != "0"),
+        syntax: truecolor(),
         dump: None,
     };
     let mut argv = std::env::args().skip(1);
@@ -70,6 +81,7 @@ fn parse_args() -> Result<Option<Args>> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--plain" => args.plain = true,
+            "--no-syntax" => args.syntax = false,
             "--dump" => {
                 let n = argv.next().and_then(|n| n.parse().ok());
                 args.dump = Some(n.context("--dump expects a number of rows")?);
@@ -98,6 +110,7 @@ fn run() -> Result<()> {
     };
     let repo = Repo::open(&args.dir)?;
     let mut app = App::new(repo, args.plain)?;
+    app.syntax = args.syntax;
     if let Some(rows) = args.dump {
         return dump(&mut app, rows);
     }
@@ -199,7 +212,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Action::Step(1),
         KeyCode::Char('p') => Action::Step(-1),
         KeyCode::Char('?') => Action::ToggleHelp,
-        KeyCode::Char(c @ '1'..='3') => Action::GoLevel(c as u8 - b'0'),
+        KeyCode::Char(c @ '1'..='4') => Action::GoLevel(c as u8 - b'0'),
         _ => return None,
     })
 }
@@ -213,6 +226,10 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
             // Un clic referme le panneau des raccourcis.
             if app.help {
                 return Some(Action::ToggleHelp);
+            }
+            // Sous la fenêtre du fichier entier, rien n'est cliquable.
+            if app.depth() == 4 {
+                return None;
             }
             if hit.folder.is_some_and(|rect| rect.contains(pos)) {
                 return Some(Action::CopyFolder);
@@ -243,7 +260,8 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let delta = if mouse.kind == MouseEventKind::ScrollUp { -WHEEL } else { WHEEL };
-            if hit.pane.contains(pos) {
+            // La fenêtre du fichier entier recouvre tout : la molette lui revient.
+            if app.depth() == 4 || hit.pane.contains(pos) {
                 Some(Action::ScrollPane(delta))
             } else if hit.graph.contains(pos) || hit.branches.contains(pos) {
                 Some(Action::ScrollGraph(delta))

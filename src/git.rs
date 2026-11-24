@@ -14,6 +14,7 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 
 use crate::diff::{DiffLine, DiffParser, FileEntry, LineKind, parse_files};
+use crate::syntax::Colorizer;
 use crate::graph::{Batch, COMMIT, Cell, Layout, Oid};
 use crate::hierarchy::{self, Branch, BranchRow, Remote};
 
@@ -492,7 +493,9 @@ fn parse_commit(raw: &str) -> Meta {
 
 pub enum DiffReq {
     Files { id: u64, oid: Oid },
-    File { id: u64, oid: Oid, paths: Vec<String> },
+    /// `full` : le fichier entier, contexte compris, et non les seuls hunks ;
+    /// `syntax` : avec la coloration syntaxique.
+    File { id: u64, oid: Oid, paths: Vec<String>, full: bool, syntax: bool },
     Hierarchy { id: u64 },
 }
 
@@ -530,8 +533,8 @@ impl DiffWorker {
                         let result = list_files(&root, &oid).map_err(|e| format!("{e:#}"));
                         msg_tx.send(DiffMsg::Files { id, result }).is_ok()
                     }
-                    DiffReq::File { id, oid, paths } => {
-                        stream_diff(&root, id, &oid, &paths, &latest_in_thread, &msg_tx)
+                    DiffReq::File { id, oid, paths, full, syntax } => {
+                        stream_diff(&root, id, &oid, &paths, (full, syntax), &latest_in_thread, &msg_tx)
                     }
                     DiffReq::Hierarchy { id } => {
                         let result = load_hierarchy(&repo).map_err(|e| format!("{e:#}"));
@@ -556,9 +559,9 @@ impl DiffWorker {
         id
     }
 
-    pub fn request_file(&self, oid: Oid, paths: Vec<String>) -> u64 {
+    pub fn request_file(&self, oid: Oid, paths: Vec<String>, full: bool, syntax: bool) -> u64 {
         let id = self.next_id();
-        let _ = self.tx.send(DiffReq::File { id, oid, paths });
+        let _ = self.tx.send(DiffReq::File { id, oid, paths, full, syntax });
         id
     }
 
@@ -591,13 +594,16 @@ fn stream_diff(
     id: u64,
     oid: &Oid,
     paths: &[String],
+    (full, syntax): (bool, bool),
     latest: &AtomicU64,
     tx: &Sender<DiffMsg>,
 ) -> bool {
-    let meta = |text: String| DiffLine { kind: LineKind::Meta, old: 0, new: 0, text };
+    let meta = |text: String| DiffLine { kind: LineKind::Meta, old: 0, new: 0, text, tints: Vec::new() };
+    // Un contexte plus long que tout fichier : le diff porte alors le fichier entier.
+    let context = if full { "-U1000000" } else { "-U3" };
     let spawned = git(root)
         .args(SHOW_ARGS)
-        .args(["--no-ext-diff", oid.to_hex().as_str(), "--"])
+        .args(["--no-ext-diff", context, oid.to_hex().as_str(), "--"])
         .args(paths)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -611,6 +617,8 @@ fn stream_diff(
     };
     let mut reader = BufReader::new(child.stdout.take().expect("stdout is piped"));
     let mut parser = DiffParser::default();
+    // Le premier chemin est celui du fichier dans ce commit : il donne la grammaire.
+    let mut colors = paths.first().filter(|_| syntax).and_then(|path| Colorizer::for_path(path));
     let mut chunk: Vec<DiffLine> = Vec::new();
     let mut total = 0usize;
     let mut raw: Vec<u8> = Vec::new();
@@ -621,7 +629,19 @@ fn stream_diff(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        if let Some(line) = parser.feed(&String::from_utf8_lossy(&raw)) {
+        let text = String::from_utf8_lossy(&raw);
+        if let Some(mut line) = parser.feed(&text) {
+            if let Some(colors) = &mut colors {
+                match line.kind {
+                    LineKind::Hunk => colors.reset(),
+                    LineKind::Meta => {}
+                    kind => {
+                        // Le contenu brut, sans le signe du diff ni la fin de ligne.
+                        let body = text.trim_end_matches(['\n', '\r']).get(1..).unwrap_or("");
+                        line.tints = colors.line(kind, body);
+                    }
+                }
+            }
             chunk.push(line);
             total += 1;
         }
