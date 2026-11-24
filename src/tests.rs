@@ -453,6 +453,10 @@ fn syntax_colours_the_diff() {
     assert_eq!(colours(&buffer, "hello\"").1, Color::Rgb(128, 0, 8));
     assert_eq!(colours(&buffer, "bonjour\"").1, Color::Rgb(0, 88, 0));
     assert_eq!(colours(&buffer, "\" ").1, Color::Rgb(63, 0, 1));
+    // Les numéros de ligne sont estompés, sur le fond de leur ligne.
+    assert_eq!(colours(&buffer, "1 // greeting"), (Color::DarkGray, Color::Reset));
+    assert_eq!(colours(&buffer, "3     \"hello\""), (Color::DarkGray, Color::Rgb(63, 0, 1)));
+    assert_eq!(colours(&buffer, "3     \"bonjour\""), (Color::DarkGray, Color::Rgb(0, 40, 0)));
     // Le défilement horizontal emporte les teintes avec le texte.
     app.apply(Action::Horizontal(4));
     let buffer = draw(&mut app);
@@ -466,6 +470,7 @@ fn syntax_colours_the_diff() {
     wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
     let buffer = draw(&mut app);
     assert_eq!(colours(&buffer, "// greeting").0, comment);
+    assert_eq!(colours(&buffer, "1 // greeting").0, Color::DarkGray);
     app.apply(Action::GoLevel(1));
 
     // Sans coloration : le texte et les fonds d'origine.

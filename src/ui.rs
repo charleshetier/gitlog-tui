@@ -672,7 +672,8 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
             _ => (" ", DIM),
         };
         let numbers = format!("{} {}", number(line.old), number(line.new));
-        let mut x = put(buf, x0, y, end, &numbers, Style::new().fg(Color::Gray));
+        // Les numéros de ligne sont estompés : ils s'effacent derrière le contenu.
+        let mut x = put(buf, x0, y, end, &numbers, dim);
         x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
         put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
     }
@@ -809,7 +810,7 @@ fn draw_sides(
         if changed.is_some() {
             buf.set_style(bg_area, Style::new().bg(bg));
         }
-        let x = put(buf, x, y, end, &format!("{number:>num_w$}"), Style::new().fg(Color::Gray));
+        let x = put(buf, x, y, end, &format!("{number:>num_w$}"), dim);
         put_code(buf, x + 1, y, end, line, skip, (marks, mark_bg));
     };
 
