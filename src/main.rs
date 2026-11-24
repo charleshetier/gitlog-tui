@@ -298,7 +298,9 @@ fn dump(app: &mut App, rows: usize) -> Result<()> {
             .map(|labels| labels.iter().map(|l| format!("[{}] ", l.name)).collect())
             .unwrap_or_default();
         let meta = app.meta(row);
-        println!("{graph:<graph_w$}  {}  {labels}{}", oid.short(), meta.subject);
+        // La ligne des modifications non commitées n'a pas de hash.
+        let hash = if oid.is_worktree() { " ".repeat(7) } else { oid.short() };
+        println!("{graph:<graph_w$}  {hash}  {labels}{}", meta.subject);
     }
     Ok(())
 }

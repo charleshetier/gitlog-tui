@@ -260,10 +260,10 @@ fn draw_title(buf: &mut Buffer, app: &mut App, x: u16, y: u16, end: u16) -> u16 
 fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
     let end = area.right() - 1;
     let dim = Style::new().fg(DIM);
-    let n = thousands(app.store.len());
+    let n = thousands(app.commit_count());
     let count = if app.log_error.is_some() {
         "git error".to_string()
-    } else if app.log_done && app.store.len() == 1 {
+    } else if app.log_done && app.commit_count() == 1 {
         "1 commit".to_string()
     } else if app.log_done {
         format!("{n} commits")
@@ -337,6 +337,11 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         let oid = app.store.oid(row);
         let meta = app.meta(row);
         let bright = if selected { Style::new().fg(Color::White) } else { Style::new() };
+        if oid.is_worktree() {
+            // Ce qui n'est pas encore commité : ni hash, ni auteur, un nom en italique.
+            put(buf, text_x, y, end, &meta.subject, bright.add_modifier(Modifier::ITALIC));
+            continue;
+        }
         if show_hash {
             let hash_style = if selected { Style::new().fg(Color::Gray) } else { dim };
             put(buf, hash_x, y, end, &oid.short(), hash_style);
@@ -466,6 +471,9 @@ fn draw_pane_header(buf: &mut Buffer, app: &mut App, area: Rect) {
             let room = title_end.saturating_sub(area.x + 1);
             put(buf, area.x + 1, area.y, title_end, &tail(path, room), bold);
         }
+        _ if pane.oid.is_worktree() => {
+            put(buf, area.x + 1, area.y, title_end, "Uncommitted changes", bold);
+        }
         _ => {
             let x = put(buf, area.x + 1, area.y, title_end, &format!("Commit {}", pane.oid.short()), bold);
             if x + 2 < title_end {
@@ -492,7 +500,11 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
     // Encadré : le libellé du commit et son auteur sur un fond légèrement tramé.
     buf.set_style(Rect::new(area.x, area.y, area.width, area.height.min(2)), Style::new().bg(CARD_BG));
     put(buf, x0, area.y, end, &pane.meta.subject, Style::new().add_modifier(Modifier::BOLD));
-    let info = format!("{} · {}", pane.meta.author, relative(now_secs(), pane.meta.time, true));
+    let info = if pane.oid.is_worktree() {
+        "working tree and index, compared to HEAD".to_string()
+    } else {
+        format!("{} · {}", pane.meta.author, relative(now_secs(), pane.meta.time, true))
+    };
     put(buf, x0, area.y + 1, end, &info, Style::new().fg(Color::Gray));
 
     let files: &[FileEntry] = match &pane.files {

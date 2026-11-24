@@ -270,6 +270,27 @@ pub fn spawn_log(root: PathBuf, filter: Option<Filter>) -> LogStream {
     LogStream { rx, child }
 }
 
+/// Commit de HEAD quand le dossier de travail ou l'index s'en écartent : fichier
+/// modifié, indexé ou non suivi. `None` quand `git status` ne signale rien, et
+/// dans un dépôt sans commit ou sans dossier de travail.
+fn dirty_head(root: &Path) -> Option<Oid> {
+    let status = output(root, &["status", "--porcelain=v2", "--branch", "-z"]).ok()?;
+    let mut head = None;
+    let mut dirty = false;
+    // Les en-têtes finissent par un saut de ligne, les entrées par un octet nul.
+    for entry in status.split(['\0', '\n']).filter(|entry| !entry.is_empty()) {
+        match entry.strip_prefix("# ") {
+            Some(header) => {
+                if let Some(hex) = header.strip_prefix("branch.oid ") {
+                    head = Oid::from_hex(hex);
+                }
+            }
+            None => dirty = true,
+        }
+    }
+    head.filter(|_| dirty)
+}
+
 /// Neutralise les caractères spéciaux d'une expression régulière de base.
 fn regex_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -358,6 +379,12 @@ fn read_log(
         _ => None,
     };
     let mut sink = Sink { tx, layout: Layout::default(), batch: Batch::default(), limit: 64 };
+    // Le graphe complet commence par ce qui n'est pas encore commité, posé sur HEAD.
+    if filter.is_none()
+        && let Some(head) = dirty_head(root)
+    {
+        sink.push(&Oid::worktree(&head), Some(&[head]));
+    }
     let mut parents: Vec<Oid> = Vec::new();
     // Recherche par signe : commit dont le patch est en cours de lecture.
     let mut candidate: Option<Oid> = None;
@@ -518,6 +545,8 @@ pub struct FileReq {
     pub syntax: bool,
     /// Recherche active : seuls les hunks qui y répondent sont gardés.
     pub filter: Option<Filter>,
+    /// Fichier non suivi du dossier de travail : il n'a pas d'ancienne version.
+    pub untracked: bool,
 }
 
 pub enum DiffReq {
@@ -613,6 +642,9 @@ const SHOW_ARGS: [&str; 5] = ["show", "--format=", "--diff-merges=first-parent",
 /// Fichiers d'un commit. Une recherche sur les fichiers ou les hunks ne garde que
 /// ceux qui y répondent ; le second nombre compte les fichiers écartés.
 fn list_files(root: &Path, oid: &Oid, filter: Option<&Filter>) -> Result<(Vec<FileEntry>, usize)> {
+    if oid.is_worktree() {
+        return Ok((list_changes(root)?, 0));
+    }
     let hex = oid.to_hex();
     let mut args = SHOW_ARGS.to_vec();
     args.extend(["--raw", "--numstat", "--no-abbrev", hex.as_str()]);
@@ -640,6 +672,37 @@ fn list_files(root: &Path, oid: &Oid, filter: Option<&Filter>) -> Result<(Vec<Fi
     files.retain(|_| keep.next().unwrap_or(false));
     let hidden = total - files.len();
     Ok((files, hidden))
+}
+
+/// Fichiers non suivis listés au plus : au-delà, un dossier oublié dans
+/// `.gitignore` noierait le reste.
+const MAX_UNTRACKED: usize = 300;
+/// Taille au-delà de laquelle les lignes d'un fichier non suivi ne sont pas comptées.
+const MAX_COUNTED_BYTES: u64 = 2_000_000;
+
+/// Ce qui n'est pas encore commité : les fichiers suivis qui diffèrent de HEAD,
+/// indexés ou non, puis les fichiers non suivis, marqués `?`.
+fn list_changes(root: &Path) -> Result<Vec<FileEntry>> {
+    let tracked = output(root, &["diff", "-M", "--raw", "--numstat", "--no-abbrev", "HEAD"])?;
+    let mut files = parse_files(&tracked);
+    let untracked = output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|path| !path.is_empty()).take(MAX_UNTRACKED) {
+        // Un fichier texte compte pour autant de lignes ajoutées ; un binaire n'en a pas.
+        let lines = std::fs::metadata(root.join(path))
+            .ok()
+            .filter(|meta| meta.len() <= MAX_COUNTED_BYTES)
+            .and_then(|_| std::fs::read(root.join(path)).ok())
+            .filter(|bytes| !bytes.contains(&0))
+            .map(|bytes| bytes.split_inclusive(|&byte| byte == b'\n').count() as u32);
+        files.push(FileEntry {
+            status: '?',
+            path: path.to_string(),
+            old_path: None,
+            added: lines,
+            deleted: lines.map(|_| 0),
+        });
+    }
+    Ok(files)
 }
 
 /// Chemins des fichiers d'un commit dont une ligne ajoutée ou retirée, selon
@@ -771,10 +834,18 @@ fn stream_diff(root: &Path, id: u64, req: &FileReq, latest: &AtomicU64, tx: &Sen
     let meta = |text: String| DiffLine { kind: LineKind::Meta, old: 0, new: 0, text, tints: Vec::new() };
     // Un contexte plus long que tout fichier : le diff porte alors le fichier entier.
     let context = if req.full { "-U1000000" } else { "-U3" };
-    let spawned = git(root)
-        .args(SHOW_ARGS)
-        .args(["--no-ext-diff", context, req.oid.to_hex().as_str(), "--"])
-        .args(&req.paths)
+    let hex = req.oid.to_hex();
+    let mut cmd = git(root);
+    if !req.oid.is_worktree() {
+        cmd.args(SHOW_ARGS).args(["--no-ext-diff", context, hex.as_str(), "--"]).args(&req.paths);
+    } else if req.untracked {
+        // Un fichier non suivi se compare au vide, hors de l'index.
+        cmd.args(["diff", "--no-index", "--no-color", "--no-ext-diff", context, "--", "/dev/null"]).args(&req.paths);
+    } else {
+        // Ce qui n'est pas commité : le dossier de travail, index compris, face à HEAD.
+        cmd.args(["diff", "-M", "--no-color", "--no-ext-diff", context, "HEAD", "--"]).args(&req.paths);
+    }
+    let spawned = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();

@@ -48,6 +48,17 @@ pub struct Oid {
 }
 
 impl Oid {
+    /// Identifiant réservé à la ligne des modifications non commitées : tout à
+    /// zéro, celui que git emploie pour « aucun objet ». Il prend la longueur
+    /// de `like`, car le graphe range des identifiants de taille fixe.
+    pub fn worktree(like: &Oid) -> Oid {
+        Oid { bytes: [0; 32], len: like.len }
+    }
+
+    pub fn is_worktree(self) -> bool {
+        self.bytes == [0; 32]
+    }
+
     pub fn from_hex(hex: &str) -> Option<Oid> {
         let h = hex.as_bytes();
         if (h.len() != 40 && h.len() != 64) || !h.iter().all(u8::is_ascii_hexdigit) {

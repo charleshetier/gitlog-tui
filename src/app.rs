@@ -313,7 +313,13 @@ impl App {
         if self.meta_cache.len() >= META_CACHE {
             self.meta_cache.clear();
         }
-        let meta = self.meta_reader.get(&self.store.oid(row));
+        let oid = self.store.oid(row);
+        let meta = if oid.is_worktree() {
+            // Ce qui n'est pas commité n'a ni auteur ni date : seulement un nom.
+            Meta { subject: "changes".to_string(), ..Meta::default() }
+        } else {
+            self.meta_reader.get(&oid)
+        };
         self.meta_cache.insert(row, meta.clone());
         meta
     }
@@ -423,7 +429,10 @@ impl App {
                 self.keep_offset = None;
                 // Le volet montrait ce commit : il n'a plus de ligne à laquelle se rattacher.
                 self.close_pane();
-                self.set_flash("This commit is not in the graph");
+                // Plus rien à commiter : la ligne des modifications s'efface sans commentaire.
+                if !oid.is_worktree() {
+                    self.set_flash("This commit is not in the graph");
+                }
                 changed = true;
             } else {
                 self.goto = Some((oid, self.store.len()));
@@ -556,7 +565,7 @@ impl App {
         let FilesState::Ready(files) = &pane.files else { return };
         let Some(file) = files.get(index) else { return };
         // Deux colonnes quand les deux versions existent ; une seule pour un ajout ou une suppression.
-        let two_way = !matches!(file.status, 'A' | 'D');
+        let two_way = !matches!(file.status, 'A' | 'D' | '?');
         pane.file_sel = index;
         let req = self.diffs.request_file(FileReq {
             oid: pane.oid,
@@ -564,6 +573,7 @@ impl App {
             full: false,
             syntax: self.syntax,
             filter,
+            untracked: file.status == '?',
         });
         pane.full = None;
         pane.diff = Some(DiffView {
@@ -592,6 +602,7 @@ impl App {
             full: true,
             syntax: self.syntax,
             filter: None,
+            untracked: file.status == '?',
         });
         pane.full = Some(DiffView {
             file: diff.file,
@@ -775,6 +786,15 @@ impl App {
         }
         // Le commit affiché garde sa place à l'écran, même si sa ligne change. En haut de
         // l'historique, la vue y reste : c'est là qu'arrivent les nouveaux commits.
+        // Le détail d'un commit ne change pas, celui du dossier de travail si : il est relu.
+        if let Some(oid) = self.pane.as_ref().map(|pane| pane.oid).filter(|oid| oid.is_worktree()) {
+            self.close_diff();
+            let req = self.diffs.request_files(oid, None);
+            if let Some(pane) = &mut self.pane {
+                pane.files = FilesState::Loading;
+                pane.req = req;
+            }
+        }
         let current = self.pane.as_ref().map(|pane| pane.oid).or_else(|| self.selected_oid());
         self.keep_offset = current.filter(|_| self.top > 0).map(|_| self.selected.saturating_sub(self.top));
         self.restart_log(current, true);
@@ -802,10 +822,18 @@ impl App {
 
     /// Hash du commit affiché : celui du volet, sinon celui de la ligne sélectionnée.
     fn current_hash(&self) -> Option<String> {
-        match &self.pane {
-            Some(pane) => Some(pane.oid.to_hex()),
-            None => (self.selected < self.store.len()).then(|| self.store.oid(self.selected).to_hex()),
-        }
+        let oid = match &self.pane {
+            Some(pane) => Some(pane.oid),
+            None => self.selected_oid(),
+        };
+        // La ligne des modifications non commitées n'a pas de hash.
+        oid.filter(|oid| !oid.is_worktree()).map(Oid::to_hex)
+    }
+
+    /// Nombre de commits chargés, sans la ligne des modifications non commitées.
+    pub fn commit_count(&self) -> usize {
+        let changes = self.store.len() > 0 && self.store.oid(0).is_worktree();
+        self.store.len() - usize::from(changes)
     }
 
     /// Texte copié par `y` : le chemin du fichier sous le curseur, sinon le hash du commit.

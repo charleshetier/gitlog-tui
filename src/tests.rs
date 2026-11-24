@@ -600,6 +600,82 @@ fn remote_branches_are_shortened_and_hidden() {
 }
 
 #[test]
+fn uncommitted_changes_head_the_graph() {
+    let dir = make_repo("changes");
+    // Un fichier suivi modifié, un fichier indexé, un fichier non suivi.
+    std::fs::write(dir.join("a.txt"), "un\nDEUX\ntrois\nquatre\ncinq\n").unwrap();
+    std::fs::write(dir.join("staged.txt"), "indexé\n").unwrap();
+    git(&dir, &["add", "staged.txt"]);
+    std::fs::write(dir.join("untracked.rs"), "fn main() {}\nfn other() {}\n").unwrap();
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    // La première ligne est celle des modifications, reliée à HEAD ; elle n'est pas un commit.
+    assert!(app.store.oid(0).is_worktree());
+    assert_eq!((app.store.len(), app.commit_count()), (5, 4));
+    let view = screen(&mut app, 110, 14);
+    println!("{view}");
+    let lines: Vec<&str> = view.lines().collect();
+    assert!(lines[0].trim_end().ends_with("4 commits"), "{}", lines[0]);
+    assert!(lines[2].starts_with(" ● ") && lines[2].trim_end().ends_with("changes"), "{}", lines[2]);
+    assert!(lines[3].contains("Merge de feature"));
+    assert_eq!(app.copy_target(), None, "pas de hash à copier");
+
+    // Elle s'ouvre comme un commit : ses fichiers, puis leur diff.
+    app.apply(Action::Open);
+    let files_ready = |app: &App| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_)));
+    wait(&mut app, "fichiers", files_ready);
+    let listed = |app: &App| -> Vec<(char, String, Option<u32>)> {
+        let FilesState::Ready(files) = &app.pane.as_ref().unwrap().files else { unreachable!() };
+        files.iter().map(|f| (f.status, f.path.clone(), f.added)).collect()
+    };
+    assert_eq!(
+        listed(&app),
+        [
+            ('M', "a.txt".to_string(), Some(1)),
+            ('A', "staged.txt".to_string(), Some(1)),
+            ('?', "untracked.rs".to_string(), Some(2)),
+        ]
+    );
+    let view = screen(&mut app, 110, 14);
+    assert!(view.contains("Uncommitted changes") && view.contains("3 files changed"), "{view}");
+    let diff_done = |app: &App| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done);
+    let texts = |app: &App| -> Vec<String> {
+        let diff = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
+        diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Add).map(|l| l.text.clone()).collect()
+    };
+    app.apply(Action::Open);
+    wait(&mut app, "diff", diff_done);
+    assert_eq!(texts(&app), ["cinq"]);
+    // Un fichier non suivi se lit en entier, comme un ajout.
+    app.apply(Action::Step(1));
+    app.apply(Action::Step(1));
+    wait(&mut app, "diff", diff_done);
+    assert_eq!(texts(&app), ["fn main() {}", "fn other() {}"]);
+    assert_eq!(app.copy_target().as_deref(), Some("untracked.rs"));
+
+    // Le dossier de travail bouge : `R` relit la liste ouverte.
+    app.apply(Action::GoLevel(2));
+    std::fs::remove_file(dir.join("untracked.rs")).unwrap();
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done && files_ready(app));
+    assert_eq!((app.depth(), listed(&app).len()), (2, 2));
+    assert!(app.store.oid(app.selected).is_worktree());
+
+    // Tout est commité : la ligne disparaît, et son volet avec elle.
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Tout est rangé"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "rafraîchissement", |app| app.log_done);
+    assert_eq!((app.depth(), app.store.len(), app.commit_count()), (1, 5, 5));
+    assert!(!app.store.oid(0).is_worktree());
+    assert_eq!(app.flash(), Some("Refreshed"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn refresh_reloads_the_repository() {
     use crate::git::Head;
 
