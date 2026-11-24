@@ -9,10 +9,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, FilesState, HitMap};
-use crate::diff::{DiffLine, FileEntry, LineKind};
+use crate::app::{App, FilesState, HierState, HitMap, NodeStyle};
+use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE};
 use crate::git::{Head, Label, RefKind};
-use crate::graph::COMMIT;
+use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
+use crate::hierarchy::{Remote, Sync};
 
 /// Une teinte par branche, attribuée à l'ouverture de sa colonne.
 const PALETTE: [Color; 8] = [
@@ -27,11 +28,22 @@ const PALETTE: [Color; 8] = [
 ];
 const TAG_COLOR: Color = Color::Yellow;
 const SEL_BG: Color = Color::Indexed(237);
+/// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
+const LANE_BG: Color = Color::Indexed(236);
+const LANE_SEL_BG: Color = Color::Indexed(240);
+/// Encadré du libellé du commit, en tête du volet.
+const CARD_BG: Color = Color::Indexed(236);
+/// Fond du panneau flottant des raccourcis.
+const PANEL_BG: Color = Color::Indexed(235);
+/// Teinte d'accent : touches du panneau des raccourcis, marque de sélection.
+const ACCENT: Color = Color::LightBlue;
 const REMOTE_BG: Color = Color::Indexed(240);
 const CHIP_BG: Color = Color::Indexed(238);
 const ADD_BG: Color = Color::Indexed(22);
 const DEL_BG: Color = Color::Indexed(52);
 const DIM: Color = Color::DarkGray;
+/// Fond du côté sans vis-à-vis dans le diff en deux colonnes.
+const VOID_BG: Color = Color::Indexed(235);
 
 const ARROW: &str = "\u{e0b2}";
 const ARROW_PLAIN: &str = "◀";
@@ -77,7 +89,7 @@ fn thousands(n: usize) -> String {
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(' ');
+            out.push(',');
         }
         out.push(c);
     }
@@ -111,17 +123,17 @@ fn relative(now: i64, t: i64, long: bool) -> String {
     }
     let age = now - t;
     let short = match age {
-        0..60 => return "à l'instant".to_string(),
+        0..60 => return "just now".to_string(),
         60..3600 => format!("{} min", age / 60),
         3600..86_400 => format!("{} h", age / 3600),
-        86_400..172_800 => return "hier".to_string(),
-        172_800..2_592_000 => format!("{} j", age / 86_400),
+        86_400..172_800 => return "yesterday".to_string(),
+        172_800..2_592_000 => format!("{} d", age / 86_400),
         _ => {
             let (y, m, d) = civil(t);
             return format!("{y:04}-{m:02}-{d:02}");
         }
     };
-    if long { format!("il y a {short}") } else { short }
+    if long { format!("{short} ago") } else { short }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -129,7 +141,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let buf = frame.buffer_mut();
     app.hit = HitMap::default();
     if area.width < 30 || area.height < 6 {
-        put(buf, area.x, area.y, area.right(), "Fenêtre trop petite", Style::new());
+        put(buf, area.x, area.y, area.right(), "Window too small", Style::new());
         return;
     }
 
@@ -138,8 +150,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let rule_bottom = area.bottom() - 2;
     let body_h = rule_bottom - body_y;
     let dim = Style::new().fg(DIM);
-    // Colonne du séparateur vertical quand le volet est ouvert.
-    let divider = app.pane.is_some().then(|| area.x + area.width / 2);
+    let two_way = app
+        .pane
+        .as_ref()
+        .and_then(|p| p.diff.as_ref())
+        .is_some_and(|d| d.sides.is_some());
+    // Colonne du séparateur vertical quand le volet est ouvert. Le diff en deux
+    // colonnes prend les deux tiers de la largeur.
+    let split_at = if two_way { (area.width / 3).max(24).min(area.width / 2) } else { area.width / 2 };
+    let divider = (app.pane.is_some() && app.hierarchy.is_none()).then(|| area.x + split_at);
 
     for y in [rule_top, rule_bottom] {
         for x in area.left()..area.right() {
@@ -152,6 +171,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         put(buf, x, rule_top, area.right(), "┼", dim);
         put(buf, x, rule_bottom, area.right(), "┴", dim);
+    }
+
+    if app.hierarchy.is_some() {
+        draw_hierarchy(buf, app, Rect::new(area.x, area.y, area.width, 1), Rect::new(area.x, body_y, area.width, body_h));
+        draw_status(buf, app, Rect::new(area.x, area.bottom() - 1, area.width, 1));
+        if app.help {
+            draw_help(buf, area);
+        }
+        return;
     }
 
     let left_w = divider.map_or(area.width, |x| x - area.x);
@@ -169,6 +197,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
     draw_status(buf, app, Rect::new(area.x, area.bottom() - 1, area.width, 1));
+    if app.help {
+        draw_help(buf, area);
+    }
 }
 
 fn draw_header(buf: &mut Buffer, app: &App, area: Rect) {
@@ -176,11 +207,11 @@ fn draw_header(buf: &mut Buffer, app: &App, area: Rect) {
     let dim = Style::new().fg(DIM);
     let n = thousands(app.store.len());
     let count = if app.log_error.is_some() {
-        "erreur git".to_string()
+        "git error".to_string()
     } else if app.log_done {
         format!("{n} commits")
     } else if app.want_all {
-        format!("chargement… {n}")
+        format!("loading… {n}")
     } else {
         format!("{n}+ commits")
     };
@@ -190,8 +221,8 @@ fn draw_header(buf: &mut Buffer, app: &App, area: Rect) {
     let mut x = put(buf, area.x + 1, area.y, text_end, "gitlog", Style::new().add_modifier(Modifier::BOLD));
     x = put(buf, x + 2, area.y, text_end, &app.repo.name, dim);
     let head = match &app.repo.head {
-        Head::Branch(name) => format!(" · HEAD sur {name}"),
-        Head::Detached(oid) => format!(" · HEAD détaché sur {}", oid.short()),
+        Head::Branch(name) => format!(" · HEAD on {name}"),
+        Head::Detached(oid) => format!(" · detached HEAD at {}", oid.short()),
         Head::Unborn => String::new(),
     };
     put(buf, x, area.y, text_end, &head, dim);
@@ -206,8 +237,8 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     if len == 0 {
         let (text, style) = match &app.log_error {
             Some(err) => (err.clone(), Style::new().fg(Color::Red)),
-            None if app.log_done => ("Aucun commit.".to_string(), dim),
-            None => ("Chargement…".to_string(), dim),
+            None if app.log_done => ("No commits.".to_string(), dim),
+            None => ("Loading…".to_string(), dim),
         };
         put(buf, area.x + 1, area.y, end, &text, style);
         return;
@@ -216,8 +247,14 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.hit.graph_top = app.top;
     let last = (app.top + area.height as usize).min(len);
 
+    let nodes = app.node_style;
     let graph_w = (app.top..last)
-        .map(|row| app.store.cells(row).len())
+        .map(|row| {
+            let cells = app.store.cells(row);
+            // Le rail déborde d'une cellule à droite du commit.
+            let extra = nodes != NodeStyle::Dots && cells.last().is_some_and(|c| c.bits & COMMIT != 0);
+            cells.len() + usize::from(extra)
+        })
         .max()
         .unwrap_or(0)
         .min(area.width as usize / 3) as u16;
@@ -225,11 +262,7 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     let show_hash = area.width >= 60;
     let show_meta = area.width >= 90;
     let hash_x = area.x + 1 + graph_w + 1;
-    let icon_x = hash_x + 8;
-    let text_x = if show_hash { icon_x + 2 } else { hash_x };
-    if show_hash {
-        app.hit.icon_x = Some(icon_x);
-    }
+    let text_x = if show_hash { hash_x + 8 } else { hash_x };
     let now = now_secs();
 
     for row in app.top..last {
@@ -239,17 +272,8 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
             buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(SEL_BG));
         }
 
-        for (i, cell) in app.store.cells(row).iter().take(graph_w as usize).enumerate() {
-            if cell.bits == 0 {
-                continue;
-            }
-            let mut style = Style::new().fg(palette(cell.color));
-            if cell.bits & COMMIT != 0 {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            let mut glyph = [0u8; 4];
-            put(buf, area.x + 1 + i as u16, y, end, cell.glyph().encode_utf8(&mut glyph), style);
-        }
+        let lane_bg = if selected { LANE_SEL_BG } else { LANE_BG };
+        draw_graph_row(buf, area.x + 1, y, end, app.store.cells(row), graph_w as usize, nodes, lane_bg);
 
         let color = palette(app.store.color(row));
         let oid = app.store.oid(row);
@@ -258,7 +282,6 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         if show_hash {
             let hash_style = if selected { Style::new().fg(Color::Gray) } else { dim };
             put(buf, hash_x, y, end, &oid.short(), hash_style);
-            put(buf, icon_x, y, end, copy_icon(app.plain), if selected { bright } else { dim });
         }
 
         let mut text_end = end;
@@ -374,13 +397,15 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.pane_height = list_h as usize;
     let Some(pane) = &mut app.pane else { return };
 
+    // Encadré : le libellé du commit et son auteur sur un fond légèrement tramé.
+    buf.set_style(Rect::new(area.x, area.y, area.width, area.height.min(2)), Style::new().bg(CARD_BG));
     put(buf, x0, area.y, end, &pane.meta.subject, Style::new().add_modifier(Modifier::BOLD));
     let info = format!("{} · {}", pane.meta.author, relative(now_secs(), pane.meta.time, true));
-    put(buf, x0, area.y + 1, end, &info, dim);
+    put(buf, x0, area.y + 1, end, &info, Style::new().fg(Color::Gray));
 
     let files: &[FileEntry] = match &pane.files {
         FilesState::Loading => {
-            put(buf, x0, area.y + 2, end, "Chargement des fichiers…", dim);
+            put(buf, x0, area.y + 2, end, "Loading files…", dim);
             return;
         }
         FilesState::Failed(err) => {
@@ -392,7 +417,7 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
     let added: u32 = files.iter().filter_map(|f| f.added).sum();
     let deleted: u32 = files.iter().filter_map(|f| f.deleted).sum();
     let plural = if files.len() > 1 { "s" } else { "" };
-    let summary = format!("{} fichier{plural} modifié{plural}", files.len());
+    let summary = format!("{} file{plural} changed", files.len());
     put(buf, x0, area.y + 2, end, &summary, dim);
     put_right(buf, x0, area.y + 2, end, &format!("{plain_minus}{deleted}"), red);
     put_right(buf, x0, area.y + 2, end.saturating_sub(8), &format!("+{added}"), green);
@@ -414,7 +439,7 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
         let y = list_y + (i - pane.file_top) as u16;
         if i == pane.file_sel {
             buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(SEL_BG));
-            put(buf, area.x, y, end, "▌", Style::new().fg(Color::LightBlue));
+            put(buf, area.x, y, end, "▌", Style::new().fg(ACCENT));
         }
         let status_color = match file.status {
             'A' => Color::Green,
@@ -431,11 +456,18 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
                 put_right(buf, x0, y, end, &format!("{plain_minus}{d}"), red);
                 put_right(buf, x0, y, end.saturating_sub(8), &format!("+{a}"), green)
             }
-            _ => put_right(buf, x0, y, end, "binaire", dim),
+            _ => put_right(buf, x0, y, end, "binary", dim),
         };
         let path_end = stats_x.saturating_sub(2);
         let room = path_end.saturating_sub(x0 + 2);
-        put(buf, x0 + 2, y, path_end, &tail(&file.path, room), Style::new());
+        // Les dossiers s'effacent derrière le nom du fichier.
+        let shown = tail(&file.path, room);
+        let name_at = shown.rfind('/').map_or(0, |slash| slash + 1);
+        let selected = i == pane.file_sel;
+        let folders = if selected { Style::new().fg(Color::Gray) } else { dim };
+        let name = if selected { Style::new().fg(Color::White) } else { Style::new() };
+        let x = put(buf, x0 + 2, y, path_end, &shown[..name_at], folders);
+        put(buf, x, y, path_end, &shown[name_at..], name);
     }
 }
 
@@ -447,8 +479,13 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     let end = area.right() - 1;
     let Some(diff) = app.pane.as_mut().and_then(|p| p.diff.as_mut()) else { return };
     if diff.lines.is_empty() {
-        let text = if diff.done { "Aucune différence à afficher." } else { "Chargement du diff…" };
+        let text = if diff.done { "No differences to show." } else { "Loading diff…" };
         put(buf, x0, area.y, end, text, dim);
+        return;
+    }
+    if let Some(sides) = &diff.sides {
+        diff.top = diff.top.min(sides.rows.len().saturating_sub(1));
+        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x);
         return;
     }
     diff.top = diff.top.min(diff.lines.len() - 1);
@@ -485,17 +522,294 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_status(buf: &mut Buffer, app: &App, area: Rect) {
+/// Dessine les cellules du graphe d'une ligne selon le style des commits.
+/// Chaque colonne active reçoit un fond `lane_bg`, large d'une cellule.
+#[allow(clippy::too_many_arguments)]
+fn draw_graph_row(
+    buf: &mut Buffer,
+    x0: u16,
+    y: u16,
+    end: u16,
+    cells: &[Cell],
+    width: usize,
+    nodes: NodeStyle,
+    lane_bg: Color,
+) {
+    let at = |i: usize| cells.get(i).copied().unwrap_or_default();
+    for i in 0..width {
+        let cell = at(i);
+        let before = if i > 0 { at(i - 1) } else { Cell::default() };
+        let is_commit = cell.bits & COMMIT != 0;
+        let after_commit = before.bits & COMMIT != 0;
+        let lane = cell.bits & (UP | DOWN | COMMIT) != 0;
+        let mut glyph = [0u8; 4];
+        let (text, color, bold): (&str, u8, bool) = match nodes {
+            NodeStyle::Rail if is_commit => {
+                // La ligne traverse la cellule et tend un bras vers la puce.
+                let mut bits = cell.bits & (UP | DOWN) | RIGHT;
+                if before.bits & RIGHT != 0 {
+                    bits |= LEFT;
+                }
+                let rail = Cell { bits, color: cell.color };
+                (rail.glyph().encode_utf8(&mut glyph), cell.color, false)
+            }
+            NodeStyle::Rail if after_commit => ("●", before.color, true),
+            _ if cell.bits == 0 => continue,
+            _ => (cell.glyph().encode_utf8(&mut glyph), cell.color, is_commit),
+        };
+        let mut style = Style::new().fg(palette(color));
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if lane {
+            style = style.bg(lane_bg);
+        }
+        put(buf, x0 + i as u16, y, end, text, style);
+    }
+}
+
+/// Diff en deux colonnes : l'ancienne version à gauche, la nouvelle à droite.
+fn draw_sides(buf: &mut Buffer, area: Rect, lines: &[DiffLine], rows: &[(u32, u32)], skip: usize) {
+    let dim = Style::new().fg(DIM);
+    let x0 = area.x + 1;
     let end = area.right() - 1;
+    let mid = x0 + (end - x0) / 2;
+    let rows = &rows[..rows.len().min(area.height as usize)];
+    let line = |index: u32| (index != NO_LINE).then(|| &lines[index as usize]);
+    let max_no = rows
+        .iter()
+        .map(|&(l, r)| line(l).map_or(0, |d| d.old).max(line(r).map_or(0, |d| d.new)))
+        .max()
+        .unwrap_or(0);
+    let num_w = max_no.to_string().len().max(3);
+
+    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Option<Color>| {
+        let Some((line, number)) = content else {
+            buf.set_style(bg_area, Style::new().bg(VOID_BG));
+            return;
+        };
+        if let Some(bg) = changed {
+            buf.set_style(bg_area, Style::new().bg(bg));
+        }
+        let x = put(buf, x, y, end, &format!("{number:>num_w$}"), Style::new().fg(Color::Gray));
+        let text: String = line.text.chars().skip(skip).collect();
+        put(buf, x + 1, y, end, &text, Style::new());
+    };
+
+    for (i, &(l, r)) in rows.iter().enumerate() {
+        let y = area.y + i as u16;
+        let (left, right) = (line(l), line(r));
+        if l == r
+            && let Some(same) = left
+        {
+            match same.kind {
+                LineKind::Hunk => {
+                    put(buf, x0, y, end, &same.text, Style::new().fg(Color::Cyan));
+                    continue;
+                }
+                LineKind::Meta => {
+                    put(buf, x0, y, end, &same.text, dim.add_modifier(Modifier::ITALIC));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let changed = l != r;
+        let left_area = Rect::new(area.x, y, mid - area.x, 1);
+        let right_area = Rect::new(mid + 1, y, area.right() - mid - 1, 1);
+        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), changed.then_some(DEL_BG));
+        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), changed.then_some(ADD_BG));
+        put(buf, mid, y, end, "│", dim);
+    }
+}
+
+/// Hiérarchie des branches : une ligne par branche, sans les commits.
+fn draw_hierarchy(buf: &mut Buffer, app: &mut App, header: Rect, body: Rect) {
+    let dim = Style::new().fg(DIM);
+    let end = body.right() - 1;
+    let plain = app.plain;
+    app.pane_height = body.height as usize;
+
+    let mut x = put(buf, header.x + 1, header.y, end, "gitlog", Style::new().add_modifier(Modifier::BOLD));
+    x = put(buf, x + 2, header.y, end, &app.repo.name, dim);
+    put(buf, x, header.y, end, " · branch hierarchy", dim);
+
+    let Some(view) = &mut app.hierarchy else { return };
+    let (rows, hidden) = match &view.state {
+        HierState::Loading => {
+            put(buf, body.x + 1, body.y, end, "Computing the hierarchy…", dim);
+            return;
+        }
+        HierState::Failed(err) => {
+            put(buf, body.x + 1, body.y, end, err, Style::new().fg(Color::Red));
+            return;
+        }
+        HierState::Ready { rows, hidden } => (rows, *hidden),
+    };
+    let mut count = format!("{} branches", rows.len());
+    if hidden > 0 {
+        count.push_str(&format!(" · {hidden} older ones hidden"));
+    }
+    put_right(buf, header.x + 10, header.y, end, &count, dim);
+    if rows.is_empty() {
+        put(buf, body.x + 1, body.y, end, "No local branches.", dim);
+        return;
+    }
+
+    let height = body.height as usize;
+    view.sel = view.sel.min(rows.len() - 1);
+    if view.sel < view.top {
+        view.top = view.sel;
+    } else if view.sel >= view.top + height {
+        view.top = view.sel + 1 - height;
+    }
+    app.hit.branches = body;
+    app.hit.branch_top = view.top;
+
+    for (i, row) in rows.iter().enumerate().skip(view.top).take(height) {
+        let y = body.y + (i - view.top) as u16;
+        if i == view.sel {
+            buf.set_style(Rect::new(body.x, y, body.width, 1), Style::new().bg(SEL_BG));
+        }
+        // La couleur dit l'état par rapport au parent, comme dans git machete.
+        let color = match row.sync {
+            Sync::Root => Color::LightBlue,
+            Sync::UpToDate => Color::Green,
+            Sync::Stale => Color::LightRed,
+            Sync::Merged => Color::Gray,
+        };
+        let mut x = body.x + 2;
+        for guide in &row.guides {
+            x = put(buf, x, y, end, if *guide { "│  " } else { "   " }, dim);
+        }
+        if row.depth > 0 {
+            x = put(buf, x, y, end, if row.last { "╰─ " } else { "├─ " }, Style::new().fg(color));
+        }
+
+        let (bg, fg) = if row.sync == Sync::Merged { (REMOTE_BG, Color::Gray) } else { (color, Color::Black) };
+        let mut label = Style::new().fg(fg).bg(bg);
+        if row.branch.is_head {
+            label = label.add_modifier(Modifier::BOLD);
+        }
+        x = put(buf, x, y, end, if plain { ARROW_PLAIN } else { ARROW }, Style::new().fg(bg));
+        x = put(buf, x, y, end, &format!(" {} ", row.branch.name), label);
+        if row.branch.is_head {
+            x = put(buf, x + 1, y, end, "← HEAD", Style::new().add_modifier(Modifier::BOLD));
+        }
+
+        let state = match (row.sync, row.ahead, row.behind) {
+            (Sync::Root, ..) => String::new(),
+            (Sync::Merged, ..) => "merged".to_string(),
+            (Sync::UpToDate, 0, _) => "same commit".to_string(),
+            (Sync::UpToDate, ahead, _) => format!("↑{ahead}"),
+            (Sync::Stale, ahead, behind) => format!("↑{ahead} ↓{behind} · needs rebase"),
+        };
+        if !state.is_empty() {
+            x = put(buf, x + 1, y, end, &state, Style::new().fg(color)) + 1;
+        }
+        let remote = match row.branch.remote {
+            Remote::InSync => "",
+            Remote::Untracked => "(no upstream)",
+            Remote::Ahead => "(to push)",
+            Remote::Behind => "(behind remote)",
+            Remote::Diverged => "(diverged from remote)",
+            Remote::Gone => "(remote gone)",
+        };
+        put(buf, x + 1, y, end, remote, dim);
+    }
+}
+
+/// Raccourcis du panneau flottant : (touches, effet). Sans touche, c'est un titre de section.
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("", "Navigation"),
+    ("↑ ↓  j k", "Move the selection, scroll a diff"),
+    ("PgUp PgDn", "Move by one page"),
+    ("g G  Home End", "Jump to the first / last item"),
+    ("Enter", "Open the commit, then the file diff"),
+    ("n p", "Next / previous file in a diff, commit in the file list"),
+    ("← →", "Scroll a diff sideways"),
+    ("1 2 3", "Go to a level: graph, files, diff"),
+    ("q", "Go back one level, quit from the graph"),
+    ("Esc", "Go back one level"),
+    ("", ""),
+    ("", "Actions"),
+    ("y", "Copy the commit hash, or the file path when on a file"),
+    ("h", "Branch hierarchy"),
+    ("s", "Commit style: dots or rail"),
+    ("?", "Show or hide this panel"),
+    ("Ctrl+C", "Quit"),
+    ("", ""),
+    ("", "Mouse"),
+    ("Click", "Open a commit or a file"),
+    ("Click copy icon", "Copy the hash of the open commit"),
+    ("Wheel", "Scroll the graph or the pane"),
+];
+
+/// Panneau flottant des raccourcis, centré par-dessus la vue courante.
+fn draw_help(buf: &mut Buffer, area: Rect) {
+    let key_w = SHORTCUTS.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
+    let text_w = SHORTCUTS
+        .iter()
+        .map(|(keys, text)| if keys.is_empty() { width(text) } else { key_w + 2 + width(text) })
+        .max()
+        .unwrap_or(0);
+    let w = (text_w + 6).min(area.width);
+    let h = (SHORTCUTS.len() as u16 + 2).min(area.height);
+    let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    let base = Style::new().bg(PANEL_BG);
+    let frame = base.fg(ACCENT);
+    let (left, right, top, bottom) = (panel.x, panel.right() - 1, panel.y, panel.bottom() - 1);
+
+    for y in top..=bottom {
+        for x in left..=right {
+            let symbol = match (x == left, x == right, y == top, y == bottom) {
+                (true, _, true, _) => "╭",
+                (_, true, true, _) => "╮",
+                (true, _, _, true) => "╰",
+                (_, true, _, true) => "╯",
+                (true, ..) | (_, true, ..) => "│",
+                (_, _, true, _) | (_, _, _, true) => "─",
+                _ => " ",
+            };
+            buf[(x, y)].reset();
+            buf[(x, y)].set_symbol(symbol).set_style(frame);
+        }
+    }
+    put(buf, left + 2, top, right, " Keyboard shortcuts ", frame.add_modifier(Modifier::BOLD));
+    let close = " ? or Esc to close ";
+    put_right(buf, left + 2, bottom, right.saturating_sub(1), close, base.fg(DIM));
+
+    let x0 = left + 3;
+    for (i, (keys, text)) in SHORTCUTS.iter().enumerate().take(h.saturating_sub(2) as usize) {
+        let y = top + 1 + i as u16;
+        if keys.is_empty() {
+            put(buf, x0, y, right, text, base.fg(Color::White).add_modifier(Modifier::BOLD));
+        } else {
+            put(buf, x0, y, right, keys, base.fg(ACCENT));
+            put(buf, x0 + key_w + 2, y, right, text, base);
+        }
+    }
+}
+
+fn draw_status(buf: &mut Buffer, app: &mut App, area: Rect) {
+    // À droite, le rappel cliquable du panneau des raccourcis.
+    let help = "? help";
+    let help_x = put_right(buf, area.x + 1, area.y, area.right() - 1, help, Style::new().fg(DIM));
+    put(buf, help_x, area.y, area.right() - 1, "?", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+    app.hit.help = Some(Rect::new(help_x, area.y, width(help), 1));
+    let end = help_x.saturating_sub(2);
     if let Some(text) = app.flash() {
         let style = Style::new().fg(Color::LightGreen).add_modifier(Modifier::BOLD);
         put(buf, area.x + 1, area.y, end, text, style);
         return;
     }
     let hints = match app.depth() {
-        1 => "↑↓ naviguer · Entrée ou clic : ouvrir le commit · y copier le hash · q quitter",
-        2 => "↑↓ fichier · Entrée ou clic : diff du fichier · y copier le hash · q fermer le volet · 1 2 changer de niveau",
-        _ => "↑↓ défiler · ←→ décaler · q revenir aux fichiers · 1 2 3 changer de niveau",
+        _ if app.hierarchy.is_some() => {
+            "↑↓ move · Enter: go to the branch · h or q: back · green up to date · red needs rebase · gray merged"
+        }
+        1 => "↑↓ move · Enter or click: open the commit · y copy the hash · h hierarchy · s style · q quit",
+        2 => "↑↓ file · Enter or click: diff · n p next / previous commit · y copy the path · q close the pane",
+        _ => "↑↓ scroll · ←→ sideways · n p next / previous file · y copy the path · q back to the files",
     };
     put(buf, area.x + 1, area.y, end, hints, Style::new().fg(DIM));
 }
@@ -514,11 +828,11 @@ mod tests {
     #[test]
     fn relative_ages() {
         let now = 1_700_000_000;
-        assert_eq!(relative(now, now - 30, false), "à l'instant");
+        assert_eq!(relative(now, now - 30, false), "just now");
         assert_eq!(relative(now, now - 5 * 3600, false), "5 h");
-        assert_eq!(relative(now, now - 5 * 3600, true), "il y a 5 h");
-        assert_eq!(relative(now, now - 30 * 3600, true), "hier");
-        assert_eq!(relative(now, now - 3 * 86_400, false), "3 j");
+        assert_eq!(relative(now, now - 5 * 3600, true), "5 h ago");
+        assert_eq!(relative(now, now - 30 * 3600, true), "yesterday");
+        assert_eq!(relative(now, now - 3 * 86_400, false), "3 d");
         assert_eq!(relative(now, 0, false), "");
         assert_eq!(relative(now, 951_782_400, false), "2000-02-29");
     }
@@ -532,6 +846,6 @@ mod tests {
     #[test]
     fn thousands_are_grouped() {
         assert_eq!(thousands(9), "9");
-        assert_eq!(thousands(1_234_567), "1 234 567");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }

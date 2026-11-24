@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::diff::{DiffLine, DiffParser, FileEntry, LineKind, parse_files};
 use crate::graph::{Batch, Layout, Oid};
+use crate::hierarchy::{self, Branch, BranchRow, Remote};
 
 /// Commits par lot envoyé à l'interface.
 const BATCH_ROWS: usize = 256;
@@ -39,7 +40,7 @@ fn output(root: &Path, args: &[&str]) -> Result<String> {
     let out = git(root)
         .args(args)
         .output()
-        .context("impossible de lancer git : est-il installé et dans le PATH ?")?;
+        .context("cannot run git: is it installed and on the PATH?")?;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -67,7 +68,7 @@ impl Repo {
             Err(err) => {
                 // Dépôt nu : pas de dossier de travail, mais un dossier git valide.
                 if output(dir, &["rev-parse", "--git-dir"]).is_err() {
-                    bail!("{} n'est pas dans un dépôt git ({err})", dir.display());
+                    bail!("{} is not inside a git repository ({err})", dir.display());
                 }
                 dir.to_path_buf()
             }
@@ -172,8 +173,8 @@ fn read_log(root: &Path, tx: &SyncSender<LogMsg>) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("impossible de lancer git log")?;
-    let stdout = BufReader::new(child.stdout.take().context("git log sans sortie")?);
+        .context("cannot run git log")?;
+    let stdout = BufReader::new(child.stdout.take().context("git log has no output")?);
 
     let mut layout = Layout::default();
     let mut batch = Batch::default();
@@ -206,7 +207,7 @@ fn read_log(root: &Path, tx: &SyncSender<LogMsg>) -> Result<()> {
         let _ = err.read_to_string(&mut stderr);
     }
     if !child.wait()?.success() && !stderr.trim().is_empty() {
-        bail!("git log : {}", stderr.trim());
+        bail!("git log: {}", stderr.trim());
     }
     Ok(())
 }
@@ -235,9 +236,9 @@ impl MetaReader {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .context("impossible de lancer git cat-file")?;
-        let stdin = child.stdin.take().context("git cat-file sans entrée")?;
-        let stdout = BufReader::new(child.stdout.take().context("git cat-file sans sortie")?);
+            .context("cannot run git cat-file")?;
+        let stdin = child.stdin.take().context("git cat-file has no input")?;
+        let stdout = BufReader::new(child.stdout.take().context("git cat-file has no output")?);
         Ok(MetaReader { child, stdin, stdout })
     }
 
@@ -253,14 +254,14 @@ impl MetaReader {
         let mut parts = header.split_whitespace();
         let (_, kind, size) = (parts.next(), parts.next(), parts.next());
         let Some(size) = size.and_then(|s| s.parse::<usize>().ok()) else {
-            bail!("objet introuvable");
+            bail!("object not found");
         };
         // Le contenu est suivi d'un saut de ligne.
         let mut body = vec![0u8; size + 1];
         self.stdout.read_exact(&mut body)?;
         body.truncate(size);
         if kind != Some("commit") {
-            bail!("pas un commit");
+            bail!("not a commit");
         }
         Ok(parse_commit(&String::from_utf8_lossy(&body)))
     }
@@ -294,15 +295,19 @@ fn parse_commit(raw: &str) -> Meta {
 pub enum DiffReq {
     Files { id: u64, oid: Oid },
     File { id: u64, oid: Oid, paths: Vec<String> },
+    Hierarchy { id: u64 },
 }
 
 pub enum DiffMsg {
     Files { id: u64, result: Result<Vec<FileEntry>, String> },
     Lines { id: u64, lines: Vec<DiffLine>, done: bool },
+    /// Lignes de l'arbre des branches et nombre de branches laissées de côté.
+    Hierarchy { id: u64, result: Result<(Vec<BranchRow>, usize), String> },
 }
 
-/// Thread qui calcule, à la demande, la liste des fichiers d'un commit et le
-/// diff d'un fichier. Une demande plus récente annule le diff en cours.
+/// Thread qui calcule, à la demande, la liste des fichiers d'un commit, le diff
+/// d'un fichier et la hiérarchie des branches. Une demande plus récente annule
+/// le diff en cours.
 pub struct DiffWorker {
     tx: Sender<DiffReq>,
     pub rx: Receiver<DiffMsg>,
@@ -310,7 +315,8 @@ pub struct DiffWorker {
 }
 
 impl DiffWorker {
-    pub fn new(root: PathBuf) -> DiffWorker {
+    pub fn new(repo: Repo) -> DiffWorker {
+        let root = repo.root.clone();
         let (tx, req_rx) = mpsc::channel::<DiffReq>();
         let (msg_tx, rx) = mpsc::channel::<DiffMsg>();
         let latest = Arc::new(AtomicU64::new(0));
@@ -328,6 +334,10 @@ impl DiffWorker {
                     }
                     DiffReq::File { id, oid, paths } => {
                         stream_diff(&root, id, &oid, &paths, &latest_in_thread, &msg_tx)
+                    }
+                    DiffReq::Hierarchy { id } => {
+                        let result = load_hierarchy(&repo).map_err(|e| format!("{e:#}"));
+                        msg_tx.send(DiffMsg::Hierarchy { id, result }).is_ok()
                     }
                 };
                 if !sent {
@@ -351,6 +361,12 @@ impl DiffWorker {
     pub fn request_file(&self, oid: Oid, paths: Vec<String>) -> u64 {
         let id = self.next_id();
         let _ = self.tx.send(DiffReq::File { id, oid, paths });
+        id
+    }
+
+    pub fn request_hierarchy(&self) -> u64 {
+        let id = self.next_id();
+        let _ = self.tx.send(DiffReq::Hierarchy { id });
         id
     }
 
@@ -391,11 +407,11 @@ fn stream_diff(
     let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
-            let lines = vec![meta(format!("git show a échoué : {err}"))];
+            let lines = vec![meta(format!("git show failed: {err}"))];
             return tx.send(DiffMsg::Lines { id, lines, done: true }).is_ok();
         }
     };
-    let mut reader = BufReader::new(child.stdout.take().expect("sortie redirigée"));
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout is piped"));
     let mut parser = DiffParser::default();
     let mut chunk: Vec<DiffLine> = Vec::new();
     let mut total = 0usize;
@@ -412,7 +428,7 @@ fn stream_diff(
             total += 1;
         }
         if total >= MAX_DIFF_LINES {
-            chunk.push(meta(format!("— diff tronqué à {MAX_DIFF_LINES} lignes —")));
+            chunk.push(meta(format!("— diff truncated at {MAX_DIFF_LINES} lines —")));
             let _ = child.kill();
             break;
         }
@@ -432,9 +448,97 @@ fn stream_diff(
     }
     let _ = child.wait();
     if total == 0 && chunk.is_empty() {
-        chunk.push(meta("Aucune différence à afficher.".to_string()));
+        chunk.push(meta("No differences to show.".to_string()));
     }
     alive && tx.send(DiffMsg::Lines { id, lines: chunk, done: true }).is_ok()
+}
+
+/// Branches prises en compte dans la hiérarchie, les plus récentes d'abord.
+const MAX_HIERARCHY_BRANCHES: usize = 150;
+
+/// Lit les branches locales et leurs écarts deux à deux, puis construit
+/// l'arbre. Tous les écarts viennent d'un seul `git for-each-ref`, grâce au
+/// champ `ahead-behind` (git 2.41 ou plus récent).
+fn load_hierarchy(repo: &Repo) -> Result<(Vec<BranchRow>, usize)> {
+    let list = output(
+        &repo.root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads",
+            "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(upstream:track)",
+        ],
+    )?;
+    let mut branches: Vec<Branch> = Vec::new();
+    for line in list.lines() {
+        let mut parts = line.split('\t');
+        let (Some(name), Some(hex)) = (parts.next(), parts.next()) else { continue };
+        let Some(oid) = Oid::from_hex(hex) else { continue };
+        let upstream = parts.next().unwrap_or("");
+        let track = parts.next().unwrap_or("");
+        let remote = if upstream.is_empty() {
+            Remote::Untracked
+        } else if track.contains("gone") {
+            Remote::Gone
+        } else {
+            match (track.contains("ahead"), track.contains("behind")) {
+                (true, true) => Remote::Diverged,
+                (true, false) => Remote::Ahead,
+                (false, true) => Remote::Behind,
+                (false, false) => Remote::InSync,
+            }
+        };
+        let is_head = repo.head == Head::Branch(name.to_string());
+        branches.push(Branch { name: name.to_string(), oid, is_head, remote });
+    }
+    let hidden = branches.len().saturating_sub(MAX_HIERARCHY_BRANCHES);
+    branches.truncate(MAX_HIERARCHY_BRANCHES);
+    if branches.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    // Une colonne par commit de tête distinct : les branches au même commit la partagent.
+    let mut tips: Vec<Oid> = Vec::new();
+    for branch in &branches {
+        if !tips.contains(&branch.oid) {
+            tips.push(branch.oid);
+        }
+    }
+    let mut format = String::from("--format=%(objectname)");
+    for tip in &tips {
+        format.push_str(&format!("%09%(ahead-behind:{})", tip.to_hex()));
+    }
+    let table = output(&repo.root, &["for-each-ref", "refs/heads", &format]).map_err(|err| {
+        if err.to_string().contains("ahead-behind") {
+            anyhow::anyhow!("the hierarchy view requires git 2.41 or newer")
+        } else {
+            err
+        }
+    })?;
+    let mut by_tip: HashMap<Oid, Vec<(u32, u32)>> = HashMap::new();
+    for line in table.lines() {
+        let mut parts = line.split('\t');
+        let Some(oid) = parts.next().and_then(Oid::from_hex) else { continue };
+        let pairs = parts
+            .map(|pair| {
+                let mut numbers = pair.split(' ').map(|n| n.parse().unwrap_or(0));
+                (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
+            })
+            .collect();
+        by_tip.insert(oid, pairs);
+    }
+    let column = |oid: &Oid| tips.iter().position(|tip| tip == oid).unwrap_or(0);
+    let ab: Vec<Vec<(u32, u32)>> = branches
+        .iter()
+        .map(|b| {
+            let row = by_tip.get(&b.oid);
+            branches
+                .iter()
+                .map(|p| row.and_then(|r| r.get(column(&p.oid)).copied()).unwrap_or((0, 0)))
+                .collect()
+        })
+        .collect();
+    Ok((hierarchy::build(&branches, &ab), hidden))
 }
 
 #[cfg(test)]

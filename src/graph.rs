@@ -292,6 +292,17 @@ impl GraphStore {
         &self.cells[r.start as usize..r.start as usize + r.len as usize]
     }
 
+    /// Cherche un commit parmi les lignes chargées, à partir de la ligne `from`.
+    pub fn find(&self, oid: &Oid, from: usize) -> Option<usize> {
+        if self.oid_len == 0 || from >= self.rows.len() {
+            return None;
+        }
+        self.oids[from * self.oid_len..]
+            .chunks_exact(self.oid_len)
+            .position(|candidate| candidate == oid.as_bytes())
+            .map(|i| i + from)
+    }
+
     /// Mémoire réservée par les lignes, en octets.
     #[cfg(test)]
     pub fn memory_bytes(&self) -> usize {

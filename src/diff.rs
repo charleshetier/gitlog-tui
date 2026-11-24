@@ -115,6 +115,54 @@ impl DiffParser {
     }
 }
 
+/// Marque l'absence de ligne d'un côté dans la vue en deux colonnes.
+pub const NO_LINE: u32 = u32::MAX;
+
+/// Mise en regard ancien / nouveau, construite au fil du flux : chaque paire
+/// désigne la ligne de gauche et celle de droite par leur indice dans le diff.
+#[derive(Default)]
+pub struct SideBySide {
+    pub rows: Vec<(u32, u32)>,
+    /// Première ligne retirée qui attend encore son vis-à-vis.
+    cursor: usize,
+    after_add: bool,
+}
+
+impl SideBySide {
+    pub fn push(&mut self, index: u32, kind: LineKind) {
+        match kind {
+            LineKind::Del => {
+                // Un retrait après des ajouts ouvre un nouveau bloc.
+                if self.after_add {
+                    self.cursor = self.rows.len();
+                }
+                self.after_add = false;
+                self.rows.push((index, NO_LINE));
+            }
+            LineKind::Add => {
+                self.after_add = true;
+                while self.cursor < self.rows.len() && self.rows[self.cursor].1 != NO_LINE {
+                    self.cursor += 1;
+                }
+                if self.cursor < self.rows.len() {
+                    self.rows[self.cursor].1 = index;
+                    self.cursor += 1;
+                } else {
+                    self.rows.push((NO_LINE, index));
+                    self.cursor = self.rows.len();
+                }
+            }
+            // « No newline at end of file » ne sépare pas un retrait de son ajout.
+            LineKind::Meta => self.rows.push((index, index)),
+            LineKind::Hunk | LineKind::Ctx => {
+                self.after_add = false;
+                self.rows.push((index, index));
+                self.cursor = self.rows.len();
+            }
+        }
+    }
+}
+
 /// Extrait les numéros de départ de `@@ -a,b +c,d @@`.
 fn parse_hunk_header(raw: &str) -> Option<(u32, u32)> {
     let mut parts = raw.split(' ');
@@ -211,5 +259,44 @@ index 1111111..2222222 100644
         let lines: Vec<DiffLine> = diff.lines().filter_map(|l| parser.feed(l)).collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].kind, LineKind::Meta);
+    }
+}
+
+#[cfg(test)]
+mod side_by_side_tests {
+    use super::*;
+
+    fn pair(kinds: &[LineKind]) -> Vec<(u32, u32)> {
+        let mut sides = SideBySide::default();
+        for (i, kind) in kinds.iter().enumerate() {
+            sides.push(i as u32, *kind);
+        }
+        sides.rows
+    }
+
+    #[test]
+    fn removed_lines_face_added_lines() {
+        use LineKind::*;
+        // contexte, 2 retraits, 3 ajouts, contexte
+        assert_eq!(
+            pair(&[Ctx, Del, Del, Add, Add, Add, Ctx]),
+            [(0, 0), (1, 3), (2, 4), (NO_LINE, 5), (6, 6)]
+        );
+    }
+
+    #[test]
+    fn separate_blocks_do_not_mix() {
+        use LineKind::*;
+        // un retrait seul, un contexte, un ajout seul ; puis retrait, ajout, retrait
+        assert_eq!(
+            pair(&[Del, Ctx, Add, Del, Add, Del]),
+            [(0, NO_LINE), (1, 1), (NO_LINE, 2), (3, 4), (5, NO_LINE)]
+        );
+    }
+
+    #[test]
+    fn no_newline_marker_keeps_the_pair() {
+        use LineKind::*;
+        assert_eq!(pair(&[Del, Meta, Add]), [(0, 2), (1, 1)]);
     }
 }
