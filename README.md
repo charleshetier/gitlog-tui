@@ -31,6 +31,8 @@ gitlog path/to/repo
 
 Press `?` inside `gitlog` for the list of shortcuts, or run `gitlog --help`.
 
+Drag the mouse over the code of a diff to select it: the text is copied to the clipboard when the button is released.
+
 The icons expect a [Nerd Font](https://www.nerdfonts.com). Without one, use `gitlog --plain` or set `GITLOG_PLAIN=1`.
 
 Diffs are syntax highlighted on terminals with 24-bit colours: always on Windows, elsewhere when `COLORTERM` is `truecolor` or `24bit`. Use `gitlog --no-syntax` to turn it off.

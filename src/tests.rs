@@ -582,6 +582,115 @@ fn search_narrows_the_commit_details() {
 }
 
 #[test]
+fn mouse_selects_code_in_a_diff() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use ratatui::style::Color;
+
+    let dir = std::env::temp_dir().join(format!("gitlog-test-select-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let source = |word: &str| format!("// greeting\npub fn hello() -> &'static str {{\n    \"{word}\"\n}}\n");
+    std::fs::write(dir.join("lib.rs"), source("hello")).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    // Un fichier modifié, en deux colonnes, et un fichier ajouté, en une seule.
+    std::fs::write(dir.join("lib.rs"), source("bonjour")).unwrap();
+    let long: String = (1..=30).map(|n| format!("ligne {n}\n")).collect();
+    std::fs::write(dir.join("long.txt"), long).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Edit"]);
+
+    let draw = |app: &mut App, height: u16| -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    // Première cellule de `needle` à l'écran, à partir de la colonne `from`.
+    let find = |buffer: &Buffer, needle: &str, from: u16| -> Position {
+        let needle: Vec<char> = needle.chars().collect();
+        for y in 0..buffer.area.height {
+            let row: Vec<char> = (from..120).map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+            if let Some(x) = row.windows(needle.len()).position(|w| w == needle.as_slice()) {
+                return Position::new(from + x as u16, y);
+            }
+        }
+        panic!("« {} » n'est pas à l'écran", needle.iter().collect::<String>());
+    };
+    let open_diff = |app: &mut App| {
+        app.apply(Action::Open);
+        wait(app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    };
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    draw(&mut app, 24);
+    app.apply(Action::Open);
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+    open_diff(&mut app);
+    let buffer = draw(&mut app, 24);
+    let code = app.hit.code.expect("le code du diff est repéré");
+    let (mid, _) = code.right.expect("deux colonnes");
+
+    // Du « b » de « bonjour » à l'accolade de la ligne suivante, à droite : le
+    // texte seul, sans numéros, d'une ligne à l'autre.
+    let start = find(&buffer, "bonjour", mid);
+    let brace = find(&buffer, "4 }", mid);
+    app.apply(Action::SelectStart(start));
+    assert!(app.selecting && app.selected_text().is_none(), "un clic seul ne sélectionne rien");
+    app.apply(Action::SelectDrag(Position::new(brace.x + 2, brace.y)));
+    assert_eq!(app.selected_text().as_deref(), Some("bonjour\"\n}"));
+    // La sélection se voit, du côté où elle a commencé seulement.
+    let buffer = draw(&mut app, 24);
+    let selected = Color::Indexed(18);
+    assert_eq!((buffer[(start.x, start.y)].bg, buffer[(brace.x + 2, brace.y)].bg), (selected, selected));
+    assert_ne!(buffer[(start.x - 1, start.y)].bg, selected);
+    assert!((0..mid).all(|x| buffer[(x, start.y)].bg != selected && buffer[(x, brace.y)].bg != selected));
+    // Le pointeur passe à gauche : la sélection reste à droite, ramenée à son bord.
+    app.apply(Action::SelectDrag(Position::new(2, start.y)));
+    assert_eq!(app.selected_text().as_deref(), Some("    \"b"));
+
+    // À gauche, l'ancienne version. Le défilement horizontal décale les colonnes.
+    let old = find(&buffer, "hello\"", 0);
+    app.apply(Action::SelectStart(old));
+    app.apply(Action::SelectDrag(Position::new(old.x + 4, old.y)));
+    assert_eq!(app.selected_text().as_deref(), Some("hello"));
+    app.apply(Action::Horizontal(4));
+    let buffer = draw(&mut app, 24);
+    let old = find(&buffer, "hello\"", 0);
+    app.apply(Action::SelectStart(old));
+    app.apply(Action::SelectDrag(Position::new(old.x + 5, old.y)));
+    assert_eq!(app.selected_text().as_deref(), Some("hello\""));
+
+    // Un clic sans déplacement efface la sélection, sans rien copier.
+    app.apply(Action::SelectStart(old));
+    app.apply(Action::SelectEnd);
+    assert!(!app.selecting && app.selected_text().is_none());
+
+    // Fichier ajouté, sur une colonne, dans une fenêtre basse : tirer jusqu'au
+    // bas de l'écran fait défiler le diff, et la sélection s'étend d'autant.
+    app.apply(Action::Back { quit: true });
+    app.apply(Action::Move(1));
+    open_diff(&mut app);
+    let buffer = draw(&mut app, 10);
+    let first = find(&buffer, "ligne 1", 60);
+    app.apply(Action::SelectStart(Position::new(first.x + 6, first.y)));
+    for _ in 0..3 {
+        app.apply(Action::SelectDrag(Position::new(first.x + 6, 9)));
+    }
+    let diff = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
+    assert_eq!(diff.top, 3);
+    // De la fin de « ligne 1 » au même rang dans « ligne 10 », venue sous le pointeur.
+    let text = app.selected_text().unwrap();
+    assert!(text.starts_with("1\nligne 2\n") && text.ends_with("\nligne 9\nligne 1"), "{text}");
+    assert_eq!(text.lines().count(), 10);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn remote_branches_are_shortened_and_hidden() {
     let dir = make_repo("remotes");
     // origin/main suit main ; origin/feature est resté en arrière de feature.

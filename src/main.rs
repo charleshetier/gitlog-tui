@@ -46,6 +46,7 @@ Usage: gitlog [OPTIONS] [PATH]
 
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       y copy the commit hash, or the path of the file under the cursor
+      drag the mouse over a diff to select code: it is copied on release
       Enter on a diff opens the whole file in a floating window
       n N next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
@@ -231,6 +232,10 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
             if app.help {
                 return Some(Action::ToggleHelp);
             }
+            // Sur le code d'un diff, le bouton commence une sélection.
+            if hit.code.is_some_and(|code| code.area.contains(pos)) {
+                return Some(Action::SelectStart(pos));
+            }
             // Sous la fenêtre du fichier entier, rien n'est cliquable.
             if app.depth() == 4 {
                 return None;
@@ -262,6 +267,8 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
             }
             None
         }
+        MouseEventKind::Drag(MouseButton::Left) if app.selecting => Some(Action::SelectDrag(pos)),
+        MouseEventKind::Up(MouseButton::Left) if app.selecting => Some(Action::SelectEnd),
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let delta = if mouse.kind == MouseEventKind::ScrollUp { -WHEEL } else { WHEEL };
             // La fenêtre du fichier entier recouvre tout : la molette lui revient.

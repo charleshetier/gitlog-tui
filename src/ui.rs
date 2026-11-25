@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, DiffView, FilesState, HierState, HitMap, NodeStyle, Prompt};
+use crate::app::{App, CodeHit, DiffView, FilesState, HierState, HitMap, NodeStyle, Prompt, Side};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -32,6 +32,8 @@ const SEL_BG: Color = Color::Indexed(237);
 /// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
 const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
+/// Code sélectionné à la souris dans un diff.
+const SELECT_BG: Color = Color::Indexed(18);
 /// Ligne du commit de HEAD : un fond à peine relevé, en deçà de la sélection.
 const HEAD_BG: Color = Color::Indexed(235);
 const LANE_HEAD_BG: Color = Color::Indexed(238);
@@ -616,9 +618,8 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
 fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.pane_height = area.height as usize;
     let syntax = app.syntax;
-    if let Some(diff) = app.pane.as_mut().and_then(|p| p.diff.as_mut()) {
-        draw_diff_view(buf, diff, area, syntax);
-    }
+    let diff = app.pane.as_mut().and_then(|p| p.diff.as_mut());
+    app.hit.code = diff.and_then(|diff| draw_diff_view(buf, diff, area, syntax));
 }
 
 /// Niveau 4 : le fichier entier dans une fenêtre flottante, modifications en place.
@@ -655,12 +656,14 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
             buf[(x, y)].reset();
         }
     }
-    draw_diff_view(buf, full, inner, syntax);
+    // La fenêtre recouvre le diff : c'est dans son code que la souris sélectionne.
+    app.hit.code = draw_diff_view(buf, full, inner, syntax);
 }
 
 /// Lignes d'un diff à partir de sa position de défilement : en deux colonnes quand
-/// les deux versions du fichier existent, en une seule sinon.
-fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: bool) {
+/// les deux versions du fichier existent, en une seule sinon. Renvoie la place
+/// du code à l'écran, `None` tant qu'il n'y a rien à lire.
+fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: bool) -> Option<CodeHit> {
     let dim = Style::new().fg(DIM);
     let tones = if syntax { SYNTAX_TONES } else { TONES };
     let x0 = area.x + 1;
@@ -668,12 +671,11 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     if diff.lines.is_empty() {
         let text = if diff.done { "No differences to show." } else { "Loading diff…" };
         put(buf, x0, area.y, end, text, dim);
-        return;
+        return None;
     }
     if let Some(sides) = &diff.sides {
         diff.top = diff.top.min(sides.rows.len().saturating_sub(1));
-        draw_sides(buf, area, &diff.lines, &sides.rows[diff.top..], diff.x, tones);
-        return;
+        return Some(draw_sides(buf, area, diff, &sides.rows[diff.top..], tones));
     }
     diff.top = diff.top.min(diff.lines.len() - 1);
     let visible: &[DiffLine] = &diff.lines[diff.top..(diff.top + area.height as usize).min(diff.lines.len())];
@@ -682,6 +684,8 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     let number = |n: u32| if n == 0 { " ".repeat(num_w) } else { format!("{n:>num_w$}") };
     // Un fichier ajouté n'a que des lignes vertes : le « + » n'y apprendrait rien.
     let signs = visible.iter().any(|line| matches!(line.kind, LineKind::Del));
+    // Numéros, signe éventuel, puis le code.
+    let code_x = x0 + 2 * num_w as u16 + 2 + if signs { 2 } else { 0 };
 
     for (i, line) in visible.iter().enumerate() {
         let y = area.y + i as u16;
@@ -710,6 +714,30 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
             x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
         }
         put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
+        if let Some(columns) = diff.select.and_then(|select| select.columns(Side::Left, diff.top + i)) {
+            mark_selection(buf, (code_x, y, end), diff.x, line, columns);
+        }
+    }
+    Some(CodeHit { area, top: diff.top, skip: diff.x, left: code_x, right: None, lower_edge: lower_edge(buf, area) })
+}
+
+/// Ligne de l'écran où une sélection commence à faire défiler le diff vers le
+/// bas : celle qui suit le diff, ou sa dernière s'il touche le bas de l'écran.
+fn lower_edge(buf: &Buffer, area: Rect) -> u16 {
+    if area.bottom() >= buf.area.bottom() { area.bottom().saturating_sub(1) } else { area.bottom() }
+}
+
+/// Pose le fond de la sélection sur une ligne de code dessinée en `x` : `from`
+/// et `to` sont des rangs de caractères dans le texte, `skip` le défilement.
+fn mark_selection(buf: &mut Buffer, (x, y, end): (u16, u16, u16), skip: usize, line: &DiffLine, (from, to): (usize, usize)) {
+    let len = line.text.chars().count();
+    // Une ligne prise jusqu'au bout déborde d'une cellule : son saut de ligne.
+    let to = if to == usize::MAX { len + 1 } else { to.min(len) };
+    let from = from.max(skip);
+    let room = end.saturating_sub(x) as usize;
+    let (start, stop) = ((from - skip).min(room), to.saturating_sub(skip).min(room));
+    if start < stop {
+        buf.set_style(Rect::new(x + start as u16, y, (stop - start) as u16, 1), Style::new().bg(SELECT_BG));
     }
 }
 
@@ -813,14 +841,8 @@ fn draw_graph_row(
 }
 
 /// Diff en deux colonnes : l'ancienne version à gauche, la nouvelle à droite.
-fn draw_sides(
-    buf: &mut Buffer,
-    area: Rect,
-    lines: &[DiffLine],
-    rows: &[(u32, u32)],
-    skip: usize,
-    tones: Tones,
-) {
+fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)], tones: Tones) -> CodeHit {
+    let (lines, skip) = (diff.lines.as_slice(), diff.x);
     let dim = Style::new().fg(DIM);
     let x0 = area.x + 1;
     let end = area.right() - 1;
@@ -836,7 +858,9 @@ fn draw_sides(
 
     // `changed` : fond d'une ligne modifiée, puis ses passages modifiés et leur fond.
     type Changed<'a> = Option<(Color, &'a [Range<usize>], Color)>;
-    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed| {
+    // `selected` : caractères de la ligne pris dans la sélection à la souris.
+    type Selected = Option<(usize, usize)>;
+    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed, selected: Selected| {
         let Some((line, number)) = content else {
             buf.set_style(bg_area, Style::new().bg(VOID_BG));
             return;
@@ -847,6 +871,9 @@ fn draw_sides(
         }
         let x = put(buf, x, y, end, &format!("{number:>num_w$}"), dim);
         put_code(buf, x + 1, y, end, line, skip, (marks, mark_bg));
+        if let Some(columns) = selected {
+            mark_selection(buf, (x + 1, y, end), skip, line, columns);
+        }
     };
 
     for (i, &(l, r)) in rows.iter().enumerate() {
@@ -877,10 +904,15 @@ fn draw_sides(
         };
         let removed = changed.then_some((tones.del, old_marks.as_slice(), tones.del_mark));
         let added = changed.then_some((tones.add, new_marks.as_slice(), tones.add_mark));
-        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed);
-        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added);
+        let selected = |side: Side| diff.select.and_then(|select| select.columns(side, diff.top + i));
+        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed, selected(Side::Left));
+        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added, selected(Side::Right));
         put(buf, mid, y, end, "│", dim);
     }
+    // De chaque côté : le numéro de ligne, une espace, puis le code.
+    let code = num_w as u16 + 1;
+    let right = Some((mid, mid + 2 + code));
+    CodeHit { area, top: diff.top, skip, left: x0 + code, right, lower_edge: lower_edge(buf, area) }
 }
 
 /// Hiérarchie des branches : une ligne par branche, sans les commits.
@@ -1006,6 +1038,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Click copy icon", "Copy the hash of the open commit"),
     ("Click header", "On the folder: copy its path; on the repo: its URL"),
     ("Wheel", "Scroll the graph or the pane"),
+    ("Drag on a diff", "Select code: it is copied when the button is released"),
 ];
 
 /// Cadre d'un panneau flottant : fond uni, titre en haut, rappel de fermeture en bas.

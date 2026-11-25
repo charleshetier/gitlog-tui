@@ -5,7 +5,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::diff::{DiffLine, FileEntry, LineKind, SideBySide};
 use crate::git::{self, DiffMsg, DiffWorker, FileReq, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
@@ -49,6 +49,38 @@ pub enum FilesState {
     Failed(String),
 }
 
+/// Côté d'un diff. En une seule colonne, tout le code est à gauche.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Code sélectionné à la souris dans un diff : d'un caractère à un autre, sur un
+/// seul côté. Chaque borne donne la ligne de la vue et le rang du caractère.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub side: Side,
+    /// Là où le bouton a été enfoncé, puis là où se trouve le pointeur.
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
+impl Selection {
+    /// Caractères sélectionnés sur une ligne de la vue : du premier, inclus, au
+    /// dernier, exclu ; `usize::MAX` quand la sélection continue à la ligne suivante.
+    pub fn columns(&self, side: Side, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = (self.anchor.min(self.head), self.anchor.max(self.head));
+        // Un clic sans déplacement ne sélectionne rien.
+        if side != self.side || start == end || row < start.0 || row > end.0 {
+            return None;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 + 1 } else { usize::MAX };
+        Some((from, to))
+    }
+}
+
 /// Niveau 3 : le diff d'un fichier.
 pub struct DiffView {
     pub file: usize,
@@ -58,6 +90,7 @@ pub struct DiffView {
     pub done: bool,
     pub top: usize,
     pub x: usize,
+    pub select: Option<Selection>,
     /// Fichier entier : se placer sur la première modification dès qu'elle arrive.
     seek: bool,
     req: u64,
@@ -83,6 +116,33 @@ impl DiffView {
         (0..self.len())
             .filter(|&row| self.changed(row) && (row == 0 || !self.changed(row - 1)))
             .map(|row| row.saturating_sub(CHANGE_MARGIN))
+    }
+
+    /// Ligne de code d'une ligne de la vue, du côté demandé : ni un en-tête de
+    /// hunk, ni le vide laissé en face d'un ajout ou d'un retrait.
+    fn code(&self, row: usize, side: Side) -> Option<&DiffLine> {
+        let index = match &self.sides {
+            Some(sides) => {
+                let &(left, right) = sides.rows.get(row)?;
+                if side == Side::Left { left } else { right }
+            }
+            None => row as u32,
+        };
+        let line = self.lines.get(index as usize)?;
+        matches!(line.kind, LineKind::Ctx | LineKind::Add | LineKind::Del).then_some(line)
+    }
+
+    /// Texte de la sélection, ligne de code par ligne de code, sans les numéros.
+    pub fn selected_text(&self) -> Option<String> {
+        let select = self.select?;
+        let (first, last) = (select.anchor.0.min(select.head.0), select.anchor.0.max(select.head.0));
+        let mut out: Vec<String> = Vec::new();
+        for row in first..=last {
+            if let (Some((from, to)), Some(line)) = (select.columns(select.side, row), self.code(row, select.side)) {
+                out.push(line.text.chars().skip(from).take(to.saturating_sub(from)).collect());
+            }
+        }
+        out.iter().any(|line| !line.is_empty()).then(|| out.join("\n"))
     }
 
     fn append(&mut self, lines: Vec<DiffLine>) {
@@ -124,6 +184,45 @@ pub struct Hierarchy {
     req: u64,
 }
 
+/// Code d'un diff à l'écran : de quoi traduire un point en position dans le texte.
+#[derive(Clone, Copy, Debug)]
+pub struct CodeHit {
+    /// Lignes du diff affichées.
+    pub area: Rect,
+    /// Ligne de la vue en haut de la zone, puis défilement horizontal.
+    pub top: usize,
+    pub skip: usize,
+    /// Première colonne du code, à gauche ou dans la colonne unique.
+    pub left: u16,
+    /// En deux colonnes : le séparateur, puis la première colonne du code à droite.
+    pub right: Option<(u16, u16)>,
+    /// Ligne de l'écran à partir de laquelle une sélection fait défiler vers le
+    /// bas : la dernière du diff quand rien ne le suit à l'écran.
+    pub lower_edge: u16,
+}
+
+impl CodeHit {
+    fn side(&self, x: u16) -> Side {
+        match self.right {
+            Some((mid, _)) if x > mid => Side::Right,
+            _ => Side::Left,
+        }
+    }
+
+    /// Ligne de la vue et rang du caractère sous un point. Hors du code de ce
+    /// côté, le point est ramené à son bord le plus proche.
+    fn locate(&self, pos: Position, side: Side) -> (usize, usize) {
+        let (start, end) = match (side, self.right) {
+            (Side::Right, Some((_, code))) => (code, self.area.right().saturating_sub(1)),
+            (_, Some((mid, _))) => (self.left, mid),
+            (_, None) => (self.left, self.area.right().saturating_sub(1)),
+        };
+        let x = pos.x.min(end.saturating_sub(1)).max(start);
+        let y = pos.y.min(self.area.bottom().saturating_sub(1)).max(self.area.y);
+        (self.top + (y - self.area.y) as usize, self.skip + (x - start) as usize)
+    }
+}
+
 /// Zones cliquables mémorisées au dernier rendu.
 #[derive(Default)]
 pub struct HitMap {
@@ -139,6 +238,8 @@ pub struct HitMap {
     pub remote: Option<Rect>,
     pub branches: Rect,
     pub branch_top: usize,
+    /// Code du diff au premier plan, où la souris sélectionne du texte.
+    pub code: Option<CodeHit>,
 }
 
 /// Chemins à donner à git pour un fichier : pour un renommage, l'ancien chemin
@@ -183,6 +284,10 @@ pub enum Action {
     ScrollGraph(isize),
     ScrollPane(isize),
     Horizontal(isize),
+    /// Sélection de code à la souris dans un diff : bouton enfoncé, déplacé, relâché.
+    SelectStart(Position),
+    SelectDrag(Position),
+    SelectEnd,
     ToggleHierarchy,
     CycleNodes,
     /// Relit le dépôt : branche courante, refs et historique.
@@ -231,6 +336,8 @@ pub struct App {
     /// Recherche et commit d'avant l'ouverture du menu, rétablis si la saisie est abandonnée.
     before_search: Option<(Option<Filter>, Option<Oid>)>,
     pub hit: HitMap,
+    /// Une sélection à la souris est en cours : le bouton est encore enfoncé.
+    pub selecting: bool,
     pub should_quit: bool,
     flash: Option<(String, Instant)>,
     log: Option<LogStream>,
@@ -277,6 +384,7 @@ impl App {
             before_search: None,
             hit: HitMap::default(),
             should_quit: false,
+            selecting: false,
             flash: None,
             log,
             goto_end: false,
@@ -583,6 +691,7 @@ impl App {
             done: false,
             top: 0,
             x: 0,
+            select: None,
             seek: false,
             req,
         });
@@ -611,6 +720,7 @@ impl App {
             done: false,
             top: 0,
             x: 0,
+            select: None,
             seek: true,
             req,
         });
@@ -666,9 +776,69 @@ impl App {
             .as_mut()
             .is_some_and(|c| c.set_text(text.as_str()).is_ok());
         if copied {
-            self.set_flash(format!("Copied: {text}"));
+            // Un extrait de code de plusieurs lignes ne tient pas dans la pastille.
+            let lines = text.lines().count();
+            self.set_flash(if lines > 1 { format!("Copied {lines} lines") } else { format!("Copied: {}", text.trim()) });
         } else {
             self.set_flash("Clipboard unavailable");
+        }
+    }
+
+    /// Diff au premier plan : le fichier entier s'il est ouvert, sinon le diff.
+    fn code_view(&mut self) -> Option<&mut DiffView> {
+        self.pane.as_mut().and_then(|pane| pane.full.as_mut().or(pane.diff.as_mut()))
+    }
+
+    /// Texte sélectionné à la souris dans le diff au premier plan.
+    pub fn selected_text(&self) -> Option<String> {
+        let pane = self.pane.as_ref()?;
+        pane.full.as_ref().or(pane.diff.as_ref())?.selected_text()
+    }
+
+    /// Bouton enfoncé sur le code d'un diff : une sélection commence du côté
+    /// visé, la précédente s'efface.
+    fn select_start(&mut self, pos: Position) {
+        let Some(code) = self.hit.code else { return };
+        let side = code.side(pos.x);
+        let point = code.locate(pos, side);
+        if let Some(view) = self.code_view() {
+            view.select = Some(Selection { side, anchor: point, head: point });
+            self.selecting = true;
+        }
+    }
+
+    /// Le pointeur se déplace, bouton enfoncé : la sélection le suit. Passé le
+    /// haut ou le bas du diff, la vue défile d'une ligne.
+    fn select_drag(&mut self, pos: Position) {
+        let Some(code) = self.hit.code else { return };
+        let Some(view) = self.code_view() else { return };
+        let Some(side) = view.select.map(|select| select.side) else { return };
+        let last = view.len().saturating_sub(1);
+        let (mut row, col) = code.locate(pos, side);
+        // Après un défilement, la ligne visée est celle qui vient sous le pointeur.
+        if pos.y < code.area.y {
+            view.top = view.top.saturating_sub(1);
+            row = view.top;
+        } else if pos.y >= code.lower_edge {
+            view.top = (view.top + 1).min(last);
+            row = view.top + (pos.y.min(code.area.bottom().saturating_sub(1)) - code.area.y) as usize;
+        }
+        if let Some(select) = &mut view.select {
+            select.head = (row.min(last), col);
+        }
+    }
+
+    /// Bouton relâché : le texte sélectionné part dans le presse-papier. Après un
+    /// simple clic, il ne reste aucune sélection.
+    fn select_end(&mut self) {
+        self.selecting = false;
+        match self.selected_text() {
+            Some(text) => self.copy(text),
+            None => {
+                if let Some(view) = self.code_view() {
+                    view.select = None;
+                }
+            }
         }
     }
 
@@ -1045,6 +1215,9 @@ impl App {
                     diff.x = diff.x.saturating_add_signed(delta);
                 }
             }
+            Action::SelectStart(pos) => self.select_start(pos),
+            Action::SelectDrag(pos) => self.select_drag(pos),
+            Action::SelectEnd => self.select_end(),
             Action::ToggleHierarchy => self.toggle_hierarchy(),
             Action::Search => {
                 if self.pane.is_none() {
