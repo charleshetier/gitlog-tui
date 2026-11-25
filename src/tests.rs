@@ -589,11 +589,12 @@ fn remote_branches_are_shortened_and_hidden() {
     let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
     wait(&mut app, "historique", |app| app.log_done);
 
-    // Sur la ligne de sa branche locale, la branche distante se réduit à « &origin ».
+    // Sur la ligne de sa branche locale, la branche distante se réduit à « &origin »,
+    // accolée à son cartouche : ni flèche, ni espace entre les deux.
     let view = screen(&mut app, 110, 12);
     println!("{view}");
     let line = |view: &str, subject: &str| view.lines().find(|l| l.contains(subject)).unwrap().to_string();
-    assert!(line(&view, "Merge de feature").contains("◀ main  ◀ &origin  Merge de feature"), "{view}");
+    assert!(line(&view, "Merge de feature").contains("◀ main  &origin  Merge de feature"), "{view}");
     assert!(!view.contains("origin/main"));
     // Ailleurs, elle garde son nom entier.
     assert!(line(&view, "Squelette initial").contains("◀ origin/feature "), "{view}");

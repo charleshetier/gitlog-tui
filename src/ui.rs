@@ -376,36 +376,39 @@ fn copy_icon(plain: bool) -> &'static str {
 
 /// Étiquettes d'un commit avec leur texte, dans l'ordre d'affichage. Une branche
 /// distante posée sur le même commit que la branche locale du même nom la suit,
-/// réduite à « &origin » : son nom n'apprendrait rien de plus. `remotes` à faux
-/// écarte les branches distantes.
-fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label)> {
+/// réduite à « &origin » : son nom n'apprendrait rien de plus. Le booléen la
+/// signale : elle s'accole alors au cartouche de sa branche locale. `remotes` à
+/// faux écarte les branches distantes.
+fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label, bool)> {
     // Le dépôt distant, si `remote` est la branche `local` chez lui.
     let twin = |local: &Label, remote: &Label| -> Option<String> {
         let (origin, branch) = remote.name.split_once('/')?;
         (remote.kind == RefKind::Remote && local.kind == RefKind::Local && branch == local.name)
             .then(|| format!("&{origin}"))
     };
-    let mut out: Vec<(String, &Label)> = Vec::new();
+    let mut out: Vec<(String, &Label, bool)> = Vec::new();
     for label in labels {
         match label.kind {
             RefKind::Local => {
-                out.push((label.name.clone(), label));
+                out.push((label.name.clone(), label, false));
                 if remotes {
-                    out.extend(labels.iter().filter_map(|remote| Some((twin(label, remote)?, remote))));
+                    out.extend(labels.iter().filter_map(|remote| Some((twin(label, remote)?, remote, true))));
                 }
             }
             RefKind::Remote => {
                 if remotes && !labels.iter().any(|local| twin(local, label).is_some()) {
-                    out.push((label.name.clone(), label));
+                    out.push((label.name.clone(), label, false));
                 }
             }
-            RefKind::Tag => out.push((label.name.clone(), label)),
+            RefKind::Tag => out.push((label.name.clone(), label, false)),
         }
     }
     out
 }
 
-/// Étiquettes en flèche pointant vers le commit, à gauche.
+/// Étiquettes en flèche pointant vers le commit, à gauche. Une branche distante
+/// réduite à « &origin » prolonge le cartouche de sa branche locale : un simple
+/// rectangle, sans flèche ni espace entre les deux.
 #[allow(clippy::too_many_arguments)]
 fn draw_labels(
     buf: &mut Buffer,
@@ -419,7 +422,7 @@ fn draw_labels(
 ) -> u16 {
     let arrow = if plain { ARROW_PLAIN } else { ARROW };
     let labels = label_texts(labels, remotes);
-    for (i, (name, label)) in labels.iter().enumerate() {
+    for (i, (name, label, joined)) in labels.iter().enumerate() {
         let name: String = if name.chars().count() > 32 {
             name.chars().take(31).chain(['…']).collect()
         } else {
@@ -428,7 +431,11 @@ fn draw_labels(
         let remaining = labels.len() - i;
         // Place gardée pour le compteur « +N » des étiquettes non affichées.
         let reserve = if remaining > 1 { 4 } else { 0 };
-        if x + width(&name) + 4 + reserve > end {
+        // Flèche (sauf accolée), marges du nom, espace qui suit.
+        let chrome = if *joined { 3 } else { 4 };
+        if x + width(&name) + chrome + reserve > end {
+            // Le cartouche précédent attendait sa jumelle : l'espace lui revient.
+            x += u16::from(*joined);
             x = put(buf, x, y, end, &format!("+{remaining}"), Style::new().fg(DIM)) + 1;
             break;
         }
@@ -441,8 +448,14 @@ fn draw_labels(
         if label.is_head {
             style = style.add_modifier(Modifier::BOLD);
         }
-        x = put(buf, x, y, end, arrow, Style::new().fg(bg));
-        x = put(buf, x, y, end, &format!(" {name} "), style) + 1;
+        if !joined {
+            x = put(buf, x, y, end, arrow, Style::new().fg(bg));
+        }
+        x = put(buf, x, y, end, &format!(" {name} "), style);
+        // Pas d'espace avant une étiquette accolée.
+        if !labels.get(i + 1).is_some_and(|next| next.2) {
+            x += 1;
+        }
     }
     x
 }
