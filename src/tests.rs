@@ -92,7 +92,7 @@ fn three_levels_end_to_end() {
     assert_eq!(app.repo.remote_url.as_deref(), Some("https://example.com/alice/demo.git"));
     assert!(app.folder_path().ends_with(&format!("gitlog-test-levels-{}", std::process::id())));
     assert_eq!(app.folder_path().contains('/'), !cfg!(windows));
-    assert!(lines[2].contains("●─╮") && lines[2].contains("◀ main ") && lines[2].contains("Merge de feature"));
+    assert!(lines[2].contains("◉─╮") && lines[2].contains("◀ HEAD → main ") && lines[2].contains("Merge de feature"));
     assert!(!lines[2].contains("⧉") && lines[2].contains("Alice"));
     assert!(level1.contains("◀ feature ") && level1.contains("◀ v0.1.0 "));
     assert!(lines[5].contains("●─╯") && lines[5].contains("Squelette initial"));
@@ -594,7 +594,7 @@ fn remote_branches_are_shortened_and_hidden() {
     let view = screen(&mut app, 110, 12);
     println!("{view}");
     let line = |view: &str, subject: &str| view.lines().find(|l| l.contains(subject)).unwrap().to_string();
-    assert!(line(&view, "Merge de feature").contains("◀ main  &origin  Merge de feature"), "{view}");
+    assert!(line(&view, "Merge de feature").contains("◀ HEAD → main  &origin  Merge de feature"), "{view}");
     assert!(!view.contains("origin/main"));
     // Ailleurs, elle garde son nom entier.
     assert!(line(&view, "Squelette initial").contains("◀ origin/feature "), "{view}");
@@ -605,7 +605,7 @@ fn remote_branches_are_shortened_and_hidden() {
     assert_eq!(app.flash(), Some("Remote branches hidden"));
     let view = screen(&mut app, 110, 12);
     assert!(!view.contains("origin"), "{view}");
-    assert!(view.contains("◀ main  Merge de feature") && view.contains("◀ v0.1.0 "), "{view}");
+    assert!(view.contains("◀ HEAD → main  Merge de feature") && view.contains("◀ v0.1.0 "), "{view}");
     app.apply(Action::ToggleRemotes);
     assert_eq!(app.flash(), Some("Remote branches shown"));
     assert!(screen(&mut app, 110, 12).contains("&origin"));
@@ -893,7 +893,7 @@ fn commit_styles_link_the_commits() {
 
     // Par défaut : une puce par commit.
     assert_eq!(app.node_style, NodeStyle::Dots);
-    assert!(graph(&mut app)[0].starts_with(" ●─╮"));
+    assert!(graph(&mut app)[0].starts_with(" ◉─╮"));
 
     // Chaque colonne active porte un fond d'une cellule, pas l'intervalle entre deux colonnes.
     let mut terminal = Terminal::new(TestBackend::new(110, 12)).unwrap();
@@ -912,14 +912,57 @@ fn commit_styles_link_the_commits() {
     assert_eq!(app.node_style, NodeStyle::Rail);
     let rail = graph(&mut app);
     println!("{rail:#?}");
-    assert!(rail[0].starts_with(" ╭●╮"), "{}", rail[0]);
+    assert!(rail[0].starts_with(" ╭◉╮"), "{}", rail[0]);
     assert!(rail[1].starts_with(" ├●│"), "{}", rail[1]);
     assert!(rail[2].starts_with(" │ ├●"), "{}", rail[2]);
     assert!(rail[3].starts_with(" ╰●╯"), "{}", rail[3]);
 
     app.apply(Action::CycleNodes);
     assert_eq!(app.node_style, NodeStyle::Dots);
-    assert!(graph(&mut app)[0].starts_with(" ●─╮"));
+    assert!(graph(&mut app)[0].starts_with(" ◉─╮"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_stands_out_in_the_graph() {
+    let dir = make_repo("head");
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    // Fonds de la marge, de la colonne du graphe et du message, pour une ligne.
+    let bgs = |app: &mut App, y: u16| {
+        let mut terminal = Terminal::new(TestBackend::new(110, 12)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (buffer[(0, y)].bg, buffer[(1, y)].bg, buffer[(60, y)].bg)
+    };
+
+    // La branche courante : puce pleine cerclée, étiquette « HEAD → nom ».
+    let view = screen(&mut app, 110, 12);
+    let lines: Vec<&str> = view.lines().collect();
+    assert!(lines[2].starts_with(" ◉─╮") && lines[2].contains("◀ HEAD → main  Merge"), "{view}");
+    assert_eq!(view.matches('◉').count(), 1, "{view}");
+    assert!(lines[4].contains("◀ feature  Travail"), "{view}");
+
+    // Hors sélection, sa ligne garde un fond propre, distinct de celui de la sélection.
+    let selected = bgs(&mut app, 2);
+    app.apply(Action::Move(1));
+    let (head, other) = (bgs(&mut app, 2), bgs(&mut app, 4));
+    assert_eq!(head.0, head.2, "le fond couvre toute la ligne");
+    assert_ne!(head.0, other.0);
+    assert_ne!(head.0, selected.0);
+    assert_eq!(bgs(&mut app, 3).0, selected.0);
+    assert_ne!(head.1, head.0, "la bande du graphe reste visible");
+
+    // HEAD détaché : l'étiquette « HEAD » seule, la puce et le fond suivent.
+    git(&dir, &["checkout", "-q", "--detach", "feature"]);
+    app.apply(Action::Refresh);
+    wait(&mut app, "relecture", |app| app.log_done);
+    let view = screen(&mut app, 110, 12);
+    let line = view.lines().find(|l| l.contains("Travail sur la branche")).unwrap();
+    assert!(line.contains("◉") && line.contains("◀ HEAD  ◀ feature  Travail"), "{view}");
+    assert!(!view.contains("HEAD →") && view.matches('◉').count() == 1, "{view}");
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);

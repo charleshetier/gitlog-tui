@@ -32,6 +32,9 @@ const SEL_BG: Color = Color::Indexed(237);
 /// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
 const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
+/// Ligne du commit de HEAD : un fond à peine relevé, en deçà de la sélection.
+const HEAD_BG: Color = Color::Indexed(235);
+const LANE_HEAD_BG: Color = Color::Indexed(238);
 /// Encadré du libellé du commit, en tête du volet.
 const CARD_BG: Color = Color::Indexed(236);
 /// Fond du panneau flottant des raccourcis.
@@ -69,6 +72,8 @@ const VOID_BG: Color = Color::Indexed(235);
 
 const ARROW: &str = "\u{e0b2}";
 const ARROW_PLAIN: &str = "◀";
+/// Puce du commit de HEAD, à la place de « ● ».
+const HEAD_NODE: &str = "◉";
 const COPY: &str = "\u{f0c5}";
 const COPY_PLAIN: &str = "⧉";
 /// Glyphe « code fork » de Font Awesome (Nerd Font), de la même famille que l'icône dossier.
@@ -326,16 +331,23 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     for row in app.top..last {
         let y = area.y + (row - app.top) as u16;
         let selected = row == app.selected;
-        if selected {
-            buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(SEL_BG));
+        let oid = app.store.oid(row);
+        // HEAD se repère de trois façons : le fond de sa ligne, sa puce, son étiquette.
+        let head = app.labels.get(&oid).is_some_and(|labels| labels.iter().any(|label| label.is_head));
+        let (row_bg, lane_bg) = match (selected, head) {
+            (true, _) => (Some(SEL_BG), LANE_SEL_BG),
+            (false, true) => (Some(HEAD_BG), LANE_HEAD_BG),
+            (false, false) => (None, LANE_BG),
+        };
+        if let Some(bg) = row_bg {
+            buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(bg));
         }
 
-        let lane_bg = if selected { LANE_SEL_BG } else { LANE_BG };
-        let oid = app.store.oid(row);
         // Ce qui n'est pas encore commité reste en retrait : puce et nom en gris.
         let grey = if selected { Color::Gray } else { DIM };
         let tint = oid.is_worktree().then_some(grey);
-        draw_graph_row(buf, area.x + 1, y, end, app.store.cells(row), graph_w as usize, nodes, (lane_bg, tint));
+        let cells = app.store.cells(row);
+        draw_graph_row(buf, area.x + 1, y, end, cells, graph_w as usize, (nodes, head), (lane_bg, tint));
 
         let color = palette(app.store.color(row));
         let meta = app.meta(row);
@@ -408,7 +420,8 @@ fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label, bool)> {
 
 /// Étiquettes en flèche pointant vers le commit, à gauche. Une branche distante
 /// réduite à « &origin » prolonge le cartouche de sa branche locale : un simple
-/// rectangle, sans flèche ni espace entre les deux.
+/// rectangle, sans flèche ni espace entre les deux. La branche courante
+/// s'annonce comme dans `git log` : « HEAD → nom ».
 #[allow(clippy::too_many_arguments)]
 fn draw_labels(
     buf: &mut Buffer,
@@ -428,6 +441,8 @@ fn draw_labels(
         } else {
             name.clone()
         };
+        // HEAD détaché porte déjà ce nom : git n'admet pas de branche « HEAD ».
+        let name = if label.is_head && name != "HEAD" { format!("HEAD → {name}") } else { name };
         let remaining = labels.len() - i;
         // Place gardée pour le compteur « +N » des étiquettes non affichées.
         let reserve = if remaining > 1 { 4 } else { 0 };
@@ -743,9 +758,9 @@ fn put_code(
     }
 }
 
-/// Dessine les cellules du graphe d'une ligne selon le style des commits.
-/// Chaque colonne active reçoit un fond `lane_bg`, large d'une cellule. `tint`
-/// remplace la teinte des branches sur toute la ligne.
+/// Dessine les cellules du graphe d'une ligne selon le style des commits ;
+/// `head` y change la puce. Chaque colonne active reçoit un fond `lane_bg`, large
+/// d'une cellule. `tint` remplace la teinte des branches sur toute la ligne.
 #[allow(clippy::too_many_arguments)]
 fn draw_graph_row(
     buf: &mut Buffer,
@@ -754,7 +769,7 @@ fn draw_graph_row(
     end: u16,
     cells: &[Cell],
     width: usize,
-    nodes: NodeStyle,
+    (nodes, head): (NodeStyle, bool),
     (lane_bg, tint): (Color, Option<Color>),
 ) {
     let at = |i: usize| cells.get(i).copied().unwrap_or_default();
@@ -775,8 +790,9 @@ fn draw_graph_row(
                 let rail = Cell { bits, color: cell.color };
                 (rail.glyph().encode_utf8(&mut glyph), cell.color, false)
             }
-            NodeStyle::Rail if after_commit => ("●", before.color, true),
+            NodeStyle::Rail if after_commit => (if head { HEAD_NODE } else { "●" }, before.color, true),
             _ if cell.bits == 0 => continue,
+            _ if is_commit && head => (HEAD_NODE, cell.color, true),
             _ => (cell.glyph().encode_utf8(&mut glyph), cell.color, is_commit),
         };
         let mut style = Style::new().fg(tint.unwrap_or(palette(color)));
