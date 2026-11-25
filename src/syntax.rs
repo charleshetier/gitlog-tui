@@ -20,6 +20,8 @@ static THEME: LazyLock<Theme> = LazyLock::new(crate::theme::vscode_dark);
 struct State {
     parse: ParseState,
     highlight: HighlightState,
+    /// Aucune ligne de code n'a encore été lue depuis le début du hunk.
+    fresh: bool,
 }
 
 /// Colore un diff ligne à ligne. L'ancienne et la nouvelle version sont suivies
@@ -27,6 +29,9 @@ struct State {
 pub struct Colorizer {
     highlighter: Highlighter<'static>,
     start: State,
+    /// PHP : l'état une fois passée la balise `<?php`. La grammaire commence
+    /// en HTML, or un hunk pris au milieu d'un fichier est presque toujours du PHP.
+    inside: Option<State>,
     old: State,
     new: State,
 }
@@ -45,8 +50,14 @@ impl Colorizer {
         let start = State {
             parse: ParseState::new(syntax),
             highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+            fresh: true,
         };
-        Some(Colorizer { highlighter, old: start.clone(), new: start.clone(), start })
+        let inside = (syntax.name == "PHP").then(|| {
+            let mut state = start.clone();
+            paint(&mut state, &highlighter, "<?php\n");
+            state
+        });
+        Some(Colorizer { highlighter, old: start.clone(), new: start.clone(), start, inside })
     }
 
     /// Un nouveau hunk : les lignes ne suivent plus les précédentes.
@@ -61,11 +72,25 @@ impl Colorizer {
             return Vec::new();
         }
         // Les grammaires attendent la fin de ligne.
-        let source = format!("{text}\n");
+        let mut source = format!("{text}\n");
+        // PHP 8 : `#[` ouvre un attribut, que la grammaire prend encore pour un
+        // commentaire. Sans son `#`, elle le lit comme du code, caractère pour caractère.
+        if self.inside.is_some() && text.trim_start().starts_with("#[") {
+            source = source.replacen('#', " ", 1);
+        }
+        let inside = self.inside.as_ref();
         match kind {
-            LineKind::Add => paint(&mut self.new, &self.highlighter, &source),
-            LineKind::Del => paint(&mut self.old, &self.highlighter, &source),
+            LineKind::Add => {
+                settle(&mut self.new, inside, text);
+                paint(&mut self.new, &self.highlighter, &source)
+            }
+            LineKind::Del => {
+                settle(&mut self.old, inside, text);
+                paint(&mut self.old, &self.highlighter, &source)
+            }
             LineKind::Ctx => {
+                settle(&mut self.old, inside, text);
+                settle(&mut self.new, inside, text);
                 // Une ligne commune fait avancer les deux versions.
                 let same = self.old == self.new;
                 let tints = paint(&mut self.new, &self.highlighter, &source);
@@ -79,6 +104,21 @@ impl Colorizer {
             LineKind::Hunk | LineKind::Meta => Vec::new(),
         }
     }
+}
+
+/// Première ligne de code d'un hunk : elle dit si l'on est déjà dans le PHP. Une
+/// ligne qui s'ouvre par une balise (`<?php`, `<div>`) part du HTML, comme le
+/// début du fichier ; toute autre est tenue pour du PHP.
+fn settle(state: &mut State, inside: Option<&State>, text: &str) {
+    if !state.fresh || text.trim().is_empty() {
+        return;
+    }
+    if let Some(inside) = inside
+        && !text.trim_start().starts_with('<')
+    {
+        *state = inside.clone();
+    }
+    state.fresh = false;
 }
 
 /// Analyse une ligne et la découpe en segments de même teinte, comptés en
@@ -164,6 +204,52 @@ mod tests {
         assert_eq!(colors.line(LineKind::Add, "let x = 1;"), code);
         // L'ancienne version, elle, est toujours dans le commentaire.
         assert_eq!(colors.line(LineKind::Del, "let x = 1;").len(), 1);
+    }
+
+    #[test]
+    fn a_php_hunk_starts_inside_the_php() {
+        let tinted = |tints: &[Tint]| tints.iter().filter_map(|&(_, color)| color).collect::<std::collections::HashSet<_>>();
+        // Au milieu d'un fichier, sans la balise `<?php` : du PHP quand même.
+        let mut colors = Colorizer::for_path("src/Entity/DataSet.php").unwrap();
+        let code = colors.line(LineKind::Ctx, "        return $this->nature === null ? 'none' : 42;");
+        assert!(tinted(&code).len() >= 4, "keyword, variable, string, number: {code:?}");
+        // Une ligne vide en tête de hunk ne décide de rien ; les deux versions suivent.
+        colors.reset();
+        assert!(colors.line(LineKind::Ctx, "").is_empty());
+        assert_eq!(colors.line(LineKind::Del, "        return $this->nature === null ? 'none' : 42;"), code);
+        assert_eq!(colors.line(LineKind::Add, "        return $this->nature === null ? 'none' : 42;"), code);
+        // Le début du fichier : la balise ouvre le PHP, sans être lue comme du code.
+        colors.reset();
+        let tag = colors.line(LineKind::Ctx, "<?php");
+        assert_eq!(tag.len(), 1, "{tag:?}");
+        assert_eq!(colors.line(LineKind::Ctx, "        return $this->nature === null ? 'none' : 42;"), code);
+        // Un hunk de gabarit qui s'ouvre sur une balise reste du HTML.
+        colors.reset();
+        let mut html = Colorizer::for_path("page.html").unwrap();
+        let line = "<div class=\"card\">";
+        assert_eq!(colors.line(LineKind::Ctx, line), html.line(LineKind::Ctx, line));
+        // Les autres langages ne changent pas.
+        assert!(Colorizer::for_path("a.rs").unwrap().inside.is_none());
+    }
+
+    #[test]
+    fn a_php_attribute_is_not_a_comment() {
+        let mut colors = Colorizer::for_path("a.php").unwrap();
+        let comment = colors.line(LineKind::Ctx, "    # a note about ['default' => false]");
+        assert_eq!(comment.iter().filter(|(_, color)| color.is_some()).count(), 1, "one tint: {comment:?}");
+        // Un attribut est coloré comme du code, sur toute la longueur de la ligne.
+        let line = "    #[ORM\\Column(options: ['default' => false])]";
+        let attribute = colors.line(LineKind::Ctx, line);
+        assert_eq!(chars(&attribute), line.chars().count());
+        let tinted: std::collections::HashSet<_> = attribute.iter().filter_map(|&(_, color)| color).collect();
+        assert!(tinted.len() >= 3 && !tinted.contains(&comment[1].1.unwrap()), "{attribute:?}");
+        // La ligne suivante se lit comme si l'attribut n'était pas là.
+        let after = colors.line(LineKind::Ctx, "    private bool $mvt = false;");
+        colors.reset();
+        assert_eq!(colors.line(LineKind::Ctx, "    private bool $mvt = false;"), after);
+        // Ailleurs, `#[` reste ce qu'en dit la grammaire.
+        let mut rust = Colorizer::for_path("a.rs").unwrap();
+        assert!(rust.line(LineKind::Ctx, "#[derive(Debug)]").len() > 1);
     }
 
     /// Débit de la coloration : `cargo test --release bench_colouring -- --ignored --nocapture`.
