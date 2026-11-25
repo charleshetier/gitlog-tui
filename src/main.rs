@@ -8,6 +8,7 @@ mod hierarchy;
 mod syntax;
 #[cfg(test)]
 mod tests;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};

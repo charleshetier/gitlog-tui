@@ -5,7 +5,6 @@ use std::sync::LazyLock;
 
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, Theme};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
-use two_face::theme::EmbeddedThemeName;
 
 use crate::diff::{LineKind, TAB_WIDTH, Tint};
 
@@ -13,10 +12,8 @@ use crate::diff::{LineKind, TAB_WIDTH, Tint};
 const MAX_BYTES: usize = 1000;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
-/// Thème sombre aux teintes pastel : chacune reste lisible sur les fonds du diff.
-/// see https://docs.rs/two-face/latest/two_face/theme/enum.EmbeddedThemeName.html
-static THEME: LazyLock<Theme> =
-    LazyLock::new(|| two_face::theme::extra().get(EmbeddedThemeName::Base16EightiesDark).clone());
+/// Les teintes du thème sombre de VS Code : chacune reste lisible sur les fonds du diff.
+static THEME: LazyLock<Theme> = LazyLock::new(crate::theme::vscode_dark);
 
 /// Où en est l'analyse d'une version du fichier : elle se poursuit d'une ligne à l'autre.
 #[derive(Clone, PartialEq)]
