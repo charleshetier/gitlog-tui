@@ -691,6 +691,151 @@ fn mouse_selects_code_in_a_diff() {
 }
 
 #[test]
+fn slash_searches_the_code_of_a_diff() {
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    let dir = std::env::temp_dir().join(format!("gitlog-test-find-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let source = |word: &str| format!("// greeting\npub fn hello() -> &'static str {{\n    \"{word}\"\n}}\n");
+    std::fs::write(dir.join("lib.rs"), source("hello")).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    std::fs::write(dir.join("lib.rs"), source("bonjour")).unwrap();
+    let long: String = (1..=30).map(|n| format!("ligne {n}\n")).collect();
+    std::fs::write(dir.join("long.txt"), long).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Edit"]);
+
+    let draw = |app: &mut App, height: u16| -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let text = |buffer: &Buffer, y: u16| -> String { (0..120).map(|x| buffer[(x, y)].symbol()).collect() };
+    // Fonds des cellules où commence chaque « needle » d'une ligne de l'écran.
+    let backgrounds = |buffer: &Buffer, y: u16, needle: &str| -> Vec<Color> {
+        let row: Vec<char> = text(buffer, y).chars().collect();
+        let needle: Vec<char> = needle.chars().collect();
+        let starts = (0..row.len()).filter(|&x| row[x..].starts_with(&needle));
+        starts.map(|x| buffer[(x as u16, y)].bg).collect()
+    };
+    let open_diff = |app: &mut App| {
+        app.apply(Action::Open);
+        wait(app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    };
+    let type_in = |app: &mut App, query: &str| query.chars().for_each(|key| app.apply(Action::PromptKey(key)));
+    let (current, other) = (Color::Indexed(208), Color::Indexed(179));
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    draw(&mut app, 24);
+    // Hors d'un diff, `/` ne fait rien.
+    app.apply(Action::Find);
+    assert!(app.prompt.is_none());
+    app.apply(Action::Open);
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+    open_diff(&mut app);
+    draw(&mut app, 24);
+
+    // La recherche suit la frappe. « hello » : la ligne commune, comptée une fois
+    // mais marquée des deux côtés, puis la ligne retirée, à gauche.
+    app.apply(Action::Find);
+    type_in(&mut app, "hello");
+    assert_eq!(app.code_find(), Some(("hello", true, Some(0), 2)));
+    let buffer = draw(&mut app, 24);
+    assert!(text(&buffer, 23).contains("find: hello") && text(&buffer, 23).contains("match 1/2"), "{}", text(&buffer, 23));
+    let line = |buffer: &Buffer, needle: &str| (0..24).find(|&y| text(buffer, y).contains(needle)).unwrap();
+    assert_eq!(backgrounds(&buffer, line(&buffer, "fn hello"), "hello"), [current, current]);
+    assert_eq!(backgrounds(&buffer, line(&buffer, "\"hello\""), "hello"), [other]);
+
+    // Entrée garde la recherche ; `n` et `N` parcourent les occurrences, en boucle,
+    // au lieu de changer de fichier.
+    app.apply(Action::PromptSubmit);
+    assert_eq!(app.code_find(), Some(("hello", false, Some(0), 2)));
+    app.apply(Action::Step(1));
+    assert_eq!(app.code_find().unwrap().2, Some(1));
+    let buffer = draw(&mut app, 24);
+    assert!(text(&buffer, 23).contains("match 2/2"));
+    assert_eq!(backgrounds(&buffer, line(&buffer, "\"hello\""), "hello"), [current]);
+    app.apply(Action::Step(1));
+    assert_eq!(app.code_find().unwrap().2, Some(0));
+    app.apply(Action::Step(-1));
+    assert_eq!(app.code_find().unwrap().2, Some(1));
+    assert_eq!(app.pane.as_ref().unwrap().diff.as_ref().unwrap().file, 0);
+
+    // Retour quitte d'abord la recherche, puis le diff.
+    app.apply(Action::Back { quit: false });
+    assert_eq!((app.depth(), app.code_find()), (3, None));
+    assert!(!text(&draw(&mut app, 24), 23).contains("find:"));
+
+    // Une majuscule rend la recherche sensible à la casse. Sans résultat, Entrée
+    // ne garde rien ; Échap rend la vue et la recherche d'avant.
+    app.apply(Action::Find);
+    type_in(&mut app, "Hello");
+    assert_eq!(app.code_find(), Some(("Hello", true, None, 0)));
+    assert!(text(&draw(&mut app, 24), 23).contains("no match"));
+    app.apply(Action::PromptSubmit);
+    assert_eq!((app.code_find(), app.flash()), (None, Some("No match: Hello")));
+    app.apply(Action::Find);
+    type_in(&mut app, "bonjour");
+    app.apply(Action::PromptSubmit);
+    app.apply(Action::Find);
+    type_in(&mut app, "fn");
+    assert_eq!(app.code_find().unwrap().0, "fn");
+    app.apply(Action::PromptCancel);
+    assert_eq!(app.code_find(), Some(("bonjour", false, Some(0), 1)));
+
+    // Le fichier entier a sa propre recherche.
+    app.apply(Action::Open);
+    wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
+    draw(&mut app, 24);
+    assert_eq!(app.code_find(), None);
+    app.apply(Action::Find);
+    type_in(&mut app, "GREETING");
+    assert_eq!(app.code_find().unwrap().3, 0);
+    app.apply(Action::PromptBackspace);
+    app.apply(Action::PromptCancel);
+    app.apply(Action::Find);
+    type_in(&mut app, "greeting");
+    app.apply(Action::PromptSubmit);
+    assert_eq!(app.code_find(), Some(("greeting", false, Some(0), 1)));
+    app.apply(Action::Back { quit: false });
+    assert_eq!(app.depth(), 4);
+    app.apply(Action::Back { quit: false });
+    assert_eq!((app.depth(), app.code_find().map(|find| find.0)), (3, Some("bonjour")));
+
+    // Fichier ajouté, plus long que la fenêtre : la vue suit l'occurrence courante.
+    app.apply(Action::Back { quit: false });
+    app.apply(Action::Back { quit: false });
+    app.apply(Action::Move(1));
+    open_diff(&mut app);
+    draw(&mut app, 10);
+    app.apply(Action::Find);
+    type_in(&mut app, "ligne 2");
+    app.apply(Action::PromptSubmit);
+    // « ligne 2 », puis « ligne 20 » à « ligne 29 ».
+    assert_eq!(app.code_find(), Some(("ligne 2", false, Some(0), 11)));
+    let top = |app: &App| app.pane.as_ref().unwrap().diff.as_ref().unwrap().top;
+    assert_eq!(top(&app), 0);
+    for _ in 0..6 {
+        app.apply(Action::Step(1));
+    }
+    let buffer = draw(&mut app, 10);
+    assert!(top(&app) > 0 && app.code_find().unwrap().2 == Some(6));
+    let y = (0..9).find(|&y| text(&buffer, y).contains("ligne 25")).expect("l'occurrence courante est à l'écran");
+    assert_eq!(backgrounds(&buffer, y, "ligne 25"), [current]);
+    app.apply(Action::Step(-1));
+    app.apply(Action::Step(-1));
+    assert_eq!(app.code_find().unwrap().2, Some(4));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn remote_branches_are_shortened_and_hidden() {
     let dir = make_repo("remotes");
     // origin/main suit main ; origin/feature est resté en arrière de feature.

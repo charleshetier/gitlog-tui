@@ -47,6 +47,7 @@ Usage: gitlog [OPTIONS] [PATH]
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       y copy the commit hash, or the path of the file under the cursor
       drag the mouse over a diff to select code: it is copied on release
+      / search the code of a diff, then n N next / previous match, Esc to clear
       Enter on a diff opens the whole file in a floating window
       n N next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
@@ -210,6 +211,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Right => Action::Horizontal(4),
         KeyCode::Char('h') => Action::ToggleHierarchy,
         KeyCode::Char('s') => Action::Search,
+        KeyCode::Char('/') => Action::Find,
         KeyCode::Char('S') => Action::CycleNodes,
         KeyCode::Char('R') => Action::Refresh,
         KeyCode::Char('o') => Action::ToggleRemotes,

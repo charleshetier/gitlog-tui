@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, CodeHit, DiffView, FilesState, HierState, HitMap, NodeStyle, Prompt, Side};
+use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Side};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -34,6 +34,10 @@ const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
 /// Code sélectionné à la souris dans un diff.
 const SELECT_BG: Color = Color::Indexed(18);
+/// Occurrences d'une recherche dans le code, en noir sur ces fonds : la
+/// courante, puis les autres.
+const FIND_CURRENT_BG: Color = Color::Indexed(208);
+const FIND_BG: Color = Color::Indexed(179);
 /// Ligne du commit de HEAD : un fond à peine relevé, en deçà de la sélection.
 const HEAD_BG: Color = Color::Indexed(235);
 const LANE_HEAD_BG: Color = Color::Indexed(238);
@@ -186,7 +190,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Pas de pied de page : le corps descend jusqu'au bas de l'écran, sauf la ligne
     // du champ de recherche tant qu'une saisie ou une recherche est en cours.
     let searching = app.hierarchy.is_none()
-        && (app.filter.is_some() || matches!(app.prompt, Some(Prompt::Input { .. })));
+        && (app.filter.is_some() || matches!(app.prompt, Some(Prompt::Input { .. })) || app.code_find().is_some());
     let body_h = area.bottom() - body_y - u16::from(searching);
     let body_bottom = body_y + body_h;
     let dim = Style::new().fg(DIM);
@@ -649,7 +653,9 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
     };
     let room = panel.width.saturating_sub(width(&count) + 9);
     let title = format!(" {} · {count} ", tail(path, room));
-    draw_panel(buf, panel, &title, " n N changes · Esc to close ");
+    // Pendant une recherche dans le code, ces touches lui reviennent.
+    let keys = if full.find.is_some() { " n N matches · Esc to clear the search " } else { " n N changes · Esc to close " };
+    draw_panel(buf, panel, &title, keys);
     // L'intérieur reprend le fond du terminal : les couleurs du diff y restent celles du volet.
     for y in inner.top()..inner.bottom() {
         for x in inner.left()..inner.right() {
@@ -714,6 +720,7 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
             x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
         }
         put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
+        mark_finds(buf, (code_x, y, end), diff.x, diff.find.as_ref(), (diff.top + i, Side::Left));
         if let Some(columns) = diff.select.and_then(|select| select.columns(Side::Left, diff.top + i)) {
             mark_selection(buf, (code_x, y, end), diff.x, line, columns);
         }
@@ -727,17 +734,31 @@ fn lower_edge(buf: &Buffer, area: Rect) -> u16 {
     if area.bottom() >= buf.area.bottom() { area.bottom().saturating_sub(1) } else { area.bottom() }
 }
 
-/// Pose le fond de la sélection sur une ligne de code dessinée en `x` : `from`
+/// Applique un style à un passage d'une ligne de code dessinée en `x` : `from`
 /// et `to` sont des rangs de caractères dans le texte, `skip` le défilement.
-fn mark_selection(buf: &mut Buffer, (x, y, end): (u16, u16, u16), skip: usize, line: &DiffLine, (from, to): (usize, usize)) {
+fn mark_span(buf: &mut Buffer, (x, y, end): (u16, u16, u16), skip: usize, (from, to): (usize, usize), style: Style) {
+    let room = end.saturating_sub(x) as usize;
+    let (start, stop) = (from.saturating_sub(skip).min(room), to.saturating_sub(skip).min(room));
+    if start < stop {
+        buf.set_style(Rect::new(x + start as u16, y, (stop - start) as u16, 1), style);
+    }
+}
+
+/// Fond de la sélection à la souris sur une ligne de code.
+fn mark_selection(buf: &mut Buffer, at: (u16, u16, u16), skip: usize, line: &DiffLine, (from, to): (usize, usize)) {
     let len = line.text.chars().count();
     // Une ligne prise jusqu'au bout déborde d'une cellule : son saut de ligne.
     let to = if to == usize::MAX { len + 1 } else { to.min(len) };
-    let from = from.max(skip);
-    let room = end.saturating_sub(x) as usize;
-    let (start, stop) = ((from - skip).min(room), to.saturating_sub(skip).min(room));
-    if start < stop {
-        buf.set_style(Rect::new(x + start as u16, y, (stop - start) as u16, 1), Style::new().bg(SELECT_BG));
+    mark_span(buf, at, skip, (from, to), Style::new().bg(SELECT_BG));
+}
+
+/// Occurrences de la recherche sur une ligne de la vue, d'un côté : en noir sur
+/// fond vif, l'occurrence courante d'une autre teinte.
+fn mark_finds(buf: &mut Buffer, at: (u16, u16, u16), skip: usize, find: Option<&Find>, (row, side): (usize, Side)) {
+    let Some(find) = find else { return };
+    for (start, len, current) in find.on(row, side) {
+        let bg = if current { FIND_CURRENT_BG } else { FIND_BG };
+        mark_span(buf, at, skip, (start, start + len), Style::new().fg(Color::Black).bg(bg));
     }
 }
 
@@ -858,9 +879,8 @@ fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)]
 
     // `changed` : fond d'une ligne modifiée, puis ses passages modifiés et leur fond.
     type Changed<'a> = Option<(Color, &'a [Range<usize>], Color)>;
-    // `selected` : caractères de la ligne pris dans la sélection à la souris.
-    type Selected = Option<(usize, usize)>;
-    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed, selected: Selected| {
+    // `at` : ligne de la vue et côté, pour y poser la recherche et la sélection.
+    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed, at: (usize, Side)| {
         let Some((line, number)) = content else {
             buf.set_style(bg_area, Style::new().bg(VOID_BG));
             return;
@@ -871,7 +891,8 @@ fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)]
         }
         let x = put(buf, x, y, end, &format!("{number:>num_w$}"), dim);
         put_code(buf, x + 1, y, end, line, skip, (marks, mark_bg));
-        if let Some(columns) = selected {
+        mark_finds(buf, (x + 1, y, end), skip, diff.find.as_ref(), at);
+        if let Some(columns) = diff.select.and_then(|select| select.columns(at.1, at.0)) {
             mark_selection(buf, (x + 1, y, end), skip, line, columns);
         }
     };
@@ -904,9 +925,9 @@ fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)]
         };
         let removed = changed.then_some((tones.del, old_marks.as_slice(), tones.del_mark));
         let added = changed.then_some((tones.add, new_marks.as_slice(), tones.add_mark));
-        let selected = |side: Side| diff.select.and_then(|select| select.columns(side, diff.top + i));
-        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed, selected(Side::Left));
-        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added, selected(Side::Right));
+        let row = diff.top + i;
+        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed, (row, Side::Left));
+        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added, (row, Side::Right));
         put(buf, mid, y, end, "│", dim);
     }
     // De chaque côté : le numéro de ligne, une espace, puis le code.
@@ -1018,6 +1039,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("g G  Home End", "Jump to the first / last item"),
     ("Enter", "Open the commit, the file diff, then the whole file"),
     ("n N", "Next / previous commit, file or change, by level"),
+    ("/", "Search the code of a diff; then n N for the matches"),
     ("← →", "Scroll a diff sideways"),
     ("1 2 3 4", "Go to a level: graph, files, diff, whole file"),
     ("q", "Go back one level, quit from the graph"),
@@ -1105,10 +1127,40 @@ fn draw_search_menu(buf: &mut Buffer, area: Rect, sign: Option<char>) {
 /// Champ de recherche, tout en bas : la saisie en cours, sinon la recherche appliquée
 /// et le nombre de commits trouvés.
 fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
-    let (kind, query, editing) = match (&app.prompt, &app.filter) {
-        (Some(Prompt::Input { kind, query }), _) => (*kind, query.as_str(), true),
-        (_, Some(filter)) => (filter.kind, filter.query.as_str(), false),
-        _ => return,
+    // La recherche dans le code du diff ouvert passe devant celle des commits.
+    let (label, query, editing, status) = if let Some((query, editing, current, count)) = app.code_find() {
+        let status = match (current, count) {
+            (_, 0) if query.is_empty() => String::new(),
+            (_, 0) => "no match".to_string(),
+            (Some(current), count) => format!("match {}/{}", current + 1, thousands(count)),
+            (None, 1) => "1 match".to_string(),
+            (None, count) => format!("{} matches", thousands(count)),
+        };
+        ("find:".to_string(), query, editing, status)
+    } else {
+        let (kind, query, editing) = match (&app.prompt, &app.filter) {
+            (Some(Prompt::Input { kind, query }), _) => (*kind, query.as_str(), true),
+            (_, Some(filter)) => (filter.kind, filter.query.as_str(), false),
+            _ => return,
+        };
+        // À droite : le nombre de commits trouvés, quand la liste répond bien au texte affiché.
+        let applied = app.filter.as_ref().is_some_and(|f| f.kind == kind && f.query == query.trim());
+        let status = if applied {
+            match app.store.len() {
+                _ if app.log_error.is_some() => "git error".to_string(),
+                _ if app.stale => "searching…".to_string(),
+                n if !app.log_done => format!("searching… {}", thousands(n)),
+                0 => "no match".to_string(),
+                1 => "1 match".to_string(),
+                n => format!("{} matches", thousands(n)),
+            }
+        } else if editing && !kind.is_live() {
+            // Trop lourde pour suivre la frappe : cette recherche attend la validation.
+            "Enter to search".to_string()
+        } else {
+            String::new()
+        };
+        (format!("{}:", kind.label()), query, editing, status)
     };
     let base = Style::new().bg(PANEL_BG);
     for x in area.left()..area.right() {
@@ -1116,25 +1168,7 @@ fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
     }
     buf.set_style(area, base);
     let end = area.right() - 1;
-    // À droite : le nombre de commits trouvés, quand la liste répond bien au texte affiché.
-    let applied = app.filter.as_ref().is_some_and(|f| f.kind == kind && f.query == query.trim());
-    let status = if applied {
-        match app.store.len() {
-            _ if app.log_error.is_some() => "git error".to_string(),
-            _ if app.stale => "searching…".to_string(),
-            n if !app.log_done => format!("searching… {}", thousands(n)),
-            0 => "no match".to_string(),
-            1 => "1 match".to_string(),
-            n => format!("{} matches", thousands(n)),
-        }
-    } else if editing && !kind.is_live() {
-        // Trop lourde pour suivre la frappe : cette recherche attend la validation.
-        "Enter to search".to_string()
-    } else {
-        String::new()
-    };
     let text_end = put_right(buf, area.x + 1, area.y, end, &status, base.fg(DIM)).saturating_sub(2);
-    let label = format!("{}:", kind.label());
     let x = put(buf, area.x + 1, area.y, text_end, &label, base.fg(ACCENT).add_modifier(Modifier::BOLD)) + 1;
     // Une saisie plus longue que le champ garde sa fin visible, curseur compris.
     let room = text_end.saturating_sub(x + 1) as usize;

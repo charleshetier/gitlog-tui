@@ -81,6 +81,41 @@ impl Selection {
     }
 }
 
+/// Occurrence d'une recherche dans le code : la ligne de la vue, le côté
+/// (`None` pour une ligne commune aux deux côtés ou pour la colonne unique) et
+/// les caractères trouvés.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub row: usize,
+    pub side: Option<Side>,
+    pub start: usize,
+    pub len: usize,
+}
+
+/// Recherche de texte dans le code d'un diff, ouverte par `/`.
+#[derive(Clone, Debug)]
+pub struct Find {
+    pub query: String,
+    /// Occurrences, dans l'ordre de lecture.
+    pub hits: Vec<Hit>,
+    /// Occurrence où l'on se trouve, parmi `hits`.
+    pub current: Option<usize>,
+}
+
+impl Find {
+    /// Occurrences d'une ligne de la vue, d'un côté : début, longueur, et si
+    /// c'est l'occurrence courante.
+    pub fn on(&self, row: usize, side: Side) -> impl Iterator<Item = (usize, usize, bool)> + '_ {
+        let first = self.hits.partition_point(|hit| hit.row < row);
+        self.hits[first..]
+            .iter()
+            .enumerate()
+            .take_while(move |(_, hit)| hit.row == row)
+            .filter(move |(_, hit)| hit.side.is_none_or(|s| s == side))
+            .map(move |(i, hit)| (hit.start, hit.len, self.current == Some(first + i)))
+    }
+}
+
 /// Niveau 3 : le diff d'un fichier.
 pub struct DiffView {
     pub file: usize,
@@ -91,6 +126,7 @@ pub struct DiffView {
     pub top: usize,
     pub x: usize,
     pub select: Option<Selection>,
+    pub find: Option<Find>,
     /// Fichier entier : se placer sur la première modification dès qu'elle arrive.
     seek: bool,
     req: u64,
@@ -145,6 +181,63 @@ impl DiffView {
         out.iter().any(|line| !line.is_empty()).then(|| out.join("\n"))
     }
 
+    /// Occurrences de `query` dans le code. Sans majuscule dans la recherche, la
+    /// casse est ignorée.
+    fn search(&self, query: &str) -> Vec<Hit> {
+        let exact = query.chars().any(char::is_uppercase);
+        // Caractère pour caractère : les rangs restent ceux du texte affiché.
+        let fold = |c: char| if exact { c } else { c.to_lowercase().next().unwrap_or(c) };
+        let needle: Vec<char> = query.chars().map(fold).collect();
+        let mut hits = Vec::new();
+        if needle.is_empty() {
+            return hits;
+        }
+        for row in 0..self.len() {
+            // Une ligne commune aux deux côtés ne compte qu'une fois.
+            let sides: &[Option<Side>] = match &self.sides {
+                Some(sides) if sides.rows[row].0 != sides.rows[row].1 => &[Some(Side::Left), Some(Side::Right)],
+                _ => &[None],
+            };
+            for &side in sides {
+                let Some(line) = self.code(row, side.unwrap_or(Side::Left)) else { continue };
+                let text: Vec<char> = line.text.chars().map(fold).collect();
+                let mut start = 0;
+                while start + needle.len() <= text.len() {
+                    if text[start..start + needle.len()] == needle[..] {
+                        hits.push(Hit { row, side, start, len: needle.len() });
+                        start += needle.len();
+                    } else {
+                        start += 1;
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// Pose la recherche, ou la retire si `query` est vide. L'occurrence courante
+    /// est la première à partir du haut de la vue.
+    fn set_find(&mut self, query: &str) {
+        let hits = self.search(query);
+        let current = hits.iter().position(|hit| hit.row >= self.top).or((!hits.is_empty()).then_some(0));
+        self.find = (!query.is_empty()).then(|| Find { query: query.to_string(), hits, current });
+    }
+
+    /// Amène l'occurrence courante à l'écran : `height` lignes sont visibles,
+    /// et `code` dit la largeur du code affiché.
+    fn reveal(&mut self, height: usize, code: Option<CodeHit>) {
+        let Some(hit) = self.find.as_ref().and_then(|find| find.hits.get(find.current?)).copied() else { return };
+        // La dernière ligne peut passer sous le champ de recherche.
+        if hit.row < self.top || hit.row + 1 >= self.top + height.max(2) {
+            self.top = hit.row.saturating_sub(CHANGE_MARGIN);
+        }
+        let Some(code) = code else { return };
+        let width = code.width(hit.side.unwrap_or(Side::Left));
+        if hit.start < self.x || hit.start + hit.len > self.x + width {
+            self.x = if hit.start + hit.len <= width { 0 } else { hit.start.saturating_sub(width / 3) };
+        }
+    }
+
     fn append(&mut self, lines: Vec<DiffLine>) {
         if let Some(sides) = &mut self.sides {
             for (i, line) in lines.iter().enumerate() {
@@ -152,6 +245,13 @@ impl DiffView {
             }
         }
         self.lines.extend(lines);
+        // Le diff s'allonge : la recherche en cours suit, sans perdre sa place.
+        if let Some(find) = self.find.take() {
+            let at = find.current.and_then(|current| find.hits.get(current).copied());
+            let hits = self.search(&find.query);
+            let current = at.and_then(|at| hits.iter().position(|hit| *hit == at));
+            self.find = Some(Find { query: find.query, hits, current });
+        }
     }
 }
 
@@ -209,14 +309,26 @@ impl CodeHit {
         }
     }
 
-    /// Ligne de la vue et rang du caractère sous un point. Hors du code de ce
-    /// côté, le point est ramené à son bord le plus proche.
-    fn locate(&self, pos: Position, side: Side) -> (usize, usize) {
-        let (start, end) = match (side, self.right) {
+    /// Colonnes de l'écran occupées par le code d'un côté : la première, puis
+    /// celle qui suit la dernière.
+    fn columns(&self, side: Side) -> (u16, u16) {
+        match (side, self.right) {
             (Side::Right, Some((_, code))) => (code, self.area.right().saturating_sub(1)),
             (_, Some((mid, _))) => (self.left, mid),
             (_, None) => (self.left, self.area.right().saturating_sub(1)),
-        };
+        }
+    }
+
+    /// Nombre de caractères de code visibles d'un côté.
+    fn width(&self, side: Side) -> usize {
+        let (start, end) = self.columns(side);
+        end.saturating_sub(start) as usize
+    }
+
+    /// Ligne de la vue et rang du caractère sous un point. Hors du code de ce
+    /// côté, le point est ramené à son bord le plus proche.
+    fn locate(&self, pos: Position, side: Side) -> (usize, usize) {
+        let (start, end) = self.columns(side);
         let x = pos.x.min(end.saturating_sub(1)).max(start);
         let y = pos.y.min(self.area.bottom().saturating_sub(1)).max(self.area.y);
         (self.top + (y - self.area.y) as usize, self.skip + (x - start) as usize)
@@ -256,6 +368,8 @@ pub enum Prompt {
     Kind { sign: Option<char> },
     /// Champ de saisie, tout en bas de l'écran.
     Input { kind: SearchKind, query: String },
+    /// Recherche dans le code du diff au premier plan, ouverte par `/`.
+    Code { query: String },
 }
 
 pub enum Action {
@@ -297,6 +411,8 @@ pub enum Action {
     ToggleHelp,
     /// Ouvre le sous-menu de recherche.
     Search,
+    /// Ouvre la recherche de texte dans le code d'un diff.
+    Find,
     /// Touches reçues tant qu'une recherche est en cours de saisie.
     PromptKey(char),
     PromptBackspace,
@@ -335,6 +451,9 @@ pub struct App {
     live_at: Option<Instant>,
     /// Recherche et commit d'avant l'ouverture du menu, rétablis si la saisie est abandonnée.
     before_search: Option<(Option<Filter>, Option<Oid>)>,
+    /// Vue d'avant l'ouverture de la recherche dans le code : position, défilement
+    /// horizontal et recherche précédente, rétablis si la saisie est abandonnée.
+    before_find: Option<(usize, usize, Option<Find>)>,
     pub hit: HitMap,
     /// Une sélection à la souris est en cours : le bouton est encore enfoncé.
     pub selecting: bool,
@@ -385,6 +504,7 @@ impl App {
             hit: HitMap::default(),
             should_quit: false,
             selecting: false,
+            before_find: None,
             flash: None,
             log,
             goto_end: false,
@@ -692,6 +812,7 @@ impl App {
             top: 0,
             x: 0,
             select: None,
+            find: None,
             seek: false,
             req,
         });
@@ -721,6 +842,7 @@ impl App {
             top: 0,
             x: 0,
             select: None,
+            find: None,
             seek: true,
             req,
         });
@@ -795,6 +917,79 @@ impl App {
         pane.full.as_ref().or(pane.diff.as_ref())?.selected_text()
     }
 
+    /// Recherche dans le code à montrer en bas de l'écran : son texte, si elle
+    /// est en cours de saisie, le rang de l'occurrence courante et leur nombre.
+    pub fn code_find(&self) -> Option<(&str, bool, Option<usize>, usize)> {
+        let pane = self.pane.as_ref();
+        let find = pane.and_then(|pane| pane.full.as_ref().or(pane.diff.as_ref())).and_then(|view| view.find.as_ref());
+        let state = (find.and_then(|find| find.current), find.map_or(0, |find| find.hits.len()));
+        match &self.prompt {
+            Some(Prompt::Code { query }) => Some((query, true, state.0, state.1)),
+            Some(_) => None,
+            None => find.map(|find| (find.query.as_str(), false, state.0, state.1)),
+        }
+    }
+
+    /// `/` : ouvre la saisie d'une recherche dans le code du diff au premier plan.
+    fn open_find(&mut self) {
+        if let Some(view) = self.code_view() {
+            self.before_find = Some((view.top, view.x, view.find.take()));
+            self.prompt = Some(Prompt::Code { query: String::new() });
+        }
+    }
+
+    /// La saisie change : la recherche repart d'où la vue se trouvait à
+    /// l'ouverture, et va à la première occurrence qui suit.
+    fn find_live(&mut self, query: &str) {
+        let Some((top, x)) = self.before_find.as_ref().map(|&(top, x, _)| (top, x)) else { return };
+        let (height, code) = (self.pane_height, self.hit.code);
+        if let Some(view) = self.code_view() {
+            (view.top, view.x) = (top, x);
+            view.set_find(query);
+            view.reveal(height, code);
+        }
+    }
+
+    /// Fin de la saisie. `keep` garde la recherche tapée, si elle a trouvé
+    /// quelque chose ; sinon la vue revient où elle était, avec `restore` pour
+    /// retrouver aussi la recherche d'avant.
+    fn close_find(&mut self, keep: bool, restore: bool) -> bool {
+        let Some((top, x, find)) = self.before_find.take() else { return false };
+        let Some(view) = self.code_view() else { return false };
+        if keep && view.find.as_ref().is_some_and(|find| !find.hits.is_empty()) {
+            return true;
+        }
+        (view.top, view.x, view.find) = (top, x, find.filter(|_| restore));
+        false
+    }
+
+    /// `n` / `N` pendant une recherche dans le code : occurrence suivante ou
+    /// précédente, en boucle. Faux quand aucune recherche n'est en place.
+    fn find_step(&mut self, delta: isize) -> bool {
+        let (height, code) = (self.pane_height, self.hit.code);
+        let Some(view) = self.code_view() else { return false };
+        let top = view.top;
+        let Some(find) = &mut view.find else { return false };
+        let count = find.hits.len();
+        if count == 0 {
+            self.set_flash("No match");
+            return true;
+        }
+        find.current = Some(match find.current {
+            Some(current) => (current as isize + delta).rem_euclid(count as isize) as usize,
+            // Pas encore d'occurrence courante : la plus proche du haut de la vue.
+            None if delta > 0 => find.hits.iter().position(|hit| hit.row >= top).unwrap_or(0),
+            None => find.hits.iter().rposition(|hit| hit.row < top).unwrap_or(count - 1),
+        });
+        view.reveal(height, code);
+        true
+    }
+
+    /// Retire la recherche dans le code ; faux s'il n'y en avait pas.
+    fn clear_find(&mut self) -> bool {
+        self.code_view().and_then(|view| view.find.take()).is_some()
+    }
+
     /// Bouton enfoncé sur le code d'un diff : une sélection commence du côté
     /// visé, la précédente s'efface.
     fn select_start(&mut self, pos: Position) {
@@ -850,6 +1045,27 @@ impl App {
         self.prompt = match (prompt, action) {
             (_, Action::Quit) => {
                 self.should_quit = true;
+                None
+            }
+            (Prompt::Code { .. }, Action::PromptCancel) => {
+                // Abandon : la vue et la recherche d'avant.
+                self.close_find(false, true);
+                None
+            }
+            (Prompt::Code { mut query }, Action::PromptKey(key)) => {
+                query.push(key);
+                self.find_live(&query);
+                Some(Prompt::Code { query })
+            }
+            (Prompt::Code { mut query }, Action::PromptBackspace) => {
+                query.pop();
+                self.find_live(&query);
+                Some(Prompt::Code { query })
+            }
+            (Prompt::Code { query }, Action::PromptSubmit) => {
+                if !self.close_find(true, false) && !query.is_empty() {
+                    self.set_flash(format!("No match: {query}"));
+                }
                 None
             }
             (_, Action::PromptCancel) => {
@@ -1139,6 +1355,8 @@ impl App {
         }
         match action {
             Action::Quit => self.should_quit = true,
+            // Une recherche dans le code est un niveau de plus : on en sort d'abord.
+            Action::Back { .. } if self.clear_find() => {}
             Action::Back { quit } => match self.depth() {
                 4 => self.close_full(),
                 3 => self.close_diff(),
@@ -1197,7 +1415,13 @@ impl App {
                     self.copy(hash);
                 }
             }
-            Action::Step(delta) => self.step(delta),
+            Action::Step(delta) => {
+                // Pendant une recherche dans le code, `n` et `N` suivent ses occurrences.
+                if !self.find_step(delta) {
+                    self.step(delta);
+                }
+            }
+            Action::Find => self.open_find(),
             Action::ScrollGraph(delta) => {
                 self.top = self
                     .top
