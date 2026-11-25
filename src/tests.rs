@@ -134,7 +134,8 @@ fn three_levels_end_to_end() {
     });
     let unified = screen(&mut app, 110, 12);
     println!("{unified}");
-    assert!(unified.contains("b.txt") && unified.contains("+ nouveau"));
+    // Le fond vert suffit à dire l'ajout : pas de « + » devant chaque ligne.
+    assert!(unified.contains("b.txt") && unified.contains("  1 nouveau") && !unified.contains("+ nouveau"), "{unified}");
 
     // q remonte d'un niveau à la fois, puis quitte.
     app.apply(Action::Back { quit: true });
@@ -448,7 +449,7 @@ fn syntax_colours_the_diff() {
     let (_, added_bg) = colours(&buffer, "\"bonjour\"");
     let (removed, added) = (colours(&buffer, "hello\"").0, colours(&buffer, "bonjour\"").0);
     assert!(rgb(removed) && removed == added, "{removed:?} {added:?}");
-    assert_eq!((removed_bg, added_bg), (Color::Rgb(63, 0, 1), Color::Rgb(0, 40, 0)));
+    assert_eq!((removed_bg, added_bg), (Color::Rgb(63, 0, 1), Color::Rgb(0, 56, 0)));
     // Dans la ligne modifiée, seul le mot qui change porte le fond soutenu.
     assert_eq!(colours(&buffer, "hello\"").1, Color::Rgb(128, 0, 8));
     assert_eq!(colours(&buffer, "bonjour\"").1, Color::Rgb(0, 88, 0));
@@ -456,7 +457,7 @@ fn syntax_colours_the_diff() {
     // Les numéros de ligne sont estompés, sur le fond de leur ligne.
     assert_eq!(colours(&buffer, "1 // greeting"), (Color::DarkGray, Color::Reset));
     assert_eq!(colours(&buffer, "3     \"hello\""), (Color::DarkGray, Color::Rgb(63, 0, 1)));
-    assert_eq!(colours(&buffer, "3     \"bonjour\""), (Color::DarkGray, Color::Rgb(0, 40, 0)));
+    assert_eq!(colours(&buffer, "3     \"bonjour\""), (Color::DarkGray, Color::Rgb(0, 56, 0)));
     // Le défilement horizontal emporte les teintes avec le texte.
     app.apply(Action::Horizontal(4));
     let buffer = draw(&mut app);

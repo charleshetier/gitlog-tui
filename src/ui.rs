@@ -60,8 +60,10 @@ const TONES: Tones = Tones {
 };
 /// Les mêmes fonds sous la coloration syntaxique : plus sombres, pour que chaque
 /// teinte du thème y reste lisible. Aucune couleur de la palette n'est aussi sombre.
+/// Un terminal qui ramène le 24 bits à 256 couleurs doit pourtant y retrouver du
+/// vert et du rouge : trop sombre, un fond y devient un gris proche du noir.
 const SYNTAX_TONES: Tones = Tones {
-    add: Color::Rgb(0, 40, 0),
+    add: Color::Rgb(0, 56, 0),
     del: Color::Rgb(63, 0, 1),
     add_mark: Color::Rgb(0, 88, 0),
     del_mark: Color::Rgb(128, 0, 8),
@@ -678,6 +680,8 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     let max_no = visible.iter().map(|l| l.old.max(l.new)).max().unwrap_or(0);
     let num_w = max_no.to_string().len().max(3);
     let number = |n: u32| if n == 0 { " ".repeat(num_w) } else { format!("{n:>num_w$}") };
+    // Un fichier ajouté n'a que des lignes vertes : le « + » n'y apprendrait rien.
+    let signs = visible.iter().any(|line| matches!(line.kind, LineKind::Del));
 
     for (i, line) in visible.iter().enumerate() {
         let y = area.y + i as u16;
@@ -702,7 +706,9 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
         let numbers = format!("{} {}", number(line.old), number(line.new));
         // Les numéros de ligne sont estompés : ils s'effacent derrière le contenu.
         let mut x = put(buf, x0, y, end, &numbers, dim);
-        x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
+        if signs {
+            x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
+        }
         put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
     }
 }
@@ -1152,6 +1158,32 @@ fn draw_flash(buf: &mut Buffer, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Couleur de la palette à 256 teintes la plus proche, comme la choisit un
+    /// terminal sans 24 bits : le cube 6×6×6 ou la rampe de gris.
+    fn reduced(color: Color) -> [i32; 3] {
+        let Color::Rgb(r, g, b) = color else { panic!("{color:?} n'est pas une couleur 24 bits") };
+        let rgb = [r, g, b].map(i32::from);
+        let cube = rgb.map(|v| [0, 95, 135, 175, 215, 255].into_iter().min_by_key(|level| (level - v).abs()).unwrap());
+        let grey = 8 + 10 * ((rgb.iter().sum::<i32>() / 3 - 3) / 10).clamp(0, 23);
+        let gap = |to: [i32; 3]| (0..3).map(|i| (to[i] - rgb[i]).pow(2)).sum::<i32>();
+        if gap(cube) <= gap([grey; 3]) { cube } else { [grey; 3] }
+    }
+
+    #[test]
+    fn syntax_tones_survive_256_colours() {
+        // Les ajouts restent verts, les retraits rouges, jamais gris.
+        for add in [SYNTAX_TONES.add, SYNTAX_TONES.add_mark] {
+            let [r, g, b] = reduced(add);
+            assert!(g >= 95 && r == 0 && b == 0, "{add:?} → {:?}", [r, g, b]);
+        }
+        for del in [SYNTAX_TONES.del, SYNTAX_TONES.del_mark] {
+            let [r, g, b] = reduced(del);
+            assert!(r >= 95 && g == 0 && b == 0, "{del:?} → {:?}", [r, g, b]);
+        }
+        // L'ancien vert des ajouts s'y perdait.
+        assert_eq!(reduced(Color::Rgb(0, 40, 0)), [18; 3]);
+    }
 
     #[test]
     fn civil_dates() {
