@@ -228,13 +228,14 @@ impl DiffView {
 
     /// Amène l'occurrence courante à l'écran : `height` lignes sont visibles,
     /// et `code` dit la largeur du code affiché.
-    fn reveal(&mut self, height: usize, code: Option<CodeHit>) {
+    fn reveal(&mut self, height: usize, code: Option<&CodeHit>) {
         let Some(hit) = self.find.as_ref().and_then(|find| find.hits.get(find.current?)).copied() else { return };
         // La dernière ligne peut passer sous le champ de recherche.
         if hit.row < self.top || hit.row + 1 >= self.top + height.max(2) {
             self.top = hit.row.saturating_sub(CHANGE_MARGIN);
         }
-        let Some(code) = code else { return };
+        // Replié, le texte ne défile pas de côté : toute la ligne est à l'écran.
+        let Some(code) = code.filter(|code| !code.wrap) else { return };
         let width = code.width(hit.side.unwrap_or(Side::Left));
         if hit.start < self.x || hit.start + hit.len > self.x + width {
             self.x = if hit.start + hit.len <= width { 0 } else { hit.start.saturating_sub(width / 3) };
@@ -288,12 +289,15 @@ pub struct Hierarchy {
 }
 
 /// Code d'un diff à l'écran : de quoi traduire un point en position dans le texte.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CodeHit {
     /// Lignes du diff affichées.
     pub area: Rect,
-    /// Ligne de la vue en haut de la zone, puis défilement horizontal.
-    pub top: usize,
+    /// Pour chaque rangée de l'écran : la ligne de la vue qu'elle montre, et son
+    /// rang parmi les rangées de cette ligne quand le texte est replié.
+    pub lines: Vec<(usize, usize)>,
+    /// Le texte est replié à la largeur du code ; sinon il défile de `skip` caractères.
+    pub wrap: bool,
     pub skip: usize,
     /// Première colonne du code, à gauche ou dans la colonne unique.
     pub left: u16,
@@ -334,7 +338,12 @@ impl CodeHit {
         let (start, end) = self.columns(side);
         let x = pos.x.min(end.saturating_sub(1)).max(start);
         let y = pos.y.min(self.area.bottom().saturating_sub(1)).max(self.area.y);
-        (self.top + (y - self.area.y) as usize, self.skip + (x - start) as usize)
+        // Sous la dernière rangée dessinée, le point vaut pour celle-ci.
+        let line = ((y - self.area.y) as usize).min(self.lines.len().saturating_sub(1));
+        let (row, part) = self.lines.get(line).copied().unwrap_or_default();
+        // Une ligne repliée reprend, à chaque rangée, là où la précédente s'arrête.
+        let skip = if self.wrap { part * self.width(side) } else { self.skip };
+        (row, skip + (x - start) as usize)
     }
 }
 
@@ -399,7 +408,8 @@ impl Picker {
 #[derive(Default)]
 pub struct HitMap {
     pub graph: Rect,
-    pub graph_top: usize,
+    /// Ligne du graphe montrée par chaque rangée de l'écran : une ligne repliée en occupe plusieurs.
+    pub graph_rows: Vec<usize>,
     pub pane: Rect,
     pub files: Rect,
     pub file_top: usize,
@@ -469,6 +479,8 @@ pub enum Action {
     /// Relit le dépôt : branche courante, refs et historique.
     Refresh,
     /// Affiche ou masque les étiquettes des branches distantes.
+    /// `w` : replie ou non les lignes trop longues, dans le graphe et dans le code.
+    ToggleWrap,
     /// `h` : amène le curseur sur le commit de HEAD, sans l'ouvrir.
     GotoHead,
     /// `b` : ouvre le sous-menu des branches.
@@ -497,6 +509,8 @@ pub struct App {
     /// Coloration syntaxique des diffs ; demande un terminal 24 bits.
     pub syntax: bool,
     pub node_style: NodeStyle,
+    /// Les lignes trop longues sont repliées, dans le graphe comme dans le code.
+    pub wrap: bool,
     /// Nature des branches dont part le graphe.
     pub scope: Scope,
     /// Branches choisies dans la liste (`b` `f`) ; `None` : toutes.
@@ -558,6 +572,7 @@ impl App {
             plain,
             syntax: true,
             node_style: NodeStyle::Dots,
+            wrap: false,
             scope: Scope::All,
             picked: None,
             picker: None,
@@ -1201,11 +1216,11 @@ impl App {
     /// l'ouverture, et va à la première occurrence qui suit.
     fn find_live(&mut self, query: &str) {
         let Some((top, x)) = self.before_find.as_ref().map(|&(top, x, _)| (top, x)) else { return };
-        let (height, code) = (self.pane_height, self.hit.code);
+        let (height, code) = (self.pane_height, self.hit.code.clone());
         if let Some(view) = self.code_view() {
             (view.top, view.x) = (top, x);
             view.set_find(query);
-            view.reveal(height, code);
+            view.reveal(height, code.as_ref());
         }
     }
 
@@ -1225,7 +1240,7 @@ impl App {
     /// `n` / `N` pendant une recherche dans le code : occurrence suivante ou
     /// précédente, en boucle. Faux quand aucune recherche n'est en place.
     fn find_step(&mut self, delta: isize) -> bool {
-        let (height, code) = (self.pane_height, self.hit.code);
+        let (height, code) = (self.pane_height, self.hit.code.clone());
         let Some(view) = self.code_view() else { return false };
         let top = view.top;
         let Some(find) = &mut view.find else { return false };
@@ -1240,7 +1255,7 @@ impl App {
             None if delta > 0 => find.hits.iter().position(|hit| hit.row >= top).unwrap_or(0),
             None => find.hits.iter().rposition(|hit| hit.row < top).unwrap_or(count - 1),
         });
-        view.reveal(height, code);
+        view.reveal(height, code.as_ref());
         true
     }
 
@@ -1252,7 +1267,7 @@ impl App {
     /// Bouton enfoncé sur le code d'un diff : une sélection commence du côté
     /// visé, la précédente s'efface.
     fn select_start(&mut self, pos: Position) {
-        let Some(code) = self.hit.code else { return };
+        let Some(code) = self.hit.code.clone() else { return };
         let side = code.side(pos.x);
         let point = code.locate(pos, side);
         if let Some(view) = self.code_view() {
@@ -1264,7 +1279,7 @@ impl App {
     /// Le pointeur se déplace, bouton enfoncé : la sélection le suit. Passé le
     /// haut ou le bas du diff, la vue défile d'une ligne.
     fn select_drag(&mut self, pos: Position) {
-        let Some(code) = self.hit.code else { return };
+        let Some(code) = self.hit.code.clone() else { return };
         let Some(view) = self.code_view() else { return };
         let Some(side) = view.select.map(|select| select.side) else { return };
         let last = view.len().saturating_sub(1);
@@ -1275,7 +1290,9 @@ impl App {
             row = view.top;
         } else if pos.y >= code.lower_edge {
             view.top = (view.top + 1).min(last);
-            row = view.top + (pos.y.min(code.area.bottom().saturating_sub(1)) - code.area.y) as usize;
+            // La dernière ligne dessinée, décalée d'autant que la vue depuis ce rendu.
+            let (first, shown) = (code.lines.first().map_or(view.top, |line| line.0), code.lines.last().map_or(view.top, |line| line.0));
+            row = shown + view.top.saturating_sub(first);
         }
         if let Some(select) = &mut view.select {
             select.head = (row.min(last), col);
@@ -1625,6 +1642,10 @@ impl App {
         // Valables dans toutes les vues, hiérarchie des branches comprise.
         match action {
             Action::Refresh => return self.refresh(),
+            Action::ToggleWrap => {
+                self.wrap = !self.wrap;
+                return self.set_flash(if self.wrap { "Long lines wrapped" } else { "Long lines cut" });
+            }
             Action::BranchMenu => {
                 self.prompt = Some(Prompt::Branches);
                 return;
@@ -1751,7 +1772,12 @@ impl App {
             // Hors saisie, ces touches n'arrivent pas jusqu'ici.
             Action::PromptKey(_) | Action::PromptBackspace | Action::PromptSubmit | Action::PromptCancel => {}
             // Traitées plus haut, dans toutes les vues.
-            Action::Refresh | Action::BranchMenu | Action::PickBranches | Action::ToggleRemotes | Action::OnlyRemotes => {}
+            Action::Refresh
+            | Action::ToggleWrap
+            | Action::BranchMenu
+            | Action::PickBranches
+            | Action::ToggleRemotes
+            | Action::OnlyRemotes => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,

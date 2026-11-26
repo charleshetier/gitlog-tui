@@ -630,7 +630,7 @@ fn mouse_selects_code_in_a_diff() {
     wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
     open_diff(&mut app);
     let buffer = draw(&mut app, 24);
-    let code = app.hit.code.expect("le code du diff est repéré");
+    let code = app.hit.code.clone().expect("le code du diff est repéré");
     let (mid, _) = code.right.expect("deux colonnes");
 
     // Du « b » de « bonjour » à l'accolade de la ligne suivante, à droite : le
@@ -867,6 +867,119 @@ fn remote_branches_are_shortened_and_hidden() {
     wait(&mut app, "toutes", |app| app.log_done);
     let view = screen(&mut app, 110, 12);
     assert!(view.contains("&origin") && !view.contains("no remotes"), "{view}");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn w_wraps_long_lines() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use ratatui::style::Color;
+
+    let dir = std::env::temp_dir().join(format!("gitlog-test-wrap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let words = |tail: &str| (1..=40).map(|n| format!("mot{n}")).chain([tail.to_string()]).collect::<Vec<_>>().join(" ");
+    std::fs::write(dir.join("long.txt"), format!("court\n{}\nfin de fichier\n", words("QUEUE"))).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Base"]);
+    std::fs::write(dir.join("long.txt"), format!("court\n{}\nfin de fichier\n", words("QUEUE_DROITE"))).unwrap();
+    std::fs::write(dir.join("ajout.txt"), format!("{}\nseconde ligne\n", words("QUEUE_AJOUT"))).unwrap();
+    git(&dir, &["add", "."]);
+    let subject = format!("Message {} FINMESSAGE", (1..=30).map(|n| format!("partie{n}")).collect::<Vec<_>>().join(" "));
+    git(&dir, &["commit", "-q", "-m", &subject]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "Dernier"]);
+
+    let draw = |app: &mut App, height: u16| -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let text = |buffer: &Buffer, y: u16| -> String { (0..120).map(|x| buffer[(x, y)].symbol()).collect() };
+    let line = |buffer: &Buffer, needle: &str| (0..buffer.area.height).find(|&y| text(buffer, y).contains(needle));
+    let column = |buffer: &Buffer, y: u16, needle: &str| text(buffer, y).find(needle).map(|byte| text(buffer, y)[..byte].chars().count() as u16);
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+
+    // Le graphe : un message trop long est coupé, puis replié sous lui-même.
+    let cut = draw(&mut app, 12);
+    assert!(line(&cut, "FINMESSAGE").is_none() && line(&cut, "Base") == Some(4));
+    app.apply(Action::ToggleWrap);
+    assert_eq!(app.flash(), Some("Long lines wrapped"));
+    let wrapped = draw(&mut app, 12);
+    let (first, last, base) = (line(&wrapped, "Message partie1").unwrap(), line(&wrapped, "FINMESSAGE").unwrap(), line(&wrapped, "Base").unwrap());
+    assert!(first == 3 && last > first && base == last + 1, "{first} {last} {base}");
+    // Sous la première rangée : le trait de la branche, pas de hash ni d'auteur, le texte aligné.
+    let start = column(&wrapped, first, "Message").unwrap();
+    for y in first + 1..=last {
+        let row = text(&wrapped, y);
+        assert!(row.starts_with(" │") && !row.contains("·"), "{row}");
+        assert_eq!(row.chars().take_while(|c| !c.is_alphanumeric()).count() as u16, start, "{row}");
+    }
+    // Le repli se fait entre deux mots.
+    assert!((first + 1..last).all(|y| text(&wrapped, y).trim_end().ends_with(char::is_numeric)));
+    // Chaque rangée de l'écran sait de quelle ligne du graphe elle vient.
+    let rows = &app.hit.graph_rows;
+    assert_eq!(rows[..2], [0, 1]);
+    assert!(rows[1..=(last - first) as usize + 1].iter().all(|&row| row == 1) && rows[(base - 2) as usize] == 2, "{rows:?}");
+    // La sélection reste à l'écran, même sous une ligne qui en occupe plusieurs.
+    app.apply(Action::Bottom);
+    let low = draw(&mut app, 2 + (last - first) + 1);
+    assert!(line(&low, "Base").is_some() && app.top > 0, "{}", text(&low, 2));
+    app.apply(Action::Top);
+
+    // Le diff en deux colonnes : la longue ligne se replie de chaque côté.
+    app.apply(Action::ToggleWrap);
+    assert_eq!(app.flash(), Some("Long lines cut"));
+    app.apply(Action::Move(1));
+    app.apply(Action::Open);
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_))));
+    app.apply(Action::Move(1));
+    app.apply(Action::Open);
+    wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    let cut = draw(&mut app, 30);
+    assert!(line(&cut, "QUEUE").is_none() && line(&cut, "fin de fichier").is_some());
+    app.apply(Action::ToggleWrap);
+    let wrapped = draw(&mut app, 30);
+    let (start, old_end, new_end) = (line(&wrapped, "mot1 ").unwrap(), line(&wrapped, "QUEUE ").unwrap(), line(&wrapped, "QUEUE_DROITE").unwrap());
+    let after = line(&wrapped, "fin de fichier").unwrap();
+    assert!(old_end > start && new_end >= old_end && after == new_end + 1, "{start} {old_end} {new_end} {after}");
+    // Le numéro de ligne n'est écrit qu'à la première rangée.
+    assert!(text(&wrapped, start).contains("  2 mot1") && !text(&wrapped, start + 1).contains("  2 "));
+    let code = app.hit.code.clone().unwrap();
+    assert!(code.wrap && code.lines[(start - code.area.y) as usize].1 == 0 && code.lines[(new_end - code.area.y) as usize].1 > 0);
+    // Une sélection suit le texte d'une rangée à la suivante.
+    let (_, right) = code.right.unwrap();
+    app.apply(Action::SelectStart(Position::new(right, start)));
+    app.apply(Action::SelectDrag(Position::new(right + 3, start + 1)));
+    let selected = app.selected_text().unwrap();
+    let width = (119 - right) as usize;
+    assert!(words("QUEUE_DROITE").starts_with(&selected) && selected.chars().count() == width + 4, "{selected}");
+    app.apply(Action::SelectEnd);
+    // La recherche surligne une occurrence sur la rangée où elle se trouve.
+    app.apply(Action::Find);
+    "DROITE".chars().for_each(|key| app.apply(Action::PromptKey(key)));
+    app.apply(Action::PromptSubmit);
+    let found = draw(&mut app, 30);
+    let y = line(&found, "QUEUE_DROITE").unwrap();
+    let x = column(&found, y, "DROITE").unwrap();
+    assert_eq!(found[(x, y)].bg, Color::Indexed(208));
+    app.apply(Action::Back { quit: false });
+
+    // Le fichier ajouté, sur une seule colonne.
+    app.apply(Action::Back { quit: false });
+    app.apply(Action::Move(-1));
+    app.apply(Action::Open);
+    wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    let wrapped = draw(&mut app, 30);
+    let (start, end) = (line(&wrapped, "mot1 ").unwrap(), line(&wrapped, "QUEUE_AJOUT").unwrap());
+    assert!(end > start && line(&wrapped, "seconde ligne") == Some(end + 1));
+    app.apply(Action::ToggleWrap);
+    assert!(line(&draw(&mut app, 30), "QUEUE_AJOUT").is_none());
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);

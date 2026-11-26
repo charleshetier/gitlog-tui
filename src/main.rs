@@ -55,7 +55,8 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       b then h branch hierarchy · f pick the branches of the graph
              o show or hide the remote branches (origin) · O remote branches only
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
-      h jump to the HEAD commit in the graph, without opening it";
+      h jump to the HEAD commit in the graph, without opening it
+      w wrap or cut the long lines, in the graph and in the code";
 
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
 const TICK: Duration = Duration::from_millis(16);
@@ -228,6 +229,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Left => Action::Horizontal(-4),
         KeyCode::Right => Action::Horizontal(4),
         KeyCode::Char('h') => Action::GotoHead,
+        KeyCode::Char('w') => Action::ToggleWrap,
         KeyCode::Char('b') => Action::BranchMenu,
         KeyCode::Char('s') => Action::Search,
         KeyCode::Char('/') => Action::Find,
@@ -253,7 +255,7 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
                 return Some(Action::ToggleHelp);
             }
             // Sur le code d'un diff, le bouton commence une sélection.
-            if hit.code.is_some_and(|code| code.area.contains(pos)) {
+            if hit.code.as_ref().is_some_and(|code| code.area.contains(pos)) {
                 return Some(Action::SelectStart(pos));
             }
             // Sous la fenêtre du fichier entier, rien n'est cliquable.
@@ -273,10 +275,8 @@ fn on_mouse(app: &App, mouse: MouseEvent) -> Option<Action> {
                 return Some(Action::CopyHash);
             }
             if hit.graph.contains(pos) {
-                let row = hit.graph_top + (mouse.row - hit.graph.y) as usize;
-                if row >= app.store.len() {
-                    return None;
-                }
+                // Sous la dernière ligne du graphe, il n'y a rien à ouvrir.
+                let row = *hit.graph_rows.get((mouse.row - hit.graph.y) as usize)?;
                 return Some(Action::ClickCommit(row));
             }
             if hit.branches.contains(pos) {

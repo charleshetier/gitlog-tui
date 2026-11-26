@@ -306,6 +306,7 @@ fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
 fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.graph_height = area.height as usize;
     app.hit.graph = area;
+    app.hit.graph_rows.clear();
     let dim = Style::new().fg(DIM);
     let end = area.right() - 1;
     let len = app.store.len();
@@ -322,7 +323,34 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         return;
     }
     app.top = app.top.min(len - 1);
-    app.hit.graph_top = app.top;
+    // Repliées, les lignes n'ont plus toutes la même hauteur : si la sélection ne
+    // tient pas à l'écran, le haut de la vue descend d'une ligne et le dessin reprend.
+    for _ in 0..area.height.max(1) {
+        let (whole, selected_shown) = draw_graph_rows(buf, app, area);
+        if !app.wrap {
+            return;
+        }
+        if selected_shown || app.selected <= app.top {
+            // Les hauteurs se comptent désormais en lignes du graphe, pas en rangées de l'écran.
+            app.graph_height = whole.max(1);
+            return;
+        }
+        app.top += 1;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].reset();
+            }
+        }
+    }
+}
+
+/// Dessine les lignes du graphe à partir du haut de la vue. Renvoie le nombre de
+/// lignes montrées en entier, et si la ligne sélectionnée en fait partie.
+fn draw_graph_rows(buf: &mut Buffer, app: &mut App, area: Rect) -> (usize, bool) {
+    app.hit.graph_rows.clear();
+    let dim = Style::new().fg(DIM);
+    let end = area.right() - 1;
+    let len = app.store.len();
     let last = (app.top + area.height as usize).min(len);
 
     let nodes = app.node_style;
@@ -343,8 +371,12 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
     let text_x = if show_hash { hash_x + 8 } else { hash_x };
     let now = now_secs();
 
+    let (mut y, bottom) = (area.y, area.bottom());
+    let (mut whole, mut selected_shown) = (0, false);
     for row in app.top..last {
-        let y = area.y + (row - app.top) as u16;
+        if y >= bottom {
+            break;
+        }
         let selected = row == app.selected;
         let oid = app.store.oid(row);
         // HEAD se repère de trois façons : le fond de sa ligne, sa puce, son étiquette.
@@ -363,37 +395,96 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         let tint = oid.is_worktree().then_some(grey);
         let cells = app.store.cells(row);
         draw_graph_row(buf, area.x + 1, y, end, cells, graph_w as usize, (nodes, head), (lane_bg, tint));
+        // Branches qui descendent vers la ligne suivante : elles longent un message replié.
+        let below: Vec<Cell> = cells.iter().take(graph_w as usize).copied().collect();
 
         let color = palette(app.store.color(row));
         let meta = app.meta(row);
         let bright = if selected { Style::new().fg(Color::White) } else { Style::new() };
-        if oid.is_worktree() {
-            // Ni hash, ni auteur : un nom en italique.
-            put(buf, text_x, y, end, &meta.subject, Style::new().fg(grey).add_modifier(Modifier::ITALIC));
-            continue;
-        }
-        if show_hash {
-            let hash_style = if selected { Style::new().fg(Color::Gray) } else { dim };
-            put(buf, hash_x, y, end, &oid.short(), hash_style);
-        }
-
-        let mut text_end = end;
-        if show_meta {
-            let author: String = meta.author.chars().take(20).collect();
-            let info = format!("{author} · {}", relative(now, meta.time, false));
-            let w = width(&info);
-            if text_x + w + 24 < end {
-                let style = if selected { Style::new().fg(Color::Gray) } else { dim };
-                put(buf, end - w, y, end, &info, style);
-                text_end = end - w - 2;
+        // Rangées occupées par la ligne, et si son texte y tient en entier.
+        let (rows, complete) = 'line: {
+            if oid.is_worktree() {
+                // Ni hash, ni auteur : un nom en italique.
+                put(buf, text_x, y, end, &meta.subject, Style::new().fg(grey).add_modifier(Modifier::ITALIC));
+                break 'line (1, true);
             }
-        }
+            if show_hash {
+                let hash_style = if selected { Style::new().fg(Color::Gray) } else { dim };
+                put(buf, hash_x, y, end, &oid.short(), hash_style);
+            }
 
-        let mut x = text_x;
-        if let Some(labels) = app.labels.get(&oid) {
-            x = draw_labels(buf, x, y, text_end, labels, color, app.plain, |label| app.shows(label));
+            let mut text_end = end;
+            if show_meta {
+                let author: String = meta.author.chars().take(20).collect();
+                let info = format!("{author} · {}", relative(now, meta.time, false));
+                let w = width(&info);
+                if text_x + w + 24 < end {
+                    let style = if selected { Style::new().fg(Color::Gray) } else { dim };
+                    put(buf, end - w, y, end, &info, style);
+                    text_end = end - w - 2;
+                }
+            }
+
+            let mut x = text_x;
+            if let Some(labels) = app.labels.get(&oid) {
+                x = draw_labels(buf, x, y, text_end, labels, color, app.plain, |label| app.shows(label));
+            }
+            // Trop étroit, le texte ne se replie pas : il n'avancerait pas.
+            if !app.wrap || text_end.saturating_sub(text_x) < 12 {
+                put(buf, x, y, text_end, &meta.subject, bright);
+                break 'line (1, true);
+            }
+            // Le message se poursuit sous lui-même ; les branches du graphe le longent.
+            let (first, mut rest) = split_words(&meta.subject, text_end.saturating_sub(x));
+            put(buf, x, y, text_end, first, bright);
+            let mut rows = 1;
+            while !rest.is_empty() && y + rows < bottom {
+                let next = y + rows;
+                if let Some(bg) = row_bg {
+                    buf.set_style(Rect::new(area.x, next, area.width, 1), Style::new().bg(bg));
+                }
+                draw_graph_below(buf, area.x + 1, next, end, &below, lane_bg);
+                let (part, more) = split_words(rest, text_end - text_x);
+                put(buf, text_x, next, text_end, part, bright);
+                rest = more;
+                rows += 1;
+            }
+            (rows, rest.is_empty())
+        };
+        app.hit.graph_rows.extend(std::iter::repeat_n(row, rows as usize));
+        if complete {
+            whole += 1;
+            selected_shown |= selected;
         }
-        put(buf, x, y, text_end, &meta.subject, bright);
+        y += rows;
+    }
+    (whole, selected_shown)
+}
+
+/// Coupe `text` à ce qui tient dans `room` cellules, de préférence sur une
+/// espace. Renvoie ce qui tient, puis la suite ; il tient toujours un caractère.
+fn split_words(text: &str, room: u16) -> (&str, &str) {
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += width(c.encode_utf8(&mut [0; 4]));
+        if used > room && at > 0 {
+            // Un mot plus long que la moitié de la place est coupé où il se trouve.
+            return match text[..at].rfind(' ').filter(|&space| space * 2 >= at) {
+                Some(space) => (&text[..space], text[space..].trim_start()),
+                None => text.split_at(at),
+            };
+        }
+    }
+    (text, "")
+}
+
+/// Sous la première rangée d'une ligne repliée : les branches qui descendent
+/// vers la ligne suivante se prolongent d'un trait.
+fn draw_graph_below(buf: &mut Buffer, x0: u16, y: u16, end: u16, cells: &[Cell], lane_bg: Color) {
+    for (i, cell) in cells.iter().enumerate().filter(|(_, cell)| cell.bits & DOWN != 0) {
+        let line = Cell { bits: UP | DOWN, color: cell.color };
+        let style = Style::new().fg(palette(cell.color)).bg(lane_bg);
+        put(buf, x0 + i as u16, y, end, line.glyph().encode_utf8(&mut [0; 4]), style);
     }
 }
 
@@ -629,7 +720,9 @@ fn draw_diff(buf: &mut Buffer, app: &mut App, area: Rect) {
     app.pane_height = area.height as usize;
     let syntax = app.syntax;
     let diff = app.pane.as_mut().and_then(|p| p.diff.as_mut());
-    app.hit.code = diff.and_then(|diff| draw_diff_view(buf, diff, area, syntax));
+    let wrap = app.wrap;
+    app.hit.code = diff.and_then(|diff| draw_diff_view(buf, diff, area, (syntax, wrap)));
+    shown_rows(app);
 }
 
 /// Niveau 4 : le fichier entier dans une fenêtre flottante, modifications en place.
@@ -640,7 +733,7 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
     }
     let inner = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, panel.height - 2);
     app.pane_height = inner.height as usize;
-    let syntax = app.syntax;
+    let (syntax, wrap) = (app.syntax, app.wrap);
     let Some(pane) = &mut app.pane else { return };
     let Some(full) = &mut pane.full else { return };
     let path = match &pane.files {
@@ -669,13 +762,23 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
         }
     }
     // La fenêtre recouvre le diff : c'est dans son code que la souris sélectionne.
-    app.hit.code = draw_diff_view(buf, full, inner, syntax);
+    app.hit.code = draw_diff_view(buf, full, inner, (syntax, wrap));
+    shown_rows(app);
+}
+
+/// Replié, un diff montre moins de lignes que l'écran n'a de rangées : c'est ce
+/// nombre de lignes que suivent le défilement par page et la recherche.
+fn shown_rows(app: &mut App) {
+    if let Some(code) = app.hit.code.as_ref().filter(|code| code.wrap) {
+        let rows = code.lines.last().map_or(0, |last| last.0 + 1).saturating_sub(code.lines.first().map_or(0, |first| first.0));
+        app.pane_height = rows.max(1);
+    }
 }
 
 /// Lignes d'un diff à partir de sa position de défilement : en deux colonnes quand
 /// les deux versions du fichier existent, en une seule sinon. Renvoie la place
 /// du code à l'écran, `None` tant qu'il n'y a rien à lire.
-fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: bool) -> Option<CodeHit> {
+fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, (syntax, wrap): (bool, bool)) -> Option<CodeHit> {
     let dim = Style::new().fg(DIM);
     let tones = if syntax { SYNTAX_TONES } else { TONES };
     let x0 = area.x + 1;
@@ -687,7 +790,7 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     }
     if let Some(sides) = &diff.sides {
         diff.top = diff.top.min(sides.rows.len().saturating_sub(1));
-        return Some(draw_sides(buf, area, diff, &sides.rows[diff.top..], tones));
+        return Some(draw_sides(buf, area, diff, &sides.rows[diff.top..], (tones, wrap)));
     }
     diff.top = diff.top.min(diff.lines.len() - 1);
     let visible: &[DiffLine] = &diff.lines[diff.top..(diff.top + area.height as usize).min(diff.lines.len())];
@@ -698,40 +801,69 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, syntax: boo
     let signs = visible.iter().any(|line| matches!(line.kind, LineKind::Del));
     // Numéros, signe éventuel, puis le code.
     let code_x = x0 + 2 * num_w as u16 + 2 + if signs { 2 } else { 0 };
+    let room = end.saturating_sub(code_x) as usize;
+    // Trop étroit, le code ne se replie pas.
+    let wrap = wrap && room >= MIN_WRAP;
 
-    for (i, line) in visible.iter().enumerate() {
-        let y = area.y + i as u16;
-        match line.kind {
-            LineKind::Hunk => {
-                put(buf, x0, y, end, &line.text, Style::new().fg(Color::Cyan));
-                continue;
-            }
-            LineKind::Meta => {
-                put(buf, x0, y, end, &line.text, dim.add_modifier(Modifier::ITALIC));
-                continue;
-            }
-            LineKind::Add => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(tones.add)),
-            LineKind::Del => buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(tones.del)),
-            LineKind::Ctx => {}
+    let (mut y, bottom) = (area.y, area.bottom());
+    let mut shown: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in diff.lines[diff.top..].iter().enumerate() {
+        if y >= bottom {
+            break;
         }
-        let (sign, sign_color) = match line.kind {
-            LineKind::Add => ("+", Color::LightGreen),
-            LineKind::Del => ("−", Color::LightRed),
-            _ => (" ", DIM),
+        let row = diff.top + i;
+        let title = match line.kind {
+            LineKind::Hunk => Some(Style::new().fg(Color::Cyan)),
+            LineKind::Meta => Some(dim.add_modifier(Modifier::ITALIC)),
+            _ => None,
         };
-        let numbers = format!("{} {}", number(line.old), number(line.new));
-        // Les numéros de ligne sont estompés : ils s'effacent derrière le contenu.
-        let mut x = put(buf, x0, y, end, &numbers, dim);
-        if signs {
-            x = put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
+        if let Some(style) = title {
+            put(buf, x0, y, end, &line.text, style);
+            shown.push((row, 0));
+            y += 1;
+            continue;
         }
-        put_code(buf, x + 1, y, end, line, diff.x, (&[], Color::Reset));
-        mark_finds(buf, (code_x, y, end), diff.x, diff.find.as_ref(), (diff.top + i, Side::Left));
-        if let Some(columns) = diff.select.and_then(|select| select.columns(Side::Left, diff.top + i)) {
-            mark_selection(buf, (code_x, y, end), diff.x, line, columns);
+        let (bg, sign, sign_color) = match line.kind {
+            LineKind::Add => (Some(tones.add), "+", Color::LightGreen),
+            LineKind::Del => (Some(tones.del), "−", Color::LightRed),
+            _ => (None, " ", DIM),
+        };
+        // Replié, le code ne défile plus de côté : chaque rangée reprend où finit la précédente.
+        for part in 0..parts(line, room, wrap) {
+            if y >= bottom {
+                break;
+            }
+            if let Some(bg) = bg {
+                buf.set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(bg));
+            }
+            if part == 0 {
+                let numbers = format!("{} {}", number(line.old), number(line.new));
+                // Les numéros de ligne sont estompés : ils s'effacent derrière le contenu.
+                let x = put(buf, x0, y, end, &numbers, dim);
+                if signs {
+                    put(buf, x + 1, y, end, sign, Style::new().fg(sign_color).add_modifier(Modifier::BOLD));
+                }
+            }
+            let skip = if wrap { part * room } else { diff.x };
+            put_code(buf, code_x, y, end, line, skip, (&[], Color::Reset));
+            mark_finds(buf, (code_x, y, end), skip, diff.find.as_ref(), (row, Side::Left));
+            if let Some(columns) = diff.select.and_then(|select| select.columns(Side::Left, row)) {
+                mark_selection(buf, (code_x, y, end), skip, line, columns);
+            }
+            shown.push((row, part));
+            y += 1;
         }
     }
-    Some(CodeHit { area, top: diff.top, skip: diff.x, left: code_x, right: None, lower_edge: lower_edge(buf, area) })
+    let lower_edge = lower_edge(buf, area);
+    Some(CodeHit { area, lines: shown, wrap, skip: diff.x, left: code_x, right: None, lower_edge })
+}
+
+/// Largeur de code en deçà de laquelle le retour à la ligne est abandonné.
+const MIN_WRAP: usize = 8;
+
+/// Nombre de rangées qu'occupe une ligne de code dans `room` cellules.
+fn parts(line: &DiffLine, room: usize, wrap: bool) -> usize {
+    if wrap { line.text.chars().count().div_ceil(room).max(1) } else { 1 }
 }
 
 /// Ligne de l'écran où une sélection commence à faire défiler le diff vers le
@@ -868,25 +1000,36 @@ fn draw_graph_row(
 }
 
 /// Diff en deux colonnes : l'ancienne version à gauche, la nouvelle à droite.
-fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)], tones: Tones) -> CodeHit {
-    let (lines, skip) = (diff.lines.as_slice(), diff.x);
+fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)], (tones, wrap): (Tones, bool)) -> CodeHit {
+    let lines = diff.lines.as_slice();
     let dim = Style::new().fg(DIM);
     let x0 = area.x + 1;
     let end = area.right() - 1;
     let mid = x0 + (end - x0) / 2;
-    let rows = &rows[..rows.len().min(area.height as usize)];
+    let window = &rows[..rows.len().min(area.height as usize)];
     let line = |index: u32| (index != NO_LINE).then(|| &lines[index as usize]);
-    let max_no = rows
+    let max_no = window
         .iter()
         .map(|&(l, r)| line(l).map_or(0, |d| d.old).max(line(r).map_or(0, |d| d.new)))
         .max()
         .unwrap_or(0);
     let num_w = max_no.to_string().len().max(3);
+    // De chaque côté : le numéro de ligne, une espace, puis le code.
+    let code = num_w as u16 + 1;
+    let (left_x, right_x) = (x0 + code, mid + 2 + code);
+    let (left_room, right_room) = (mid.saturating_sub(left_x) as usize, end.saturating_sub(right_x) as usize);
+    // Trop étroit, le code ne se replie pas.
+    let wrap = wrap && left_room.min(right_room) >= MIN_WRAP;
 
     // `changed` : fond d'une ligne modifiée, puis ses passages modifiés et leur fond.
     type Changed<'a> = Option<(Color, &'a [Range<usize>], Color)>;
-    // `at` : ligne de la vue et côté, pour y poser la recherche et la sélection.
-    let side = |buf: &mut Buffer, y: u16, bg_area: Rect, x: u16, end: u16, content: Option<(&DiffLine, u32)>, changed: Changed, at: (usize, Side)| {
+    // Une rangée d'un côté. `at` : ligne de la vue et côté, pour y poser la recherche
+    // et la sélection ; `part` : rang de la rangée dans une ligne repliée.
+    let side = |buf: &mut Buffer, (x, y, end): (u16, u16, u16), content: Option<(&DiffLine, u32)>, changed: Changed, at: (usize, Side), part: usize| {
+        let bg_area = match at.1 {
+            Side::Left => Rect::new(area.x, y, mid - area.x, 1),
+            Side::Right => Rect::new(mid + 1, y, area.right() - mid - 1, 1),
+        };
         let Some((line, number)) = content else {
             buf.set_style(bg_area, Style::new().bg(VOID_BG));
             return;
@@ -895,35 +1038,46 @@ fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)]
         if changed.is_some() {
             buf.set_style(bg_area, Style::new().bg(bg));
         }
-        let x = put(buf, x, y, end, &format!("{number:>num_w$}"), dim);
-        put_code(buf, x + 1, y, end, line, skip, (marks, mark_bg));
-        mark_finds(buf, (x + 1, y, end), skip, diff.find.as_ref(), at);
+        let room = end.saturating_sub(x) as usize;
+        // Replié, le code ne défile plus de côté : chaque rangée reprend où finit la précédente.
+        let skip = if wrap { part * room } else { diff.x };
+        if part == 0 {
+            put(buf, x - code, y, end, &format!("{number:>num_w$}"), dim);
+        } else if part >= parts(line, room, wrap) {
+            // L'autre côté est plus long : il ne reste ici que le fond.
+            return;
+        }
+        put_code(buf, x, y, end, line, skip, (marks, mark_bg));
+        mark_finds(buf, (x, y, end), skip, diff.find.as_ref(), at);
         if let Some(columns) = diff.select.and_then(|select| select.columns(at.1, at.0)) {
-            mark_selection(buf, (x + 1, y, end), skip, line, columns);
+            mark_selection(buf, (x, y, end), skip, line, columns);
         }
     };
 
+    let (mut y, bottom) = (area.y, area.bottom());
+    let mut shown: Vec<(usize, usize)> = Vec::new();
     for (i, &(l, r)) in rows.iter().enumerate() {
-        let y = area.y + i as u16;
+        if y >= bottom {
+            break;
+        }
+        let row = diff.top + i;
         let (left, right) = (line(l), line(r));
         if l == r
             && let Some(same) = left
         {
-            match same.kind {
-                LineKind::Hunk => {
-                    put(buf, x0, y, end, &same.text, Style::new().fg(Color::Cyan));
-                    continue;
-                }
-                LineKind::Meta => {
-                    put(buf, x0, y, end, &same.text, dim.add_modifier(Modifier::ITALIC));
-                    continue;
-                }
-                _ => {}
+            let title = match same.kind {
+                LineKind::Hunk => Some(Style::new().fg(Color::Cyan)),
+                LineKind::Meta => Some(dim.add_modifier(Modifier::ITALIC)),
+                _ => None,
+            };
+            if let Some(style) = title {
+                put(buf, x0, y, end, &same.text, style);
+                shown.push((row, 0));
+                y += 1;
+                continue;
             }
         }
         let changed = l != r;
-        let left_area = Rect::new(area.x, y, mid - area.x, 1);
-        let right_area = Rect::new(mid + 1, y, area.right() - mid - 1, 1);
         // Une ligne retirée face à celle qui la remplace : ce qui change entre les deux ressort.
         let (old_marks, new_marks) = match (left, right) {
             (Some(old), Some(new)) if changed => inline_changes(&old.text, &new.text),
@@ -931,15 +1085,21 @@ fn draw_sides(buf: &mut Buffer, area: Rect, diff: &DiffView, rows: &[(u32, u32)]
         };
         let removed = changed.then_some((tones.del, old_marks.as_slice(), tones.del_mark));
         let added = changed.then_some((tones.add, new_marks.as_slice(), tones.add_mark));
-        let row = diff.top + i;
-        side(buf, y, left_area, x0, mid, left.map(|d| (d, d.old)), removed, (row, Side::Left));
-        side(buf, y, right_area, mid + 2, end, right.map(|d| (d, d.new)), added, (row, Side::Right));
-        put(buf, mid, y, end, "│", dim);
+        // La ligne prend la hauteur du côté le plus long.
+        let height = left.map_or(1, |d| parts(d, left_room, wrap)).max(right.map_or(1, |d| parts(d, right_room, wrap)));
+        for part in 0..height {
+            if y >= bottom {
+                break;
+            }
+            side(buf, (left_x, y, mid), left.map(|d| (d, d.old)), removed, (row, Side::Left), part);
+            side(buf, (right_x, y, end), right.map(|d| (d, d.new)), added, (row, Side::Right), part);
+            put(buf, mid, y, end, "│", dim);
+            shown.push((row, part));
+            y += 1;
+        }
     }
-    // De chaque côté : le numéro de ligne, une espace, puis le code.
-    let code = num_w as u16 + 1;
-    let right = Some((mid, mid + 2 + code));
-    CodeHit { area, top: diff.top, skip, left: x0 + code, right, lower_edge: lower_edge(buf, area) }
+    let (right, lower_edge) = (Some((mid, right_x)), lower_edge(buf, area));
+    CodeHit { area, lines: shown, wrap, skip: diff.x, left: left_x, right, lower_edge }
 }
 
 /// Hiérarchie des branches : une ligne par branche, sans les commits.
@@ -1056,7 +1216,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("b h · b f", "Branch hierarchy · pick the branches of the graph"),
     ("b o · b O", "Hide the remote branches (origin) · show only them"),
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
-    ("S", "Commit style: dots or rail"),
+    ("S · w", "Commit style: dots or rail · wrap the long lines"),
     ("R", "Refresh: reload the commits, branches and tags"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),
