@@ -8,6 +8,7 @@ use anyhow::Result;
 use ratatui::layout::{Position, Rect};
 
 use crate::kit::Tool;
+use crate::kit::find::Needle;
 use crate::kit::notice::{Clipboard, Flash};
 use crate::log::diff::{DiffLine, FileEntry, LineKind, SideBySide};
 use crate::log::git::{
@@ -188,10 +189,7 @@ impl DiffView {
     /// Occurrences de `query` dans le code. Sans majuscule dans la recherche, la
     /// casse est ignorée.
     fn search(&self, query: &str) -> Vec<Hit> {
-        let exact = query.chars().any(char::is_uppercase);
-        // Caractère pour caractère : les rangs restent ceux du texte affiché.
-        let fold = |c: char| if exact { c } else { c.to_lowercase().next().unwrap_or(c) };
-        let needle: Vec<char> = query.chars().map(fold).collect();
+        let needle = Needle::new(query);
         let mut hits = Vec::new();
         if needle.is_empty() {
             return hits;
@@ -204,16 +202,7 @@ impl DiffView {
             };
             for &side in sides {
                 let Some(line) = self.code(row, side.unwrap_or(Side::Left)) else { continue };
-                let text: Vec<char> = line.text.chars().map(fold).collect();
-                let mut start = 0;
-                while start + needle.len() <= text.len() {
-                    if text[start..start + needle.len()] == needle[..] {
-                        hits.push(Hit { row, side, start, len: needle.len() });
-                        start += needle.len();
-                    } else {
-                        start += 1;
-                    }
-                }
+                hits.extend(needle.starts(&line.text).into_iter().map(|start| Hit { row, side, start, len: needle.len() }));
             }
         }
         hits

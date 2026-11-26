@@ -121,6 +121,81 @@ impl Colorizer {
     }
 }
 
+/// Où en est l'analyse à un point d'un texte, pour la reprendre de là.
+#[derive(Clone)]
+pub struct Mark(State);
+
+impl Colorizer {
+    pub fn mark(&self) -> Mark {
+        Mark(self.new.clone())
+    }
+
+    /// Reprend l'analyse où elle en était à ce point.
+    pub fn rewind(&mut self, mark: &Mark) {
+        self.old = mark.0.clone();
+        self.new = mark.0.clone();
+    }
+}
+
+/// Nombre de lignes entre deux points de reprise.
+const STEP: usize = 64;
+
+/// Teintes d'un texte entier, calculées à mesure qu'on en a besoin : seules les
+/// lignes jusqu'au bas de l'écran sont analysées. Le texte peut changer : l'analyse
+/// reprend alors du point de reprise qui précède la ligne touchée, pas du début.
+pub struct Tinter {
+    colors: Option<Colorizer>,
+    tints: Vec<Vec<Tint>>,
+    /// `marks[k]` : l'état de l'analyse avant la ligne `k * STEP`.
+    marks: Vec<Mark>,
+}
+
+impl Tinter {
+    /// Pour le fichier `path` ; sans chemin, ou sans grammaire qui lui convienne,
+    /// aucune ligne n'est colorée.
+    pub fn new(path: Option<&str>) -> Tinter {
+        Tinter { colors: path.and_then(Colorizer::for_path), tints: Vec::new(), marks: Vec::new() }
+    }
+
+    /// Nombre de lignes déjà analysées.
+    pub fn len(&self) -> usize {
+        self.tints.len()
+    }
+
+    /// La ligne `line` a changé : elle et les suivantes sont à analyser de nouveau.
+    pub fn invalidate(&mut self, line: usize) {
+        if line >= self.tints.len() {
+            return;
+        }
+        let keep = line / STEP;
+        self.tints.truncate(keep * STEP);
+        if let (Some(colors), Some(mark)) = (&mut self.colors, self.marks.get(keep)) {
+            colors.rewind(mark);
+        }
+        self.marks.truncate(keep);
+    }
+
+    /// Analyse les lignes jusqu'à la ligne `upto`, non comprise. `lines` donne
+    /// les lignes du texte à partir de la première qui n'est pas encore analysée.
+    pub fn extend<'a>(&mut self, upto: usize, lines: impl Iterator<Item = &'a str>) {
+        let Some(colors) = &mut self.colors else { return };
+        for line in lines {
+            if self.tints.len() >= upto {
+                break;
+            }
+            if self.tints.len().is_multiple_of(STEP) {
+                self.marks.push(colors.mark());
+            }
+            self.tints.push(colors.line(Flow::Both, line));
+        }
+    }
+
+    /// Teintes de la ligne `line` ; aucune si elle n'est pas analysée.
+    pub fn get(&self, line: usize) -> &[Tint] {
+        self.tints.get(line).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Première ligne de code d'un hunk : elle dit si l'on est déjà dans le PHP. Une
 /// ligne qui s'ouvre par une balise (`<?php`, `<div>`) part du HTML, comme le
 /// début du fichier ; toute autre est tenue pour du PHP.
@@ -292,5 +367,32 @@ mod tests {
     fn minified_lines_stay_plain() {
         let mut colors = Colorizer::for_path("a.js").unwrap();
         assert!(colors.line(Flow::New, &"a=1;".repeat(1000)).is_empty());
+    }
+
+    #[test]
+    fn a_text_is_tinted_on_demand_and_again_after_an_edit() {
+        let mut lines: Vec<String> = (0..200).map(|n| format!("let x{n} = {n};")).collect();
+        let mut whole = Tinter::new(Some("a.rs"));
+        whole.extend(usize::MAX, lines.iter().map(String::as_str));
+        let mut tinter = Tinter::new(Some("a.rs"));
+        tinter.extend(10, lines.iter().map(String::as_str));
+        assert_eq!(tinter.len(), 10);
+        assert!(tinter.get(150).is_empty());
+        tinter.extend(200, lines.iter().skip(tinter.len()).map(String::as_str));
+        assert!((0..200).all(|line| tinter.get(line) == whole.get(line)));
+
+        // Un commentaire s'ouvre à la ligne 130 : tout ce qui suit change de teinte.
+        lines[130] = "/* open".to_string();
+        tinter.invalidate(130);
+        assert_eq!(tinter.len(), 128);
+        tinter.extend(200, lines.iter().skip(tinter.len()).map(String::as_str));
+        let mut again = Tinter::new(Some("a.rs"));
+        again.extend(usize::MAX, lines.iter().map(String::as_str));
+        assert!((0..200).all(|line| tinter.get(line) == again.get(line)));
+        assert_ne!(tinter.get(131), whole.get(131));
+        // Sans grammaire, rien n'est coloré.
+        let mut plain = Tinter::new(Some("notes.unknown"));
+        plain.extend(5, lines.iter().map(String::as_str));
+        assert_eq!(plain.len(), 0);
     }
 }

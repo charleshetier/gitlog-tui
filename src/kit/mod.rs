@@ -1,5 +1,7 @@
 //! Tronc commun de la suite : ce que tous les outils partagent.
 
+pub mod edit;
+pub mod find;
 pub mod git;
 pub mod notice;
 pub mod paint;
@@ -15,6 +17,8 @@ pub enum Tool {
     /// `gitchange` : ce qui n'est pas encore commité, sans le graphe. Le détail
     /// est ouvert d'emblée : liste des fichiers, diff, fichier entier.
     Changes,
+    /// `gitmerge` : les fichiers en conflit, sur trois colonnes, le résultat au milieu.
+    Merge,
 }
 
 impl Tool {
@@ -23,6 +27,7 @@ impl Tool {
         match self {
             Tool::Log => "gitlog",
             Tool::Changes => "gitchange",
+            Tool::Merge => "gitmerge",
         }
     }
 }

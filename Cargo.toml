@@ -2,7 +2,7 @@
 name = "gitlogs-tui"
 version = "0.1.0"
 edition = "2024"
-description = "Outils git pour le terminal : gitlog (graphe interactif), gitchange (modifications non commitées)"
+description = "Outils git pour le terminal : gitlog (graphe interactif), gitchange (modifications non commitées), gitmerge (conflits sur trois colonnes)"
 
 # Le tronc commun est la bibliothèque ; chaque outil de la suite est un binaire.
 [[bin]]
@@ -12,6 +12,10 @@ path = "src/bin/gitlog.rs"
 [[bin]]
 name = "gitchange"
 path = "src/bin/gitchange.rs"
+
+[[bin]]
+name = "gitmerge"
+path = "src/bin/gitmerge.rs"
 
 [dependencies]
 anyhow = "1"

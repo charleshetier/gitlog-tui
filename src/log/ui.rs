@@ -12,8 +12,8 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::kit::Tool;
 use crate::kit::paint::{
     ACCENT, CARD_BG, CHIP_BG, DIM, FIND_BG, FIND_CURRENT_BG, MIN_WRAP, PANEL_BG, SEL_BG, SELECT_BG, SYNTAX_TONES, TONES,
-    Tones, VOID_BG, draw_flash, draw_help, draw_menu, draw_panel, mark_span, put, put_right, put_tinted, split_words,
-    tail, thousands, width,
+    Tones, VOID_BG, draw_find_bar, draw_flash, draw_help, draw_menu, draw_panel, draw_repo_title, find_status, mark_span,
+    put, put_right, put_tinted, split_words, tail, thousands, width,
 };
 use crate::log::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side};
 use crate::log::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
@@ -46,11 +46,6 @@ const ARROW_PLAIN: &str = "◀";
 const HEAD_NODE: &str = "◉";
 const COPY: &str = "\u{f0c5}";
 const COPY_PLAIN: &str = "⧉";
-/// Glyphe « code fork » de Font Awesome (Nerd Font), de la même famille que l'icône dossier.
-const REPO: &str = "\u{f126}";
-const REPO_PLAIN: &str = "◆";
-const FOLDER: &str = "\u{f07b}";
-const FOLDER_PLAIN: &str = "⌂";
 
 fn palette(index: u8) -> Color {
     PALETTE[index as usize % PALETTE.len()]
@@ -179,21 +174,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Titre de l'en-tête : le dossier puis le dépôt distant, chacun derrière son icône.
-/// Sans dépôt distant, le dossier tient lieu de titre. Renvoie la colonne suivante.
-/// Un clic sur l'un ou l'autre copie le chemin du dossier ou l'URL du remote.
+/// Titre de l'en-tête ; un clic sur le dossier ou sur le dépôt copie son chemin
+/// ou son URL. Renvoie la colonne suivante.
 fn draw_title(buf: &mut Buffer, app: &mut App, x: u16, y: u16, end: u16) -> u16 {
-    let bold = Style::new().add_modifier(Modifier::BOLD);
-    let (repo_icon, folder_icon) = if app.plain { (REPO_PLAIN, FOLDER_PLAIN) } else { (REPO, FOLDER) };
-    let folder_x = x;
-    let x = put(buf, x, y, end, folder_icon, Style::new().fg(DIM));
-    let x = put(buf, x + 1, y, end, &app.repo.name, bold);
-    app.hit.folder = Some(Rect::new(folder_x, y, x - folder_x, 1));
-    let Some(remote) = &app.repo.remote_name else { return x };
-    let remote_x = x + 2;
-    let x = put(buf, remote_x, y, end, repo_icon, Style::new().fg(ACCENT));
-    let x = put(buf, x + 1, y, end, remote, bold);
-    app.hit.remote = Some(Rect::new(remote_x, y, x.saturating_sub(remote_x), 1));
+    let (x, folder, remote) = draw_repo_title(buf, &app.repo, app.plain, (x, y, end));
+    (app.hit.folder, app.hit.remote) = (Some(folder), remote);
     x
 }
 
@@ -1219,13 +1204,7 @@ fn draw_picker(buf: &mut Buffer, app: &mut App, area: Rect) {
 fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
     // La recherche dans le code du diff ouvert passe devant celle des commits.
     let (label, query, editing, status) = if let Some((query, editing, current, count)) = app.code_find() {
-        let status = match (current, count) {
-            (_, 0) if query.is_empty() => String::new(),
-            (_, 0) => "no match".to_string(),
-            (Some(current), count) => format!("match {}/{}", current + 1, thousands(count)),
-            (None, 1) => "1 match".to_string(),
-            (None, count) => format!("{} matches", thousands(count)),
-        };
+        let status = find_status(query, current, count);
         ("find:".to_string(), query, editing, status)
     } else {
         let (kind, query, editing) = match (&app.prompt, &app.filter) {
@@ -1252,22 +1231,7 @@ fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
         };
         (format!("{}:", kind.label()), query, editing, status)
     };
-    let base = Style::new().bg(PANEL_BG);
-    for x in area.left()..area.right() {
-        buf[(x, area.y)].reset();
-    }
-    buf.set_style(area, base);
-    let end = area.right() - 1;
-    let text_end = put_right(buf, area.x + 1, area.y, end, &status, base.fg(DIM)).saturating_sub(2);
-    let x = put(buf, area.x + 1, area.y, text_end, &label, base.fg(ACCENT).add_modifier(Modifier::BOLD)) + 1;
-    // Une saisie plus longue que le champ garde sa fin visible, curseur compris.
-    let room = text_end.saturating_sub(x + 1) as usize;
-    let length = query.chars().count();
-    let shown: String = query.chars().skip(length.saturating_sub(room)).collect();
-    let x = put(buf, x, area.y, text_end, &shown, base.fg(Color::White));
-    if editing {
-        put(buf, x, area.y, text_end, " ", Style::new().bg(Color::Gray));
-    }
+    draw_find_bar(buf, area, &label, query, editing, &status);
 }
 
 #[cfg(test)]

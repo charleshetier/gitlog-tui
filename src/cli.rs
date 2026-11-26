@@ -11,6 +11,7 @@ use crate::kit::git::Repo;
 use crate::kit::term;
 use crate::log::app::App;
 use crate::log::keys;
+use crate::merge;
 
 const LOG_HELP: &str = "\
 gitlog: interactive git graph
@@ -57,6 +58,30 @@ Keys: ↑↓ j k move · Enter open · Esc go back · q go back, quit from the l
       n N next / previous file (diff), change (whole file)
       R read the changes again · w wrap or cut the long lines · ? all shortcuts
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
+
+const MERGE_HELP: &str = "\
+gitmerge: resolve the conflicted files of a merge, a rebase or a cherry-pick
+
+Usage: gitmerge [OPTIONS] [PATH]
+
+  PATH         repository folder (default: the current folder)
+  --plain      standard glyphs, without a Powerline or Nerd Font
+               (also: environment variable GITLOG_PLAIN=1)
+  --no-syntax  code without syntax highlighting (it needs a 24-bit terminal)
+  -h, --help   show this help
+
+Three columns: ours on the left, theirs on the right, the result in the middle.
+The changes of one side only are already in the result; a conflict waits.
+
+Keys: ↑↓ j k move · ] [ or Tab Shift+Tab next / previous conflict · } { or c C change
+      > take ours · < take theirs · the other one then adds its lines below
+      x keep the result as it is · u undo · Ctrl+R redo
+      i a I A o O or Enter edit the result, Esc back to normal mode · dd delete a line
+      n N next / previous conflicted file
+      Ctrl+S write the result to the file · S write it and stage it (git add)
+      / search the result, then n N next / previous match, Esc to clear
+      w wrap or cut the long lines · y copy the line · R read the conflicts again
+      ? all shortcuts · q quit";
 
 struct Args {
     dir: PathBuf,
@@ -122,6 +147,15 @@ fn run(tool: Tool) -> Result<()> {
             }
             term::run(&mut app)
         }
+        Tool::Merge => {
+            let mut app = merge::app::App::open(repo, args.plain, args.syntax)?;
+            // Rien à fusionner : inutile de prendre le terminal.
+            if app.files.is_empty() {
+                println!("No conflicted file in {}.", app.repo.name);
+                return Ok(());
+            }
+            term::run(&mut app)
+        }
     }
 }
 
@@ -129,5 +163,6 @@ fn help(tool: Tool) -> &'static str {
     match tool {
         Tool::Log => LOG_HELP,
         Tool::Changes => CHANGES_HELP,
+        Tool::Merge => MERGE_HELP,
     }
 }

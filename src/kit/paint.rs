@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
+use crate::kit::git::Repo;
 use crate::kit::syntax::Tint;
 
 /// Ligne sous le curseur, dans une liste comme dans le graphe.
@@ -282,4 +283,60 @@ pub fn draw_flash(buf: &mut Buffer, area: Rect, text: Option<&str>) {
         buf[(cell_x, y)].reset();
     }
     put(buf, x, y, end, &text, style);
+}
+
+/// Glyphe « code fork » de Font Awesome (Nerd Font), de la même famille que l'icône dossier.
+const REPO: &str = "\u{f126}";
+const REPO_PLAIN: &str = "◆";
+const FOLDER: &str = "\u{f07b}";
+const FOLDER_PLAIN: &str = "⌂";
+
+/// Titre de l'en-tête d'un outil : le dossier puis le dépôt distant, chacun
+/// derrière son icône. Sans dépôt distant, le dossier tient lieu de titre.
+/// Renvoie la colonne suivante et la place de chacun, pour les clics.
+pub fn draw_repo_title(buf: &mut Buffer, repo: &Repo, plain: bool, (x, y, end): (u16, u16, u16)) -> (u16, Rect, Option<Rect>) {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let (repo_icon, folder_icon) = if plain { (REPO_PLAIN, FOLDER_PLAIN) } else { (REPO, FOLDER) };
+    let folder_x = x;
+    let x = put(buf, x, y, end, folder_icon, Style::new().fg(DIM));
+    let x = put(buf, x + 1, y, end, &repo.name, bold);
+    let folder = Rect::new(folder_x, y, x - folder_x, 1);
+    let Some(remote) = &repo.remote_name else { return (x, folder, None) };
+    let remote_x = x + 2;
+    let x = put(buf, remote_x, y, end, repo_icon, Style::new().fg(ACCENT));
+    let x = put(buf, x + 1, y, end, remote, bold);
+    (x, folder, Some(Rect::new(remote_x, y, x.saturating_sub(remote_x), 1)))
+}
+
+/// Ce que dit le champ de recherche dans du code : l'occurrence où l'on se
+/// trouve et leur nombre.
+pub fn find_status(query: &str, current: Option<usize>, count: usize) -> String {
+    match (current, count) {
+        (_, 0) if query.is_empty() => String::new(),
+        (_, 0) => "no match".to_string(),
+        (Some(current), count) => format!("match {}/{}", current + 1, thousands(count)),
+        (None, 1) => "1 match".to_string(),
+        (None, count) => format!("{} matches", thousands(count)),
+    }
+}
+
+/// Champ de recherche, sur une ligne : ce qui est cherché derrière son libellé,
+/// un curseur tant que la saisie dure, et à droite ce qui a été trouvé.
+pub fn draw_find_bar(buf: &mut Buffer, area: Rect, label: &str, query: &str, editing: bool, status: &str) {
+    let base = Style::new().bg(PANEL_BG);
+    for x in area.left()..area.right() {
+        buf[(x, area.y)].reset();
+    }
+    buf.set_style(area, base);
+    let end = area.right() - 1;
+    let text_end = put_right(buf, area.x + 1, area.y, end, status, base.fg(DIM)).saturating_sub(2);
+    let x = put(buf, area.x + 1, area.y, text_end, label, base.fg(ACCENT).add_modifier(Modifier::BOLD)) + 1;
+    // Une saisie plus longue que le champ garde sa fin visible, curseur compris.
+    let room = text_end.saturating_sub(x + 1) as usize;
+    let length = query.chars().count();
+    let shown: String = query.chars().skip(length.saturating_sub(room)).collect();
+    let x = put(buf, x, area.y, text_end, &shown, base.fg(Color::White));
+    if editing {
+        put(buf, x, area.y, text_end, " ", Style::new().bg(Color::Gray));
+    }
 }
