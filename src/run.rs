@@ -1,15 +1,5 @@
-//! gitlog: interactive git graph dans le terminal.
-
-mod app;
-mod diff;
-mod git;
-mod graph;
-mod hierarchy;
-mod syntax;
-#[cfg(test)]
-mod tests;
-mod theme;
-mod ui;
+//! Lancement d'un outil de la suite : arguments, terminal, boucle d'événements,
+//! clavier et souris. Tout cela est commun à `gitlog` et à `gitchanges`.
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -29,10 +19,11 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::Position;
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, Tool};
 use crate::git::Repo;
+use crate::ui;
 
-const HELP: &str = "\
+const LOG_HELP: &str = "\
 gitlog: interactive git graph
 
 Usage: gitlog [OPTIONS] [PATH]
@@ -58,6 +49,26 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       h jump to the HEAD commit in the graph, without opening it
       w wrap or cut the long lines, in the graph and in the code";
 
+const CHANGES_HELP: &str = "\
+gitchanges: the changes of a git repository that are not committed yet
+
+Usage: gitchanges [OPTIONS] [PATH]
+
+  PATH         repository folder (default: the current folder)
+  --plain      standard glyphs, without a Powerline or Nerd Font
+               (also: environment variable GITLOG_PLAIN=1)
+  --no-syntax  diffs without syntax highlighting (it needs a 24-bit terminal)
+  -h, --help   show this help
+
+Keys: ↑↓ j k move · Enter open · Esc go back · q go back, quit from the list · 1 2 3 level
+      y copy the path of the file under the cursor
+      drag the mouse over a diff to select code: it is copied on release
+      / search the code of a diff, then n N next / previous match, Esc to clear
+      Enter on a diff opens the whole file in a floating window
+      n N next / previous file (diff), change (whole file)
+      R read the changes again · w wrap or cut the long lines · ? all shortcuts
+      ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
+
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
 const TICK: Duration = Duration::from_millis(16);
 /// Lignes défilées par cran de molette.
@@ -76,7 +87,7 @@ fn truecolor() -> bool {
     cfg!(windows) || std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit")
 }
 
-fn parse_args() -> Result<Option<Args>> {
+fn parse_args(tool: Tool) -> Result<Option<Args>> {
     let mut args = Args {
         dir: PathBuf::from("."),
         plain: std::env::var_os("GITLOG_PLAIN").is_some_and(|v| !v.is_empty() && v != "0"),
@@ -89,7 +100,8 @@ fn parse_args() -> Result<Option<Args>> {
             "-h" | "--help" => return Ok(None),
             "--plain" => args.plain = true,
             "--no-syntax" => args.syntax = false,
-            "--dump" => {
+            // Le graphe en texte : propre à gitlog.
+            "--dump" if tool == Tool::Log => {
                 let n = argv.next().and_then(|n| n.parse().ok());
                 args.dump = Some(n.context("--dump expects a number of rows")?);
             }
@@ -100,23 +112,24 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(args))
 }
 
-fn main() -> ExitCode {
-    match run() {
+/// Point d'entrée d'un outil : chaque binaire de la suite s'y réduit.
+pub fn launch(tool: Tool) -> ExitCode {
+    match run(tool) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("gitlog: {err:#}");
+            eprintln!("{}: {err:#}", tool.name());
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<()> {
-    let Some(args) = parse_args()? else {
-        println!("{HELP}");
+fn run(tool: Tool) -> Result<()> {
+    let Some(args) = parse_args(tool)? else {
+        println!("{}", if tool == Tool::Log { LOG_HELP } else { CHANGES_HELP });
         return Ok(());
     };
     let repo = Repo::open(&args.dir)?;
-    let mut app = App::new(repo, args.plain)?;
+    let mut app = App::open(repo, args.plain, tool)?;
     app.syntax = args.syntax;
     if let Some(rows) = args.dump {
         return dump(&mut app, rows);
@@ -186,7 +199,7 @@ fn handle_event(app: &mut App, event: Event) -> bool {
     }
 }
 
-fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
+pub(crate) fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return (key.code == KeyCode::Char('c')).then_some(Action::Quit);
     }

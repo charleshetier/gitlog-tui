@@ -701,10 +701,21 @@ const MAX_UNTRACKED: usize = 300;
 /// Taille au-delà de laquelle les lignes d'un fichier non suivi ne sont pas comptées.
 const MAX_COUNTED_BYTES: u64 = 2_000_000;
 
+/// Ce à quoi se compare ce qui n'est pas commité : HEAD, ou l'arbre vide tant
+/// que le dépôt n'a aucun commit.
+fn changes_base(root: &Path) -> String {
+    if output(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+        return "HEAD".to_string();
+    }
+    let empty = output(root, &["hash-object", "-t", "tree", "/dev/null"]);
+    empty.map_or_else(|_| "HEAD".to_string(), |hash| hash.trim().to_string())
+}
+
 /// Ce qui n'est pas encore commité : les fichiers suivis qui diffèrent de HEAD,
 /// indexés ou non, puis les fichiers non suivis, marqués `?`.
 fn list_changes(root: &Path) -> Result<Vec<FileEntry>> {
-    let tracked = output(root, &["diff", "-M", "--raw", "--numstat", "--no-abbrev", "HEAD"])?;
+    let base = changes_base(root);
+    let tracked = output(root, &["diff", "-M", "--raw", "--numstat", "--no-abbrev", base.as_str()])?;
     let mut files = parse_files(&tracked);
     let untracked = output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     for path in untracked.split('\0').filter(|path| !path.is_empty()).take(MAX_UNTRACKED) {
@@ -856,6 +867,7 @@ fn stream_diff(root: &Path, id: u64, req: &FileReq, latest: &AtomicU64, tx: &Sen
     // Un contexte plus long que tout fichier : le diff porte alors le fichier entier.
     let context = if req.full { "-U1000000" } else { "-U3" };
     let hex = req.oid.to_hex();
+    let base = if req.oid.is_worktree() { changes_base(root) } else { String::new() };
     let mut cmd = git(root);
     if !req.oid.is_worktree() {
         cmd.args(SHOW_ARGS).args(["--no-ext-diff", context, hex.as_str(), "--"]).args(&req.paths);
@@ -864,7 +876,7 @@ fn stream_diff(root: &Path, id: u64, req: &FileReq, latest: &AtomicU64, tx: &Sen
         cmd.args(["diff", "--no-index", "--no-color", "--no-ext-diff", context, "--", "/dev/null"]).args(&req.paths);
     } else {
         // Ce qui n'est pas commité : le dossier de travail, index compris, face à HEAD.
-        cmd.args(["diff", "-M", "--no-color", "--no-ext-diff", context, "HEAD", "--"]).args(&req.paths);
+        cmd.args(["diff", "-M", "--no-color", "--no-ext-diff", context, base.as_str(), "--"]).args(&req.paths);
     }
     let spawned = cmd
         .stdout(Stdio::piped())

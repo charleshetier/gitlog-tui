@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side};
+use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side, Tool};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -202,7 +202,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Colonne du séparateur vertical quand le volet est ouvert. Le diff en deux
     // colonnes prend les deux tiers de la largeur.
     let split_at = if two_way { (area.width / 3).max(24).min(area.width / 2) } else { area.width / 2 };
-    let divider = (app.pane.is_some() && app.hierarchy.is_none()).then(|| area.x + split_at);
+    // `gitchanges` n'a pas de graphe : le détail prend toute la largeur.
+    let changes = app.tool == Tool::Changes;
+    let divider = (app.pane.is_some() && app.hierarchy.is_none() && !changes).then(|| area.x + split_at);
 
     for x in area.left()..area.right() {
         put(buf, x, rule_top, area.right(), "─", dim);
@@ -219,18 +221,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_flash(buf, app, area);
         draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
         if app.help {
-            draw_help(buf, area);
+            draw_help(buf, area, app.tool);
         }
         return;
     }
 
-    let left_w = divider.map_or(area.width, |x| x - area.x);
+    // En-tête du dépôt à gauche, puis celui du détail ; sans graphe, ils se partagent la ligne.
+    let left_w = if changes { area.width / 2 } else { divider.map_or(area.width, |x| x - area.x) };
     draw_header(buf, app, Rect::new(area.x, area.y, left_w, 1));
-    draw_graph(buf, app, Rect::new(area.x, body_y, left_w, body_h));
-    if let Some(x) = divider {
-        let pane_w = area.right() - x - 1;
-        draw_pane_header(buf, app, Rect::new(x + 1, area.y, pane_w, 1));
-        let body = Rect::new(x + 1, body_y, pane_w, body_h);
+    if !changes {
+        draw_graph(buf, app, Rect::new(area.x, body_y, left_w, body_h));
+    }
+    let detail = if changes { Some((area.x + left_w, area.x)) } else { divider.map(|x| (x + 1, x + 1)) };
+    if let Some((header_x, body_x)) = detail {
+        draw_pane_header(buf, app, Rect::new(header_x, area.y, area.right() - header_x, 1));
+        let body = Rect::new(body_x, body_y, area.right() - body_x, body_h);
         app.hit.pane = body;
         if app.depth() >= 3 {
             draw_diff(buf, app, body);
@@ -250,7 +255,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
     if app.help {
-        draw_help(buf, area);
+        draw_help(buf, area, app.tool);
     }
 }
 
@@ -287,6 +292,8 @@ fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
     } else {
         format!("{n}+ commits")
     };
+    // Sans graphe, il n'y a pas de commits à compter.
+    let count = if app.tool == Tool::Changes { String::new() } else { count };
     let count_x = put_right(buf, area.x + 10, area.y, end, &count, dim);
 
     let text_end = count_x.saturating_sub(2);
@@ -584,7 +591,10 @@ fn draw_pane_header(buf: &mut Buffer, app: &mut App, area: Rect) {
     let depth = app.depth();
     let end = area.right() - 1;
 
-    // Index de profondeur : seuls les niveaux atteints, le courant surligné.
+    // Index de profondeur : seuls les niveaux atteints, le courant surligné. Ils
+    // se comptent à partir du premier niveau de l'outil.
+    let shift = app.level_shift();
+    let depth = depth.saturating_sub(shift).max(1);
     let chips_w = u16::from(depth) * 4 - 1;
     let chips_x = end.saturating_sub(chips_w).max(area.x);
     for level in 1..=depth {
@@ -607,8 +617,11 @@ fn draw_pane_header(buf: &mut Buffer, app: &mut App, area: Rect) {
             let room = title_end.saturating_sub(area.x + 1);
             put(buf, area.x + 1, area.y, title_end, &tail(path, room), bold);
         }
+        // Dans `gitchanges`, l'encadré de la liste porte déjà ce titre.
         _ if pane.oid.is_worktree() => {
-            put(buf, area.x + 1, area.y, title_end, "Uncommitted changes", bold);
+            if app.tool == Tool::Log {
+                put(buf, area.x + 1, area.y, title_end, "Uncommitted changes", bold);
+            }
         }
         _ => {
             let x = put(buf, area.x + 1, area.y, title_end, &format!("Commit {}", pane.oid.short()), bold);
@@ -654,6 +667,10 @@ fn draw_files(buf: &mut Buffer, app: &mut App, area: Rect) {
         }
         FilesState::Ready(files) => files,
     };
+    if files.is_empty() && pane.oid.is_worktree() {
+        put(buf, x0, area.y + 2, end, "No changes: the working tree matches HEAD.", dim);
+        return;
+    }
     let added: u32 = files.iter().filter_map(|f| f.added).sum();
     let deleted: u32 = files.iter().filter_map(|f| f.deleted).sum();
     let plural = if files.len() > 1 { "s" } else { "" };
@@ -1229,6 +1246,33 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Drag on a diff", "Select code: it is copied when the button is released"),
 ];
 
+/// Raccourcis de `gitchanges` : ceux de `gitlog` qui ne tiennent pas au graphe.
+const CHANGES_SHORTCUTS: &[(&str, &str)] = &[
+    ("", "Navigation"),
+    ("↑ ↓  j k", "Move the selection, scroll a diff"),
+    ("PgUp PgDn", "Move by one page"),
+    ("g G  Home End", "Jump to the first / last item"),
+    ("Enter", "Open the file diff, then the whole file"),
+    ("n N", "Next / previous file (diff) or change (whole file)"),
+    ("/", "Search the code of a diff; then n N for the matches"),
+    ("← →", "Scroll a diff sideways"),
+    ("1 2 3", "Go to a level: files, diff, whole file"),
+    ("q  Esc", "Go back one level, leave a search; q quits from the files"),
+    ("", ""),
+    ("", "Actions"),
+    ("y", "Copy the path of the file under the cursor"),
+    ("w", "Wrap or cut the long lines"),
+    ("R", "Refresh: read the changes again"),
+    ("?", "Show or hide this panel"),
+    ("Ctrl+C", "Quit"),
+    ("", ""),
+    ("", "Mouse"),
+    ("Click", "Open a file"),
+    ("Click header", "On the folder: copy its path; on the repo: its URL"),
+    ("Wheel", "Scroll the list or the diff"),
+    ("Drag on a diff", "Select code: it is copied when the button is released"),
+];
+
 /// Cadre d'un panneau flottant : fond uni, titre en haut, rappel de fermeture en bas.
 fn draw_panel(buf: &mut Buffer, panel: Rect, title: &str, close: &str) {
     if panel.is_empty() {
@@ -1434,22 +1478,23 @@ fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
 }
 
 /// Panneau flottant des raccourcis, centré par-dessus la vue courante.
-fn draw_help(buf: &mut Buffer, area: Rect) {
-    let key_w = SHORTCUTS.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
-    let text_w = SHORTCUTS
+fn draw_help(buf: &mut Buffer, area: Rect, tool: Tool) {
+    let shortcuts = if tool == Tool::Changes { CHANGES_SHORTCUTS } else { SHORTCUTS };
+    let key_w = shortcuts.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
+    let text_w = shortcuts
         .iter()
         .map(|(keys, text)| if keys.is_empty() { width(text) } else { key_w + 2 + width(text) })
         .max()
         .unwrap_or(0);
     let w = (text_w + 6).min(area.width);
-    let h = (SHORTCUTS.len() as u16 + 2).min(area.height);
+    let h = (shortcuts.len() as u16 + 2).min(area.height);
     let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
     draw_panel(buf, panel, " Keyboard shortcuts ", " ? or Esc to close ");
     let base = Style::new().bg(PANEL_BG);
     let (left, right, top) = (panel.x, panel.right() - 1, panel.y);
 
     let x0 = left + 3;
-    for (i, (keys, text)) in SHORTCUTS.iter().enumerate().take(h.saturating_sub(2) as usize) {
+    for (i, (keys, text)) in shortcuts.iter().enumerate().take(h.saturating_sub(2) as usize) {
         let y = top + 1 + i as u16;
         if keys.is_empty() {
             put(buf, x0, y, right, text, base.fg(Color::White).add_modifier(Modifier::BOLD));

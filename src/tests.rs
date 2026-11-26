@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use crate::app::{Action, App, FilesState, HierState, NodeStyle};
+use crate::app::{Action, App, FilesState, HierState, NodeStyle, Tool};
 use crate::git::Repo;
 use crate::ui;
 
@@ -268,7 +268,7 @@ fn copy_step_and_help_shortcuts() {
     // Au clavier : n pour le suivant, N (Maj+n) pour le précédent ; p n'est plus une touche.
     {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: char, modifiers| crate::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
+        let key = |c: char, modifiers| crate::run::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
         assert!(matches!(key('n', KeyModifiers::NONE), Some(Action::Step(1))));
         assert!(matches!(key('N', KeyModifiers::SHIFT), Some(Action::Step(-1))));
         assert!(key('p', KeyModifiers::NONE).is_none());
@@ -867,6 +867,121 @@ fn remote_branches_are_shortened_and_hidden() {
     wait(&mut app, "toutes", |app| app.log_done);
     let view = screen(&mut app, 110, 12);
     assert!(view.contains("&origin") && !view.contains("no remotes"), "{view}");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gitchanges_shows_the_uncommitted_changes() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = make_repo("changes");
+    // Un fichier suivi modifié, un autre indexé, un fichier non suivi.
+    std::fs::write(dir.join("a.txt"), "un\ndeux modifié\nsix\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "branche, puis indexé\n").unwrap();
+    git(&dir, &["add", "b.txt"]);
+    std::fs::write(dir.join("nouveau.txt"), "tout neuf\n").unwrap();
+
+    let mut app = App::open(Repo::open(&dir).unwrap(), true, Tool::Changes).unwrap();
+    let files_ready = |app: &App| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_)));
+    let diff_done = |app: &App| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done);
+    let key = |app: &App, c: char| crate::run::on_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    wait(&mut app, "fichiers", files_ready);
+
+    // Pas de graphe : la liste des fichiers d'emblée, sur toute la largeur, au niveau 1.
+    let view = screen(&mut app, 110, 14);
+    let lines: Vec<&str> = view.lines().collect();
+    assert!(lines[0].contains("HEAD on main") && lines[0].trim_end().ends_with(" 1"), "{view}");
+    assert!(!lines[0].contains("commit") && !view.contains("Merge de feature") && !view.contains('●'), "{view}");
+    assert!(lines[2].starts_with(" Uncommitted changes") && lines[4].contains("3 files changed"), "{view}");
+    assert!(lines[5].contains("a.txt") && lines[6].contains("b.txt") && lines[7].contains("nouveau.txt"), "{view}");
+    assert!(lines.iter().all(|line| !line.contains('│')), "{view}");
+    assert_eq!(app.store.len(), 0);
+
+    // Ce qui tient au graphe n'a pas d'effet : recherche, branches, HEAD, style.
+    for c in ['s', 'b', 'h', 'S', 'n', 'N'] {
+        let action = key(&app, c).unwrap();
+        app.apply(action);
+    }
+    assert!(app.prompt.is_none() && app.hierarchy.is_none() && app.picker.is_none() && app.depth() == 2);
+    // Échap ne sort pas de la liste : c'est `q` qui quitte.
+    app.apply(Action::Back { quit: false });
+    assert!(!app.should_quit && app.pane.is_some());
+
+    // Niveau 2 : le diff du fichier, en deux colonnes ; niveau 3 : le fichier entier.
+    app.apply(Action::Open);
+    wait(&mut app, "diff", diff_done);
+    let view = screen(&mut app, 110, 14);
+    assert!(view.lines().next().unwrap().trim_end().ends_with(" 1   2") && view.contains("deux modifié"), "{view}");
+    assert!(view.contains("a.txt") && view.contains('│'), "{view}");
+    app.apply(Action::Open);
+    wait(&mut app, "fichier entier", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.done));
+    assert_eq!(app.depth(), 4);
+    assert!(screen(&mut app, 110, 14).lines().next().unwrap().trim_end().ends_with(" 1   2   3"));
+    // Les touches de niveau suivent ceux de l'outil : 1 la liste, 2 le diff, 3 le fichier.
+    app.apply(Action::GoLevel(2));
+    assert_eq!(app.depth(), 3);
+    app.apply(Action::GoLevel(3));
+    assert_eq!(app.depth(), 4);
+    app.apply(Action::GoLevel(1));
+    assert!(app.depth() == 2 && app.pane.is_some());
+    // `n` passe au fichier suivant depuis un diff : le fichier indexé, puis le fichier non suivi.
+    app.apply(Action::GoLevel(2));
+    wait(&mut app, "diff", diff_done);
+    app.apply(Action::Step(1));
+    wait(&mut app, "diff", diff_done);
+    assert!(screen(&mut app, 110, 14).contains("branche, puis indexé"));
+    app.apply(Action::Step(1));
+    wait(&mut app, "diff", diff_done);
+    assert!(screen(&mut app, 110, 14).contains("tout neuf"));
+
+    // `R` relit les modifications : un fichier remis en l'état quitte la liste.
+    git(&dir, &["checkout", "-q", "--", "a.txt"]);
+    app.apply(Action::Refresh);
+    assert_eq!(app.flash(), Some("Refreshed"));
+    wait(&mut app, "fichiers", files_ready);
+    let view = screen(&mut app, 110, 14);
+    assert!(view.contains("2 files changed") && !view.contains("a.txt") && app.store.len() == 0, "{view}");
+    // Plus rien à commiter : la liste le dit.
+    git(&dir, &["checkout", "-q", "--", "b.txt"]);
+    git(&dir, &["reset", "-q", "--hard"]);
+    std::fs::remove_file(dir.join("nouveau.txt")).unwrap();
+    app.apply(Action::Refresh);
+    wait(&mut app, "fichiers", files_ready);
+    assert!(screen(&mut app, 110, 14).contains("No changes: the working tree matches HEAD."));
+    app.apply(Action::Open);
+    assert_eq!(app.depth(), 2);
+
+    // L'aide ne garde que ce qui vaut ici ; `q` quitte depuis la liste.
+    app.apply(Action::ToggleHelp);
+    let help = screen(&mut app, 110, 30);
+    assert!(help.contains("Go to a level: files, diff, whole file") && !help.contains("Branch hierarchy"), "{help}");
+    app.apply(Action::ToggleHelp);
+    app.apply(Action::Back { quit: true });
+    assert!(app.should_quit);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gitchanges_works_before_the_first_commit() {
+    let dir = std::env::temp_dir().join(format!("gitlog-test-unborn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("indexé.txt"), "premier\n").unwrap();
+    git(&dir, &["add", "."]);
+    std::fs::write(dir.join("libre.txt"), "second\n").unwrap();
+
+    let mut app = App::open(Repo::open(&dir).unwrap(), true, Tool::Changes).unwrap();
+    wait(&mut app, "fichiers", |app| app.pane.as_ref().is_some_and(|p| !matches!(p.files, FilesState::Loading)));
+    let view = screen(&mut app, 110, 12);
+    assert!(view.contains("2 files changed") && view.contains("indexé.txt") && view.contains("libre.txt"), "{view}");
+    app.apply(Action::Open);
+    wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    assert!(screen(&mut app, 110, 12).contains("premier"));
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);
