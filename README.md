@@ -33,6 +33,8 @@ Press `?` inside `gitlog` for the list of shortcuts, or run `gitlog --help`.
 
 Drag the mouse over the code of a diff to select it: the text is copied to the clipboard when the button is released.
 
+Press `h` in the graph to jump to the HEAD commit, without opening it.
+
 Press `b` for the branch commands: `b` `f` opens the list of branches, to pick with `Space` the ones the graph shows (`a` checks all or none, `/` searches the list, `Enter` applies); `b` `o` shows or hides the remote branches, `b` `O` shows the remote branches only; `b` `h` opens the branch hierarchy.
 
 Press `/` on a diff to search its code. The matches follow the typing; `Enter` keeps the search, then `n` and `N` go to the next and previous match, and `Esc` clears it. The case is ignored unless the search has a capital letter.

@@ -469,6 +469,8 @@ pub enum Action {
     /// Relit le dépôt : branche courante, refs et historique.
     Refresh,
     /// Affiche ou masque les étiquettes des branches distantes.
+    /// `h` : amène le curseur sur le commit de HEAD, sans l'ouvrir.
+    GotoHead,
     /// `b` : ouvre le sous-menu des branches.
     BranchMenu,
     /// `b` `o` : montre ou cache les branches distantes dans le graphe.
@@ -813,6 +815,24 @@ impl App {
         self.selected = row;
         if row < self.top || row >= self.top + self.graph_height.max(1) {
             self.top = row.saturating_sub(self.graph_height / 3);
+        }
+    }
+
+    /// `h` : dans le graphe, amène le curseur sur le commit de HEAD et la vue
+    /// jusqu'à lui, en chargeant l'historique s'il le faut. Le commit n'est pas ouvert.
+    fn goto_head(&mut self) {
+        let head = self.labels.iter().find(|(_, labels)| labels.iter().any(|label| label.is_head));
+        let Some(oid) = head.map(|(oid, _)| *oid) else {
+            return self.set_flash("No HEAD commit");
+        };
+        match self.store.find(&oid, 0) {
+            Some(row) => self.show_row(row),
+            // Une recherche ou le choix des branches peuvent l'avoir écarté.
+            None if self.log_done => self.set_flash("HEAD is not in the graph"),
+            None => {
+                self.goto = Some((oid, self.store.len()));
+                self.want_all = true;
+            }
         }
     }
 
@@ -1696,6 +1716,11 @@ impl App {
                 }
             }
             Action::Find => self.open_find(),
+            Action::GotoHead => {
+                if self.pane.is_none() {
+                    self.goto_head();
+                }
+            }
             Action::ScrollGraph(delta) => {
                 self.top = self
                     .top

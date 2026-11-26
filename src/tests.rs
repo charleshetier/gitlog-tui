@@ -873,6 +873,50 @@ fn remote_branches_are_shortened_and_hidden() {
 }
 
 #[test]
+fn h_jumps_to_head_without_opening_it() {
+    let dir = make_repo("goto-head");
+    // HEAD loin du haut : une branche plus récente, avec de quoi remplir l'écran.
+    git(&dir, &["checkout", "-q", "-b", "longue"]);
+    for n in 1..=30 {
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", &format!("Suite {n}")]);
+    }
+    git(&dir, &["checkout", "-q", "main"]);
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    let view = screen(&mut app, 110, 12);
+    assert!(view.contains("Suite 30") && !view.contains("HEAD → main"), "{view}");
+
+    // Le curseur va sur le commit de HEAD, la vue le suit, et rien ne s'ouvre.
+    app.apply(Action::GotoHead);
+    let view = screen(&mut app, 110, 12);
+    assert!(view.contains("HEAD → main  Merge de feature"), "{view}");
+    assert_eq!((app.selected, app.depth()), (30, 1));
+    assert!(app.top > 0 && app.pane.is_none());
+    // Déjà à l'écran : le curseur y revient sans que la vue bouge.
+    let top = app.top;
+    app.apply(Action::Move(2));
+    app.apply(Action::GotoHead);
+    assert_eq!((app.selected, app.top), (30, top));
+
+    // Un commit ouvert n'est pas quitté pour autant.
+    app.apply(Action::Top);
+    app.apply(Action::Open);
+    app.apply(Action::GotoHead);
+    assert_eq!((app.depth(), app.selected), (2, 0));
+    app.apply(Action::Back { quit: false });
+    // HEAD écarté du graphe par le choix des branches : un message le dit.
+    git(&dir, &["update-ref", "refs/remotes/origin/vieux", "v0.1.0"]);
+    app.apply(Action::Refresh);
+    app.apply(Action::OnlyRemotes);
+    wait(&mut app, "distantes seules", |app| app.log_done && !app.stale);
+    app.apply(Action::GotoHead);
+    assert_eq!(app.flash(), Some("HEAD is not in the graph"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn branches_of_the_graph_are_chosen() {
     let dir = make_repo("branches");
     // origin/main suit main, puis main avance seule ; origin/extra n'existe que chez origin.

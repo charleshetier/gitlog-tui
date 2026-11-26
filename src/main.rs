@@ -54,7 +54,8 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       S commit style · R refresh · ? all shortcuts
       b then h branch hierarchy · f pick the branches of the graph
              o show or hide the remote branches (origin) · O remote branches only
-      ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
+      ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
+      h jump to the HEAD commit in the graph, without opening it";
 
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
 const TICK: Duration = Duration::from_millis(16);
@@ -226,6 +227,7 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Action::Open,
         KeyCode::Left => Action::Horizontal(-4),
         KeyCode::Right => Action::Horizontal(4),
+        KeyCode::Char('h') => Action::GotoHead,
         KeyCode::Char('b') => Action::BranchMenu,
         KeyCode::Char('s') => Action::Search,
         KeyCode::Char('/') => Action::Find,
