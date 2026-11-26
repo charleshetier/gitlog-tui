@@ -1,11 +1,10 @@
 //! Analyse des sorties de `git show` : liste des fichiers d'un commit et diff unifié.
 
+pub use crate::kit::syntax::{Flow, TAB_WIDTH, Tint};
 use std::ops::Range;
 
 /// Longueur maximale conservée pour une ligne de diff (fichiers minifiés).
 const MAX_LINE_CHARS: usize = 2000;
-/// Largeur d'une tabulation à l'affichage.
-pub const TAB_WIDTH: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -60,9 +59,6 @@ pub enum LineKind {
     Meta,
 }
 
-/// Segment d'une ligne colorée : nombre de caractères et teinte RVB (`None` : la
-/// couleur de texte du terminal).
-pub type Tint = (u16, Option<[u8; 3]>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
@@ -459,5 +455,18 @@ mod side_by_side_tests {
     fn no_newline_marker_keeps_the_pair() {
         use LineKind::*;
         assert_eq!(pair(&[Del, Meta, Add]), [(0, 2), (1, 1)]);
+    }
+}
+
+impl LineKind {
+    /// Version du fichier que la ligne fait avancer dans la coloration ; `None`
+    /// pour ce qui n'est pas du code.
+    pub fn flow(self) -> Option<Flow> {
+        match self {
+            LineKind::Add => Some(Flow::New),
+            LineKind::Del => Some(Flow::Old),
+            LineKind::Ctx => Some(Flow::Both),
+            LineKind::Hunk | LineKind::Meta => None,
+        }
     }
 }

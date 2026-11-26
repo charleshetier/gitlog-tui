@@ -112,15 +112,14 @@ pub fn vscode_dark() -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::LineKind;
-    use crate::syntax::Colorizer;
+    use crate::kit::syntax::{Colorizer, Flow};
 
     /// Teinte de `word` dans la dernière ligne de `source` ; `PLAIN` sans teinte.
     fn tint(file: &str, source: &str, word: &str) -> u32 {
         let mut colors = Colorizer::for_path(file).unwrap();
         let (mut tints, mut last) = (Vec::new(), "");
         for line in source.lines() {
-            (tints, last) = (colors.line(LineKind::Ctx, line), line);
+            (tints, last) = (colors.line(Flow::Both, line), line);
         }
         let byte = last.find(word).unwrap_or_else(|| panic!("« {word} » absent de « {last} »"));
         let at = last[..byte].chars().count();

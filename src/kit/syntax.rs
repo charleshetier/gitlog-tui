@@ -6,14 +6,29 @@ use std::sync::LazyLock;
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, Theme};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
-use crate::diff::{LineKind, TAB_WIDTH, Tint};
+/// Largeur d'une tabulation à l'affichage.
+pub const TAB_WIDTH: usize = 4;
+
+/// Segment d'une ligne colorée : nombre de caractères et teinte RVB (`None` : la
+/// couleur de texte du terminal).
+pub type Tint = (u16, Option<[u8; 3]>);
+
+/// Version d'un fichier qu'une ligne fait avancer. Un diff en suit deux, l'ancienne
+/// et la nouvelle ; un texte seul n'en a qu'une, que ses lignes font avancer ensemble.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Old,
+    New,
+    Both,
+}
+
 
 /// Au-delà, la ligne (fichier minifié) reste sans couleur : l'analyser coûterait trop.
 const MAX_BYTES: usize = 1000;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 /// Les teintes du thème sombre de VS Code : chacune reste lisible sur les fonds du diff.
-static THEME: LazyLock<Theme> = LazyLock::new(crate::theme::vscode_dark);
+static THEME: LazyLock<Theme> = LazyLock::new(crate::kit::theme::vscode_dark);
 
 /// Où en est l'analyse d'une version du fichier : elle se poursuit d'une ligne à l'autre.
 #[derive(Clone, PartialEq)]
@@ -66,8 +81,9 @@ impl Colorizer {
         self.new = self.start.clone();
     }
 
-    /// Teintes d'une ligne du diff, `text` étant son contenu brut, sans son signe.
-    pub fn line(&mut self, kind: LineKind, text: &str) -> Vec<Tint> {
+    /// Teintes d'une ligne, `text` étant son contenu brut. `flow` dit quelle
+    /// version du fichier elle fait avancer.
+    pub fn line(&mut self, flow: Flow, text: &str) -> Vec<Tint> {
         if text.len() > MAX_BYTES {
             return Vec::new();
         }
@@ -79,16 +95,16 @@ impl Colorizer {
             source = source.replacen('#', " ", 1);
         }
         let inside = self.inside.as_ref();
-        match kind {
-            LineKind::Add => {
+        match flow {
+            Flow::New => {
                 settle(&mut self.new, inside, text);
                 paint(&mut self.new, &self.highlighter, &source)
             }
-            LineKind::Del => {
+            Flow::Old => {
                 settle(&mut self.old, inside, text);
                 paint(&mut self.old, &self.highlighter, &source)
             }
-            LineKind::Ctx => {
+            Flow::Both => {
                 settle(&mut self.old, inside, text);
                 settle(&mut self.new, inside, text);
                 // Une ligne commune fait avancer les deux versions.
@@ -101,7 +117,6 @@ impl Colorizer {
                 }
                 tints
             }
-            LineKind::Hunk | LineKind::Meta => Vec::new(),
         }
     }
 }
@@ -176,7 +191,7 @@ mod tests {
     #[test]
     fn tints_cover_the_displayed_text() {
         let mut colors = Colorizer::for_path("a.rs").unwrap();
-        let tints = colors.line(LineKind::Ctx, "\tlet answer = \"forty-two\"; // why");
+        let tints = colors.line(Flow::Both, "\tlet answer = \"forty-two\"; // why");
         // La tabulation compte pour quatre caractères, comme à l'affichage.
         assert_eq!(chars(&tints), 4 + "let answer = \"forty-two\"; // why".chars().count());
         let distinct: std::collections::HashSet<_> = tints.iter().filter_map(|&(_, color)| color).collect();
@@ -186,24 +201,24 @@ mod tests {
     #[test]
     fn a_comment_continues_on_the_next_line() {
         let mut colors = Colorizer::for_path("a.rs").unwrap();
-        let code = colors.line(LineKind::Ctx, "let x = 1;");
-        colors.line(LineKind::Ctx, "/* opened");
-        let inside = colors.line(LineKind::Ctx, "let x = 1;");
+        let code = colors.line(Flow::Both, "let x = 1;");
+        colors.line(Flow::Both, "/* opened");
+        let inside = colors.line(Flow::Both, "let x = 1;");
         assert!(code.len() > 1);
         assert_eq!(inside.len(), 1, "one tint, the comment's: {inside:?}");
         // Un nouveau hunk repart d'un état neuf.
         colors.reset();
-        assert_eq!(colors.line(LineKind::Ctx, "let x = 1;"), code);
+        assert_eq!(colors.line(Flow::Both, "let x = 1;"), code);
     }
 
     #[test]
     fn removed_lines_do_not_leak_into_added_ones() {
         let mut colors = Colorizer::for_path("a.rs").unwrap();
-        let code = colors.line(LineKind::Ctx, "let x = 1;");
-        colors.line(LineKind::Del, "/* removed opening");
-        assert_eq!(colors.line(LineKind::Add, "let x = 1;"), code);
+        let code = colors.line(Flow::Both, "let x = 1;");
+        colors.line(Flow::Old, "/* removed opening");
+        assert_eq!(colors.line(Flow::New, "let x = 1;"), code);
         // L'ancienne version, elle, est toujours dans le commentaire.
-        assert_eq!(colors.line(LineKind::Del, "let x = 1;").len(), 1);
+        assert_eq!(colors.line(Flow::Old, "let x = 1;").len(), 1);
     }
 
     #[test]
@@ -211,23 +226,23 @@ mod tests {
         let tinted = |tints: &[Tint]| tints.iter().filter_map(|&(_, color)| color).collect::<std::collections::HashSet<_>>();
         // Au milieu d'un fichier, sans la balise `<?php` : du PHP quand même.
         let mut colors = Colorizer::for_path("src/Entity/DataSet.php").unwrap();
-        let code = colors.line(LineKind::Ctx, "        return $this->nature === null ? 'none' : 42;");
+        let code = colors.line(Flow::Both, "        return $this->nature === null ? 'none' : 42;");
         assert!(tinted(&code).len() >= 4, "keyword, variable, string, number: {code:?}");
         // Une ligne vide en tête de hunk ne décide de rien ; les deux versions suivent.
         colors.reset();
-        assert!(colors.line(LineKind::Ctx, "").is_empty());
-        assert_eq!(colors.line(LineKind::Del, "        return $this->nature === null ? 'none' : 42;"), code);
-        assert_eq!(colors.line(LineKind::Add, "        return $this->nature === null ? 'none' : 42;"), code);
+        assert!(colors.line(Flow::Both, "").is_empty());
+        assert_eq!(colors.line(Flow::Old, "        return $this->nature === null ? 'none' : 42;"), code);
+        assert_eq!(colors.line(Flow::New, "        return $this->nature === null ? 'none' : 42;"), code);
         // Le début du fichier : la balise ouvre le PHP, sans être lue comme du code.
         colors.reset();
-        let tag = colors.line(LineKind::Ctx, "<?php");
+        let tag = colors.line(Flow::Both, "<?php");
         assert_eq!(tag.len(), 1, "{tag:?}");
-        assert_eq!(colors.line(LineKind::Ctx, "        return $this->nature === null ? 'none' : 42;"), code);
+        assert_eq!(colors.line(Flow::Both, "        return $this->nature === null ? 'none' : 42;"), code);
         // Un hunk de gabarit qui s'ouvre sur une balise reste du HTML.
         colors.reset();
         let mut html = Colorizer::for_path("page.html").unwrap();
         let line = "<div class=\"card\">";
-        assert_eq!(colors.line(LineKind::Ctx, line), html.line(LineKind::Ctx, line));
+        assert_eq!(colors.line(Flow::Both, line), html.line(Flow::Both, line));
         // Les autres langages ne changent pas.
         assert!(Colorizer::for_path("a.rs").unwrap().inside.is_none());
     }
@@ -235,28 +250,28 @@ mod tests {
     #[test]
     fn a_php_attribute_is_not_a_comment() {
         let mut colors = Colorizer::for_path("a.php").unwrap();
-        let comment = colors.line(LineKind::Ctx, "    # a note about ['default' => false]");
+        let comment = colors.line(Flow::Both, "    # a note about ['default' => false]");
         assert_eq!(comment.iter().filter(|(_, color)| color.is_some()).count(), 1, "one tint: {comment:?}");
         // Un attribut est coloré comme du code, sur toute la longueur de la ligne.
         let line = "    #[ORM\\Column(options: ['default' => false])]";
-        let attribute = colors.line(LineKind::Ctx, line);
+        let attribute = colors.line(Flow::Both, line);
         assert_eq!(chars(&attribute), line.chars().count());
         let tinted: std::collections::HashSet<_> = attribute.iter().filter_map(|&(_, color)| color).collect();
         assert!(tinted.len() >= 3 && !tinted.contains(&comment[1].1.unwrap()), "{attribute:?}");
         // La ligne suivante se lit comme si l'attribut n'était pas là.
-        let after = colors.line(LineKind::Ctx, "    private bool $mvt = false;");
+        let after = colors.line(Flow::Both, "    private bool $mvt = false;");
         colors.reset();
-        assert_eq!(colors.line(LineKind::Ctx, "    private bool $mvt = false;"), after);
+        assert_eq!(colors.line(Flow::Both, "    private bool $mvt = false;"), after);
         // Ailleurs, `#[` reste ce qu'en dit la grammaire.
         let mut rust = Colorizer::for_path("a.rs").unwrap();
-        assert!(rust.line(LineKind::Ctx, "#[derive(Debug)]").len() > 1);
+        assert!(rust.line(Flow::Both, "#[derive(Debug)]").len() > 1);
     }
 
     /// Débit de la coloration : `cargo test --release bench_colouring -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn bench_colouring() {
-        let source = include_str!("ui.rs");
+        let source = include_str!("../log/ui.rs");
         let start = std::time::Instant::now();
         let mut colors = Colorizer::for_path("ui.rs").unwrap();
         let mut seen = std::collections::BTreeSet::new();
@@ -264,7 +279,7 @@ mod tests {
         for _ in 0..20 {
             colors.reset();
             for line in source.lines() {
-                seen.extend(colors.line(LineKind::Ctx, line).into_iter().filter_map(|(_, color)| color));
+                seen.extend(colors.line(Flow::Both, line).into_iter().filter_map(|(_, color)| color));
                 lines += 1;
             }
         }
@@ -276,6 +291,6 @@ mod tests {
     #[test]
     fn minified_lines_stay_plain() {
         let mut colors = Colorizer::for_path("a.js").unwrap();
-        assert!(colors.line(LineKind::Add, &"a=1;".repeat(1000)).is_empty());
+        assert!(colors.line(Flow::New, &"a=1;".repeat(1000)).is_empty());
     }
 }

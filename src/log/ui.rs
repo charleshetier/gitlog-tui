@@ -8,13 +8,18 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
 
-use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side, Tool};
-use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
-use crate::git::{Head, Label, RefKind};
-use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
-use crate::hierarchy::{Remote, Sync};
+use crate::kit::Tool;
+use crate::kit::paint::{
+    ACCENT, CARD_BG, CHIP_BG, DIM, FIND_BG, FIND_CURRENT_BG, MIN_WRAP, PANEL_BG, SEL_BG, SELECT_BG, SYNTAX_TONES, TONES,
+    Tones, VOID_BG, draw_flash, draw_help, draw_menu, draw_panel, mark_span, put, put_right, put_tinted, split_words,
+    tail, thousands, width,
+};
+use crate::log::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side};
+use crate::log::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
+use crate::log::git::{Head, Label, RefKind};
+use crate::log::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
+use crate::log::hierarchy::{Remote, Sync};
 
 /// Une teinte par branche, attribuée à l'ouverture de sa colonne.
 const PALETTE: [Color; 8] = [
@@ -28,56 +33,13 @@ const PALETTE: [Color; 8] = [
     Color::Magenta,
 ];
 const TAG_COLOR: Color = Color::Yellow;
-const SEL_BG: Color = Color::Indexed(237);
 /// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
 const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
-/// Code sélectionné à la souris dans un diff.
-const SELECT_BG: Color = Color::Indexed(18);
-/// Occurrences d'une recherche dans le code, en noir sur ces fonds : la
-/// courante, puis les autres.
-const FIND_CURRENT_BG: Color = Color::Indexed(208);
-const FIND_BG: Color = Color::Indexed(179);
 /// Ligne du commit de HEAD : un fond à peine relevé, en deçà de la sélection.
 const HEAD_BG: Color = Color::Indexed(235);
 const LANE_HEAD_BG: Color = Color::Indexed(238);
-/// Encadré du libellé du commit, en tête du volet.
-const CARD_BG: Color = Color::Indexed(236);
-/// Fond du panneau flottant des raccourcis.
-const PANEL_BG: Color = Color::Indexed(235);
-/// Teinte d'accent : touches du panneau des raccourcis, marque de sélection.
-const ACCENT: Color = Color::LightBlue;
 const REMOTE_BG: Color = Color::Indexed(240);
-const CHIP_BG: Color = Color::Indexed(238);
-/// Fonds d'un diff : les lignes ajoutées et retirées et, plus soutenus, les
-/// passages modifiés au sein d'une ligne.
-#[derive(Clone, Copy)]
-struct Tones {
-    add: Color,
-    del: Color,
-    add_mark: Color,
-    del_mark: Color,
-}
-const TONES: Tones = Tones {
-    add: Color::Indexed(22),
-    del: Color::Indexed(52),
-    add_mark: Color::Indexed(28),
-    del_mark: Color::Indexed(88),
-};
-/// Les mêmes fonds sous la coloration syntaxique : plus sombres, pour que chaque
-/// teinte du thème y reste lisible. Aucune couleur de la palette n'est aussi sombre.
-/// Un terminal qui ramène le 24 bits à 256 couleurs doit pourtant y retrouver du
-/// vert et du rouge : trop sombre, un fond y devient un gris proche du noir.
-const SYNTAX_TONES: Tones = Tones {
-    add: Color::Rgb(0, 56, 0),
-    del: Color::Rgb(63, 0, 1),
-    add_mark: Color::Rgb(0, 88, 0),
-    del_mark: Color::Rgb(128, 0, 8),
-};
-const DIM: Color = Color::DarkGray;
-/// Fond du côté sans vis-à-vis dans le diff en deux colonnes.
-const VOID_BG: Color = Color::Indexed(235);
-
 const ARROW: &str = "\u{e0b2}";
 const ARROW_PLAIN: &str = "◀";
 /// Puce du commit de HEAD, à la place de « ● ».
@@ -92,48 +54,6 @@ const FOLDER_PLAIN: &str = "⌂";
 
 fn palette(index: u8) -> Color {
     PALETTE[index as usize % PALETTE.len()]
-}
-
-fn width(text: &str) -> u16 {
-    Span::raw(text).width() as u16
-}
-
-/// Écrit `text` à partir de `x` sans dépasser `end` ; renvoie la colonne suivante.
-fn put(buf: &mut Buffer, x: u16, y: u16, end: u16, text: &str, style: Style) -> u16 {
-    if x >= end {
-        return x;
-    }
-    buf.set_stringn(x, y, text, (end - x) as usize, style).0
-}
-
-/// Écrit `text` aligné à droite sur `end` ; renvoie sa colonne de départ.
-fn put_right(buf: &mut Buffer, start: u16, y: u16, end: u16, text: &str, style: Style) -> u16 {
-    let x = end.saturating_sub(width(text)).max(start);
-    put(buf, x, y, end, text, style);
-    x
-}
-
-/// Garde la fin d'un chemin trop long : c'est le nom du fichier qui compte.
-fn tail(text: &str, max: u16) -> String {
-    let count = text.chars().count();
-    if width(text) <= max || max < 2 {
-        return text.to_string();
-    }
-    let keep = (max as usize - 1).min(count);
-    let kept: String = text.chars().skip(count - keep).collect();
-    format!("…{kept}")
-}
-
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn now_secs() -> i64 {
@@ -218,10 +138,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.hierarchy.is_some() {
         draw_hierarchy(buf, app, Rect::new(area.x, area.y, area.width, 1), Rect::new(area.x, body_y, area.width, body_h));
-        draw_flash(buf, app, area);
+        draw_flash(buf, area, app.flash());
         draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
         if app.help {
-            draw_help(buf, area, app.tool);
+            draw_help(buf, area, if app.tool == Tool::Changes { CHANGES_SHORTCUTS } else { SHORTCUTS });
         }
         return;
     }
@@ -249,13 +169,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.depth() == 4 {
         draw_full(buf, app, area);
     }
-    draw_flash(buf, app, area);
+    draw_flash(buf, area, app.flash());
     if let Some(Prompt::Kind { sign }) = app.prompt {
         draw_menu(buf, Rect::new(area.x, body_y, area.width, body_h), " Search ", SEARCH_KINDS, sign);
     }
     draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
     if app.help {
-        draw_help(buf, area, app.tool);
+        draw_help(buf, area, if app.tool == Tool::Changes { CHANGES_SHORTCUTS } else { SHORTCUTS });
     }
 }
 
@@ -466,23 +386,6 @@ fn draw_graph_rows(buf: &mut Buffer, app: &mut App, area: Rect) -> (usize, bool)
         y += rows;
     }
     (whole, selected_shown)
-}
-
-/// Coupe `text` à ce qui tient dans `room` cellules, de préférence sur une
-/// espace. Renvoie ce qui tient, puis la suite ; il tient toujours un caractère.
-fn split_words(text: &str, room: u16) -> (&str, &str) {
-    let mut used = 0;
-    for (at, c) in text.char_indices() {
-        used += width(c.encode_utf8(&mut [0; 4]));
-        if used > room && at > 0 {
-            // Un mot plus long que la moitié de la place est coupé où il se trouve.
-            return match text[..at].rfind(' ').filter(|&space| space * 2 >= at) {
-                Some(space) => (&text[..space], text[space..].trim_start()),
-                None => text.split_at(at),
-            };
-        }
-    }
-    (text, "")
 }
 
 /// Sous la première rangée d'une ligne repliée : les branches qui descendent
@@ -875,9 +778,6 @@ fn draw_diff_view(buf: &mut Buffer, diff: &mut DiffView, area: Rect, (syntax, wr
     Some(CodeHit { area, lines: shown, wrap, skip: diff.x, left: code_x, right: None, lower_edge })
 }
 
-/// Largeur de code en deçà de laquelle le retour à la ligne est abandonné.
-const MIN_WRAP: usize = 8;
-
 /// Nombre de rangées qu'occupe une ligne de code dans `room` cellules.
 fn parts(line: &DiffLine, room: usize, wrap: bool) -> usize {
     if wrap { line.text.chars().count().div_ceil(room).max(1) } else { 1 }
@@ -887,16 +787,6 @@ fn parts(line: &DiffLine, room: usize, wrap: bool) -> usize {
 /// bas : celle qui suit le diff, ou sa dernière s'il touche le bas de l'écran.
 fn lower_edge(buf: &Buffer, area: Rect) -> u16 {
     if area.bottom() >= buf.area.bottom() { area.bottom().saturating_sub(1) } else { area.bottom() }
-}
-
-/// Applique un style à un passage d'une ligne de code dessinée en `x` : `from`
-/// et `to` sont des rangs de caractères dans le texte, `skip` le défilement.
-fn mark_span(buf: &mut Buffer, (x, y, end): (u16, u16, u16), skip: usize, (from, to): (usize, usize), style: Style) {
-    let room = end.saturating_sub(x) as usize;
-    let (start, stop) = (from.saturating_sub(skip).min(room), to.saturating_sub(skip).min(room));
-    if start < stop {
-        buf.set_style(Rect::new(x + start as u16, y, (stop - start) as u16, 1), style);
-    }
 }
 
 /// Fond de la sélection à la souris sur une ligne de code.
@@ -917,55 +807,10 @@ fn mark_finds(buf: &mut Buffer, at: (u16, u16, u16), skip: usize, find: Option<&
     }
 }
 
-/// Écrit le texte d'une ligne de diff à partir du caractère `skip`. Le texte est
-/// découpé là où change la teinte syntaxique ou le fond : `marks` désigne, en
-/// rangs de caractères, les passages modifiés, qui reçoivent le fond `mark_bg`.
-fn put_code(
-    buf: &mut Buffer,
-    mut x: u16,
-    y: u16,
-    end: u16,
-    line: &DiffLine,
-    skip: usize,
-    (marks, mark_bg): (&[Range<usize>], Color),
-) {
-    let text = line.text.as_str();
-    // Octet de chaque caractère, puis la fin du texte.
-    let offsets: Vec<usize> = text.char_indices().map(|(at, _)| at).chain([text.len()]).collect();
-    let count = offsets.len() - 1;
-    let mut cuts = vec![skip.min(count), count];
-    let mut tint_end = 0;
-    for &(len, _) in &line.tints {
-        tint_end += len as usize;
-        cuts.push(tint_end.min(count));
-    }
-    cuts.extend(marks.iter().flat_map(|mark| [mark.start.min(count), mark.end.min(count)]));
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut tints = line.tints.iter();
-    let (mut tint_end, mut color) = (0, None);
-    for cut in cuts.windows(2) {
-        let (from, to) = (cut[0], cut[1]);
-        while from >= tint_end {
-            // Sans coloration, ou au-delà de ses segments : la couleur de texte du terminal.
-            (tint_end, color) = match tints.next() {
-                Some(&(len, color)) => (tint_end + len as usize, color),
-                None => (usize::MAX, None),
-            };
-        }
-        if from < skip {
-            continue;
-        }
-        let mut style = color.map_or(Style::new(), |[r, g, b]| Style::new().fg(Color::Rgb(r, g, b)));
-        if marks.iter().any(|mark| mark.contains(&from)) {
-            style = style.bg(mark_bg);
-        }
-        x = put(buf, x, y, end, &text[offsets[from]..offsets[to]], style);
-        if x >= end {
-            return;
-        }
-    }
+/// Écrit le texte d'une ligne de diff à partir du caractère `skip` ; `marks`
+/// désigne ses passages modifiés et leur fond.
+fn put_code(buf: &mut Buffer, x: u16, y: u16, end: u16, line: &DiffLine, skip: usize, marks: (&[Range<usize>], Color)) {
+    put_tinted(buf, (x, y, end), &line.text, &line.tints, skip, marks);
 }
 
 /// Dessine les cellules du graphe d'une ligne selon le style des commits ;
@@ -1273,33 +1118,6 @@ const CHANGES_SHORTCUTS: &[(&str, &str)] = &[
     ("Drag on a diff", "Select code: it is copied when the button is released"),
 ];
 
-/// Cadre d'un panneau flottant : fond uni, titre en haut, rappel de fermeture en bas.
-fn draw_panel(buf: &mut Buffer, panel: Rect, title: &str, close: &str) {
-    if panel.is_empty() {
-        return;
-    }
-    let base = Style::new().bg(PANEL_BG);
-    let frame = base.fg(ACCENT);
-    let (left, right, top, bottom) = (panel.x, panel.right() - 1, panel.y, panel.bottom() - 1);
-    for y in top..=bottom {
-        for x in left..=right {
-            let symbol = match (x == left, x == right, y == top, y == bottom) {
-                (true, _, true, _) => "╭",
-                (_, true, true, _) => "╮",
-                (true, _, _, true) => "╰",
-                (_, true, _, true) => "╯",
-                (true, ..) | (_, true, ..) => "│",
-                (_, _, true, _) | (_, _, _, true) => "─",
-                _ => " ",
-            };
-            buf[(x, y)].reset();
-            buf[(x, y)].set_symbol(symbol).set_style(frame);
-        }
-    }
-    put(buf, left + 2, top, right, title, frame.add_modifier(Modifier::BOLD));
-    put_right(buf, left + 2, bottom, right.saturating_sub(1), close, base.fg(DIM));
-}
-
 /// Types de recherche du sous-menu : (touches, ce qui est examiné).
 const SEARCH_KINDS: &[(&str, &str)] = &[
     ("c", "commit hash"),
@@ -1317,31 +1135,6 @@ const BRANCH_KEYS: &[(&str, &str)] = &[
     ("o", "show or hide the remote branches"),
     ("O", "remote branches only, or all"),
 ];
-
-/// Sous-menu d'une touche à deux temps, posé en bas à gauche : celui de la
-/// recherche, au-dessus du champ de saisie, ou celui des branches. Après un `+`
-/// ou un `-`, seule la ligne qui peut encore suivre reste en évidence.
-fn draw_menu(buf: &mut Buffer, area: Rect, title: &str, entries: &[(&str, &str)], sign: Option<char>) {
-    let key_w = 2;
-    let text_w = entries.iter().map(|(_, text)| width(text)).max().unwrap_or(0);
-    let w = (key_w + 2 + text_w + 6).min(area.width);
-    let h = (entries.len() as u16 + 2).min(area.height);
-    let panel = Rect::new(area.x + 1.min(area.width - w), area.bottom() - h, w, h);
-    draw_panel(buf, panel, title, " Esc to cancel ");
-    let base = Style::new().bg(PANEL_BG);
-    let (x0, right) = (panel.x + 3, panel.right() - 1);
-    for (i, (keys, text)) in entries.iter().enumerate().take(h.saturating_sub(2) as usize) {
-        let y = panel.y + 1 + i as u16;
-        let reachable = sign.is_none_or(|sign| keys.starts_with(sign));
-        let (key_style, text_style) = if reachable {
-            (base.fg(ACCENT).add_modifier(Modifier::BOLD), base)
-        } else {
-            (base.fg(DIM), base.fg(DIM))
-        };
-        put(buf, x0, y, right, keys, key_style);
-        put(buf, x0 + key_w + 2, y, right, text, text_style);
-    }
-}
 
 /// Panneaux des branches, par-dessus le graphe ou la hiérarchie : le sous-menu
 /// de `b`, puis la liste des branches à cocher.
@@ -1475,49 +1268,6 @@ fn draw_search_bar(buf: &mut Buffer, app: &App, area: Rect) {
     if editing {
         put(buf, x, area.y, text_end, " ", Style::new().bg(Color::Gray));
     }
-}
-
-/// Panneau flottant des raccourcis, centré par-dessus la vue courante.
-fn draw_help(buf: &mut Buffer, area: Rect, tool: Tool) {
-    let shortcuts = if tool == Tool::Changes { CHANGES_SHORTCUTS } else { SHORTCUTS };
-    let key_w = shortcuts.iter().map(|(keys, _)| width(keys)).max().unwrap_or(0);
-    let text_w = shortcuts
-        .iter()
-        .map(|(keys, text)| if keys.is_empty() { width(text) } else { key_w + 2 + width(text) })
-        .max()
-        .unwrap_or(0);
-    let w = (text_w + 6).min(area.width);
-    let h = (shortcuts.len() as u16 + 2).min(area.height);
-    let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
-    draw_panel(buf, panel, " Keyboard shortcuts ", " ? or Esc to close ");
-    let base = Style::new().bg(PANEL_BG);
-    let (left, right, top) = (panel.x, panel.right() - 1, panel.y);
-
-    let x0 = left + 3;
-    for (i, (keys, text)) in shortcuts.iter().enumerate().take(h.saturating_sub(2) as usize) {
-        let y = top + 1 + i as u16;
-        if keys.is_empty() {
-            put(buf, x0, y, right, text, base.fg(Color::White).add_modifier(Modifier::BOLD));
-        } else {
-            put(buf, x0, y, right, keys, base.fg(ACCENT));
-            put(buf, x0 + key_w + 2, y, right, text, base);
-        }
-    }
-}
-
-/// Message éphémère (copie, butée) : une pastille en bas à droite, par-dessus la vue.
-fn draw_flash(buf: &mut Buffer, app: &App, area: Rect) {
-    let Some(text) = app.flash() else { return };
-    let room = area.width.saturating_sub(4) as usize;
-    let text: String = text.chars().take(room).collect();
-    let text = format!(" {text} ");
-    let style = Style::new().fg(Color::LightGreen).bg(PANEL_BG).add_modifier(Modifier::BOLD);
-    let (y, end) = (area.bottom() - 1, area.right() - 1);
-    let x = end.saturating_sub(width(&text)).max(area.x);
-    for cell_x in x..end {
-        buf[(cell_x, y)].reset();
-    }
-    put(buf, x, y, end, &text, style);
 }
 
 #[cfg(test)]

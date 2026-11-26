@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::layout::{Position, Rect};
 
-use crate::diff::{DiffLine, FileEntry, LineKind, SideBySide};
-use crate::git::{
+use crate::kit::Tool;
+use crate::kit::notice::{Clipboard, Flash};
+use crate::log::diff::{DiffLine, FileEntry, LineKind, SideBySide};
+use crate::log::git::{
     self, DiffMsg, DiffWorker, FileReq, Filter, Head, Label, LogMsg, LogStream, Meta, MetaReader, RefKind, Repo, Revs,
     SearchKind,
 };
-use crate::graph::{GraphStore, Oid};
-use crate::hierarchy::BranchRow;
+use crate::log::graph::{GraphStore, Oid};
+use crate::log::hierarchy::BranchRow;
 
 /// Lignes gardées d'avance sous le bas de l'écran avant de laisser git en pause.
 const LOOKAHEAD: usize = 2000;
@@ -21,7 +23,6 @@ const LOOKAHEAD: usize = 2000;
 const BATCHES_PER_TICK: usize = 64;
 /// Entrées du cache de métadonnées avant remise à zéro.
 const META_CACHE: usize = 4096;
-const FLASH: Duration = Duration::from_millis(1500);
 /// Lignes de contexte gardées au-dessus d'une modification atteinte par `n` ou `p`.
 const CHANGE_MARGIN: usize = 3;
 /// Pause dans la frappe avant de lancer une recherche en direct : un seul git par mot tapé.
@@ -347,26 +348,6 @@ impl CodeHit {
     }
 }
 
-/// Outil de la suite que l'application fait tourner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tool {
-    /// `gitlog` : le graphe des commits, puis le détail de celui qu'on ouvre.
-    Log,
-    /// `gitchange` : ce qui n'est pas encore commité, sans le graphe. Le détail
-    /// est ouvert d'emblée : liste des fichiers, diff, fichier entier.
-    Changes,
-}
-
-impl Tool {
-    /// Nom de la commande.
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Log => "gitlog",
-            Tool::Changes => "gitchange",
-        }
-    }
-}
-
 /// Branches dont part le graphe, selon leur nature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -569,7 +550,7 @@ pub struct App {
     /// Une sélection à la souris est en cours : le bouton est encore enfoncé.
     pub selecting: bool,
     pub should_quit: bool,
-    flash: Option<(String, Instant)>,
+    flash: Flash,
     log: Option<LogStream>,
     goto_end: bool,
     /// Commit à atteindre dès qu'il sera chargé, et lignes déjà examinées.
@@ -579,7 +560,7 @@ pub struct App {
     meta_reader: MetaReader,
     meta_cache: HashMap<usize, Meta>,
     diffs: DiffWorker,
-    clipboard: Option<arboard::Clipboard>,
+    clipboard: Clipboard,
 }
 
 impl App {
@@ -627,13 +608,13 @@ impl App {
             should_quit: false,
             selecting: false,
             before_find: None,
-            flash: None,
+            flash: Flash::default(),
             log,
             goto_end: false,
             goto: None,
             keep_offset: None,
             meta_cache: HashMap::new(),
-            clipboard: None,
+            clipboard: Clipboard::default(),
         };
         if tool == Tool::Changes {
             app.open_changes();
@@ -678,11 +659,11 @@ impl App {
     }
 
     pub fn flash(&self) -> Option<&str> {
-        self.flash.as_ref().map(|(text, _)| text.as_str())
+        self.flash.text()
     }
 
     fn set_flash(&mut self, text: impl Into<String>) {
-        self.flash = Some((text.into(), Instant::now()));
+        self.flash.set(text);
     }
 
     /// Métadonnées d'une ligne, lues à la demande et gardées dans un petit cache.
@@ -742,7 +723,7 @@ impl App {
             .hierarchy
             .as_ref()
             .is_some_and(|h| matches!(h.state, HierState::Loading));
-        loading_log || loading_pane || loading_tree || self.flash.is_some()
+        loading_log || loading_pane || loading_tree || self.flash.is_shown()
     }
 
     /// Absorbe ce que les threads de fond ont produit. Renvoie vrai s'il faut redessiner.
@@ -759,11 +740,7 @@ impl App {
         }
         changed |= self.pump_log();
         changed |= self.pump_worker();
-        if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() >= FLASH) {
-            self.flash = None;
-            changed = true;
-        }
-        changed
+        changed | self.flash.expire()
     }
 
     fn pump_log(&mut self) -> bool {
@@ -1060,20 +1037,8 @@ impl App {
     }
 
     fn copy(&mut self, text: String) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        let copied = self
-            .clipboard
-            .as_mut()
-            .is_some_and(|c| c.set_text(text.as_str()).is_ok());
-        if copied {
-            // Un extrait de code de plusieurs lignes ne tient pas dans la pastille.
-            let lines = text.lines().count();
-            self.set_flash(if lines > 1 { format!("Copied {lines} lines") } else { format!("Copied: {}", text.trim()) });
-        } else {
-            self.set_flash("Clipboard unavailable");
-        }
+        let told = self.clipboard.copy_and_tell(&text);
+        self.set_flash(told);
     }
 
     /// Toutes les branches du dépôt : les locales, puis les distantes.

@@ -13,10 +13,12 @@ use std::thread;
 
 use anyhow::{Context, Result, bail};
 
-use crate::diff::{DiffLine, DiffParser, FileEntry, LineKind, parse_files};
-use crate::syntax::Colorizer;
-use crate::graph::{Batch, COMMIT, Cell, Layout, Oid};
-use crate::hierarchy::{self, Branch, BranchRow, Remote};
+use crate::log::diff::{DiffLine, DiffParser, FileEntry, LineKind, parse_files};
+use crate::kit::syntax::Colorizer;
+use crate::kit::git::{git, output};
+pub use crate::kit::git::{Head, Oid, Repo};
+use crate::log::graph::{Batch, COMMIT, Cell, Layout};
+use crate::log::hierarchy::{self, Branch, BranchRow, Remote};
 
 /// Commits par lot envoyé à l'interface.
 const BATCH_ROWS: usize = 256;
@@ -26,87 +28,6 @@ const BATCH_QUEUE: usize = 8;
 const DIFF_CHUNK: usize = 1000;
 /// Plafond de lignes conservées pour un diff.
 pub const MAX_DIFF_LINES: usize = 50_000;
-
-fn git(root: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(root)
-        .args(["--no-pager", "-c", "core.quotePath=false"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null());
-    cmd
-}
-
-/// Lance une commande git courte et renvoie sa sortie standard.
-fn output(root: &Path, args: &[&str]) -> Result<String> {
-    let out = git(root)
-        .args(args)
-        .output()
-        .context("cannot run git: is it installed and on the PATH?")?;
-    if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Head {
-    Branch(String),
-    Detached(Oid),
-    Unborn,
-}
-
-#[derive(Clone, Debug)]
-pub struct Repo {
-    pub root: PathBuf,
-    /// Nom du dossier racine.
-    pub name: String,
-    /// Nom du dépôt distant, tiré de l'URL de `origin`.
-    pub remote_name: Option<String>,
-    /// URL du remote `origin`.
-    pub remote_url: Option<String>,
-    pub head: Head,
-}
-
-/// Nom du dépôt dans une URL de remote : `https://hôte/qui/nom.git`, `git@hôte:qui/nom.git`.
-fn repo_name(url: &str) -> Option<String> {
-    let url = url.trim().trim_end_matches(['/', '\\']);
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let name = url.rsplit(['/', '\\', ':']).next()?;
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-impl Repo {
-    pub fn open(dir: &Path) -> Result<Repo> {
-        let root = match output(dir, &["rev-parse", "--show-toplevel"]) {
-            Ok(top) => PathBuf::from(top.trim()),
-            Err(err) => {
-                // Dépôt nu : pas de dossier de travail, mais un dossier git valide.
-                if output(dir, &["rev-parse", "--git-dir"]).is_err() {
-                    bail!("{} is not inside a git repository ({err})", dir.display());
-                }
-                dir.to_path_buf()
-            }
-        };
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string());
-        let head_oid = output(&root, &["rev-parse", "--verify", "-q", "HEAD"])
-            .ok()
-            .and_then(|s| Oid::from_hex(s.trim()));
-        let head = match (output(&root, &["symbolic-ref", "-q", "--short", "HEAD"]), head_oid) {
-            (_, None) => Head::Unborn,
-            (Ok(branch), Some(_)) => Head::Branch(branch.trim().to_string()),
-            (Err(_), Some(oid)) => Head::Detached(oid),
-        };
-        let remote_url = output(&root, &["remote", "get-url", "origin"])
-            .ok()
-            .map(|url| url.trim().to_string())
-            .filter(|url| !url.is_empty());
-        let remote_name = remote_url.as_deref().and_then(repo_name);
-        Ok(Repo { root, name, remote_name, remote_url, head })
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefKind {
@@ -914,7 +835,11 @@ fn stream_diff(root: &Path, id: u64, req: &FileReq, latest: &AtomicU64, tx: &Sen
                     LineKind::Hunk => colors.reset(),
                     LineKind::Meta => {}
                     // Le contenu brut, sans le signe du diff.
-                    kind => line.tints = colors.line(kind, text.get(1..).unwrap_or("")),
+                    kind => {
+                        if let Some(flow) = kind.flow() {
+                            line.tints = colors.line(flow, text.get(1..).unwrap_or(""));
+                        }
+                    }
                 }
             }
             match &mut sieve {
@@ -1046,15 +971,6 @@ fn load_hierarchy(repo: &Repo) -> Result<(Vec<BranchRow>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repo_name_from_remote_url() {
-        assert_eq!(repo_name("https://example.com/alice/gitlog-tui.git\n").as_deref(), Some("gitlog-tui"));
-        assert_eq!(repo_name("git@example.com:alice/gitlog-tui.git").as_deref(), Some("gitlog-tui"));
-        assert_eq!(repo_name("ssh://example.com/alice/tools/").as_deref(), Some("tools"));
-        assert_eq!(repo_name("C:\\repos\\bare.git").as_deref(), Some("bare"));
-        assert_eq!(repo_name(""), None);
-    }
 
     #[test]
     fn commit_object_is_parsed() {

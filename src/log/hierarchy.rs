@@ -4,7 +4,7 @@
 //! L'arbre est déduit du graphe : une branche a pour parent la branche déjà
 //! placée par rapport à laquelle elle a le moins de commits propres.
 
-use crate::graph::Oid;
+use crate::log::graph::Oid;
 
 /// Branches prises pour racine, par ordre de préférence.
 const ROOT_NAMES: [&str; 4] = ["main", "master", "trunk", "develop"];

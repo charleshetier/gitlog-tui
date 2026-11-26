@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use crate::app::{Action, App, FilesState, HierState, NodeStyle, Tool};
-use crate::git::Repo;
-use crate::ui;
+use crate::kit::Tool;
+use crate::log::app::{Action, App, FilesState, HierState, NodeStyle};
+use crate::log::git::Repo;
+use crate::log::ui;
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -268,7 +269,7 @@ fn copy_step_and_help_shortcuts() {
     // Au clavier : n pour le suivant, N (Maj+n) pour le précédent ; p n'est plus une touche.
     {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: char, modifiers| crate::run::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
+        let key = |c: char, modifiers| crate::log::keys::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
         assert!(matches!(key('n', KeyModifiers::NONE), Some(Action::Step(1))));
         assert!(matches!(key('N', KeyModifiers::SHIFT), Some(Action::Step(-1))));
         assert!(key('p', KeyModifiers::NONE).is_none());
@@ -535,8 +536,8 @@ fn search_narrows_the_commit_details() {
         app.apply(Action::Open);
         wait(app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
         let diff = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
-        let count = diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Hunk).count();
-        let metas = diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Meta).map(|l| l.text.clone());
+        let count = diff.lines.iter().filter(|l| l.kind == crate::log::diff::LineKind::Hunk).count();
+        let metas = diff.lines.iter().filter(|l| l.kind == crate::log::diff::LineKind::Meta).map(|l| l.text.clone());
         (count, metas.collect())
     };
     let names = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -886,7 +887,7 @@ fn gitchange_shows_the_uncommitted_changes() {
     let mut app = App::open(Repo::open(&dir).unwrap(), true, Tool::Changes).unwrap();
     let files_ready = |app: &App| app.pane.as_ref().is_some_and(|p| matches!(p.files, FilesState::Ready(_)));
     let diff_done = |app: &App| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done);
-    let key = |app: &App, c: char| crate::run::on_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    let key = |app: &App, c: char| crate::log::keys::on_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     wait(&mut app, "fichiers", files_ready);
 
     // Pas de graphe : la liste des fichiers d'emblée, sur toute la largeur, au niveau 1.
@@ -1203,7 +1204,7 @@ fn branches_of_the_graph_are_chosen() {
     assert!(!view.contains("◀ feature") && view.contains("◀ v0.1.0 ") && view.contains("· remotes only"), "{view}");
     // `b` `o` les cache alors : il reste les locales. `b` `O` deux fois : seules, puis toutes.
     app.apply(Action::ToggleRemotes);
-    assert_eq!(app.scope, crate::app::Scope::Local);
+    assert_eq!(app.scope, crate::log::app::Scope::Local);
     app.apply(Action::OnlyRemotes);
     app.apply(Action::OnlyRemotes);
     assert_eq!(app.flash(), Some("Local and remote branches"));
@@ -1348,7 +1349,7 @@ fn uncommitted_changes_head_the_graph() {
     let diff_done = |app: &App| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done);
     let texts = |app: &App| -> Vec<String> {
         let diff = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
-        diff.lines.iter().filter(|l| l.kind == crate::diff::LineKind::Add).map(|l| l.text.clone()).collect()
+        diff.lines.iter().filter(|l| l.kind == crate::log::diff::LineKind::Add).map(|l| l.text.clone()).collect()
     };
     app.apply(Action::Open);
     wait(&mut app, "diff", diff_done);
@@ -1383,7 +1384,7 @@ fn uncommitted_changes_head_the_graph() {
 
 #[test]
 fn refresh_reloads_the_repository() {
-    use crate::git::Head;
+    use crate::log::git::Head;
 
     let dir = make_repo("refresh");
     let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
@@ -1537,13 +1538,13 @@ fn search_filters_the_commits() {
     assert!(menu.contains("╭─ Search ") && menu.contains("commit message") && menu.contains("-h"));
     app.apply(Action::PromptKey('+'));
     app.apply(Action::PromptKey('m'));
-    assert!(matches!(app.prompt, Some(crate::app::Prompt::Kind { sign: Some('+') })));
+    assert!(matches!(app.prompt, Some(crate::log::app::Prompt::Kind { sign: Some('+') })));
     app.apply(Action::PromptKey('h'));
     app.apply(Action::PromptKey('x'));
     let typing = screen(&mut app, 110, 20);
     let last = typing.lines().last().unwrap();
     assert!(last.starts_with(" +hunk: x") && last.trim_end().ends_with("Enter to search"), "{last}");
-    assert_eq!(app.filter.as_ref().map(|f| f.kind), Some(crate::git::SearchKind::Hash), "les hunks attendent Entrée");
+    assert_eq!(app.filter.as_ref().map(|f| f.kind), Some(crate::log::git::SearchKind::Hash), "les hunks attendent Entrée");
     // Échap abandonne la saisie et garde la recherche appliquée.
     app.apply(Action::PromptCancel);
     assert!(app.prompt.is_none() && app.filter.is_some());

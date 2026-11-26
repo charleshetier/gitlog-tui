@@ -4,6 +4,8 @@
 //! toujours avant ses parents. Chaque colonne active attend un commit précis ;
 //! le calcul ne garde que ces colonnes et traite chaque commit une seule fois.
 
+pub use crate::kit::git::Oid;
+
 pub const UP: u8 = 1;
 pub const DOWN: u8 = 2;
 pub const LEFT: u8 = 4;
@@ -37,59 +39,6 @@ impl Cell {
             b if b == LEFT | RIGHT | UP => '┴',
             _ => '┼',
         }
-    }
-}
-
-/// Identifiant d'objet git (SHA-1 sur 20 octets ou SHA-256 sur 32).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Oid {
-    bytes: [u8; 32],
-    len: u8,
-}
-
-impl Oid {
-    /// Identifiant réservé à la ligne des modifications non commitées : tout à
-    /// zéro, celui que git emploie pour « aucun objet ». Il prend la longueur
-    /// de `like`, car le graphe range des identifiants de taille fixe.
-    pub fn worktree(like: &Oid) -> Oid {
-        Oid { bytes: [0; 32], len: like.len }
-    }
-
-    pub fn is_worktree(self) -> bool {
-        self.bytes == [0; 32]
-    }
-
-    pub fn from_hex(hex: &str) -> Option<Oid> {
-        let h = hex.as_bytes();
-        if (h.len() != 40 && h.len() != 64) || !h.iter().all(u8::is_ascii_hexdigit) {
-            return None;
-        }
-        let val = |c: u8| (c as char).to_digit(16).unwrap() as u8;
-        let mut bytes = [0u8; 32];
-        for (i, pair) in h.chunks(2).enumerate() {
-            bytes[i] = val(pair[0]) << 4 | val(pair[1]);
-        }
-        Some(Oid { bytes, len: (h.len() / 2) as u8 })
-    }
-
-    pub fn from_bytes(b: &[u8]) -> Oid {
-        let mut bytes = [0u8; 32];
-        bytes[..b.len()].copy_from_slice(b);
-        Oid { bytes, len: b.len() as u8 }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-
-    pub fn to_hex(self) -> String {
-        self.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    pub fn short(self) -> String {
-        let mut s = self.to_hex();
-        s.truncate(7);
-        s
     }
 }
 
