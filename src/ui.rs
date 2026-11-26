@@ -202,7 +202,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Colonne du séparateur vertical quand le volet est ouvert. Le diff en deux
     // colonnes prend les deux tiers de la largeur.
     let split_at = if two_way { (area.width / 3).max(24).min(area.width / 2) } else { area.width / 2 };
-    // `gitchanges` n'a pas de graphe : le détail prend toute la largeur.
+    // `gitchange` n'a pas de graphe : le détail prend toute la largeur.
     let changes = app.tool == Tool::Changes;
     let divider = (app.pane.is_some() && app.hierarchy.is_none() && !changes).then(|| area.x + split_at);
 
@@ -617,7 +617,7 @@ fn draw_pane_header(buf: &mut Buffer, app: &mut App, area: Rect) {
             let room = title_end.saturating_sub(area.x + 1);
             put(buf, area.x + 1, area.y, title_end, &tail(path, room), bold);
         }
-        // Dans `gitchanges`, l'encadré de la liste porte déjà ce titre.
+        // Dans `gitchange`, l'encadré de la liste porte déjà ce titre.
         _ if pane.oid.is_worktree() => {
             if app.tool == Tool::Log {
                 put(buf, area.x + 1, area.y, title_end, "Uncommitted changes", bold);
@@ -1246,7 +1246,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Drag on a diff", "Select code: it is copied when the button is released"),
 ];
 
-/// Raccourcis de `gitchanges` : ceux de `gitlog` qui ne tiennent pas au graphe.
+/// Raccourcis de `gitchange` : ceux de `gitlog` qui ne tiennent pas au graphe.
 const CHANGES_SHORTCUTS: &[(&str, &str)] = &[
     ("", "Navigation"),
     ("↑ ↓  j k", "Move the selection, scroll a diff"),

@@ -1,5 +1,5 @@
 //! Lancement d'un outil de la suite : arguments, terminal, boucle d'événements,
-//! clavier et souris. Tout cela est commun à `gitlog` et à `gitchanges`.
+//! clavier et souris. Tout cela est commun à `gitlog` et à `gitchange`.
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -50,9 +50,9 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       w wrap or cut the long lines, in the graph and in the code";
 
 const CHANGES_HELP: &str = "\
-gitchanges: the changes of a git repository that are not committed yet
+gitchange: the changes of a git repository that are not committed yet
 
-Usage: gitchanges [OPTIONS] [PATH]
+Usage: gitchange [OPTIONS] [PATH]
 
   PATH         repository folder (default: the current folder)
   --plain      standard glyphs, without a Powerline or Nerd Font

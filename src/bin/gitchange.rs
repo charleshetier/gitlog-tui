@@ -1,4 +1,4 @@
-//! gitchanges : ce qui n'est pas encore commité, fichier par fichier.
+//! gitchange : ce qui n'est pas encore commité, fichier par fichier.
 
 use std::process::ExitCode;
 

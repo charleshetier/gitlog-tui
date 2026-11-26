@@ -873,7 +873,7 @@ fn remote_branches_are_shortened_and_hidden() {
 }
 
 #[test]
-fn gitchanges_shows_the_uncommitted_changes() {
+fn gitchange_shows_the_uncommitted_changes() {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let dir = make_repo("changes");
@@ -966,7 +966,7 @@ fn gitchanges_shows_the_uncommitted_changes() {
 }
 
 #[test]
-fn gitchanges_works_before_the_first_commit() {
+fn gitchange_works_before_the_first_commit() {
     let dir = std::env::temp_dir().join(format!("gitlog-test-unborn-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

@@ -1,6 +1,6 @@
 //! Tronc commun d'une suite d'outils git pour le terminal. Chaque outil est un
 //! binaire de quelques lignes (`src/bin`) qui lance l'application dans son mode :
-//! `gitlog` montre le graphe des commits, `gitchanges` ce qui n'est pas encore
+//! `gitlog` montre le graphe des commits, `gitchange` ce qui n'est pas encore
 //! commité. La lecture de git, les diffs, leur coloration, l'interface et la
 //! boucle d'événements sont les mêmes pour tous.
 

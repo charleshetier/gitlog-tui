@@ -352,7 +352,7 @@ impl CodeHit {
 pub enum Tool {
     /// `gitlog` : le graphe des commits, puis le détail de celui qu'on ouvre.
     Log,
-    /// `gitchanges` : ce qui n'est pas encore commité, sans le graphe. Le détail
+    /// `gitchange` : ce qui n'est pas encore commité, sans le graphe. Le détail
     /// est ouvert d'emblée : liste des fichiers, diff, fichier entier.
     Changes,
 }
@@ -362,7 +362,7 @@ impl Tool {
     pub fn name(self) -> &'static str {
         match self {
             Tool::Log => "gitlog",
-            Tool::Changes => "gitchanges",
+            Tool::Changes => "gitchange",
         }
     }
 }
@@ -591,7 +591,7 @@ impl App {
 
     pub fn open(repo: Repo, plain: bool, tool: Tool) -> Result<App> {
         // Le flux démarre en premier : git parcourt pendant que les refs sont lues.
-        // `gitchanges` n'a pas de graphe : il ne lit pas l'historique.
+        // `gitchange` n'a pas de graphe : il ne lit pas l'historique.
         let log = (tool == Tool::Log).then(|| git::spawn_log(repo.root.clone(), None, Revs::default()));
         let labels = git::load_labels(&repo)?;
         let mut app = App {
@@ -641,7 +641,7 @@ impl App {
         Ok(app)
     }
 
-    /// `gitchanges` : ouvre le détail de ce qui n'est pas commité. Il reste ouvert
+    /// `gitchange` : ouvre le détail de ce qui n'est pas commité. Il reste ouvert
     /// tant que l'outil tourne ; c'est le même que celui de la ligne « changes » du graphe.
     fn open_changes(&mut self) {
         // L'identifiant fictif prend la longueur de ceux du dépôt ; à défaut, celle de SHA-1.
@@ -671,7 +671,7 @@ impl App {
         }
     }
 
-    /// Niveaux que l'outil n'a pas : `gitchanges` commence à la liste des
+    /// Niveaux que l'outil n'a pas : `gitchange` commence à la liste des
     /// fichiers, son niveau 1, qui est le niveau 2 de `gitlog`.
     pub fn level_shift(&self) -> u8 {
         u8::from(self.tool == Tool::Changes)
@@ -1536,7 +1536,7 @@ impl App {
                 pane.req = req;
             }
         }
-        // `gitchanges` n'a pas d'historique à relire.
+        // `gitchange` n'a pas d'historique à relire.
         if self.tool == Tool::Log {
             let current = self.pane.as_ref().map(|pane| pane.oid).or_else(|| self.selected_oid());
             self.keep_offset = current.filter(|_| self.top > 0).map(|_| self.selected.saturating_sub(self.top));
@@ -1608,7 +1608,7 @@ impl App {
                     self.set_flash(if delta < 0 { "First file of the commit" } else { "Last file of the commit" });
                 }
             }
-            // Pas de commit voisin dans `gitchanges` : la liste des fichiers est seule.
+            // Pas de commit voisin dans `gitchange` : la liste des fichiers est seule.
             2 if self.tool == Tool::Changes => {}
             2 => {
                 let next = neighbour(self.selected, self.store.len());
@@ -1757,7 +1757,7 @@ impl App {
             Action::Back { quit } => match self.depth() {
                 4 => self.close_full(),
                 3 => self.close_diff(),
-                // La liste des fichiers est le premier niveau de `gitchanges` : `q` y quitte.
+                // La liste des fichiers est le premier niveau de `gitchange` : `q` y quitte.
                 2 if self.tool == Tool::Changes => self.should_quit = quit,
                 2 => self.close_pane(),
                 // Une recherche active est un niveau de plus : on en sort d'abord.
