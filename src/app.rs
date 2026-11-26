@@ -1145,7 +1145,7 @@ impl App {
             Action::Top | Action::PromptKey('g') => picker.sel = 0,
             Action::Bottom | Action::PromptKey('G') => picker.sel = picker.items.len() - 1,
             Action::PromptKey(' ') => picker.checked[picker.sel] = !picker.checked[picker.sel],
-            Action::PromptKey('a') => {
+            Action::PromptKey('v') => {
                 // Tout cocher ; ou tout décocher si tout l'est déjà.
                 let all = picker.checked.iter().all(|&checked| checked);
                 picker.checked.fill(!all);

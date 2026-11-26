@@ -1104,8 +1104,8 @@ fn branches_of_the_graph_are_chosen() {
     assert!(picker.checked.iter().all(|&checked| checked));
     let view = screen(&mut app, 110, 16);
     assert!(view.contains("Branches in the graph · 4/4") && view.contains("[x] origin/extra"), "{view}");
-    // `a` décoche tout ; rien de coché ne s'applique pas.
-    keys(&mut app, "a");
+    // `v` décoche tout ; rien de coché ne s'applique pas. `a` n'est plus un raccourci.
+    keys(&mut app, "av");
     app.apply(Action::PromptSubmit);
     assert!(app.picker.is_some() && app.flash() == Some("Pick at least one branch"));
     assert!(screen(&mut app, 110, 16).contains("Branches in the graph · 0/4"));
@@ -1147,14 +1147,14 @@ fn branches_of_the_graph_are_chosen() {
     app.apply(Action::ToggleRemotes);
 
     // La liste rouvre sur le choix en place. Échap la referme sans rien changer ;
-    // `a` puis Entrée reviennent à toutes les branches.
+    // `v` puis Entrée reviennent à toutes les branches.
     app.apply(Action::PickBranches);
     assert_eq!(app.picker.as_ref().unwrap().checked, [false, false, true, false]);
-    keys(&mut app, "ja");
+    keys(&mut app, "jv");
     app.apply(Action::PromptCancel);
     assert!(app.picker.is_none() && app.picked.as_ref().is_some_and(|picked| picked.len() == 1));
     app.apply(Action::PickBranches);
-    keys(&mut app, "a");
+    keys(&mut app, "v");
     app.apply(Action::PromptSubmit);
     assert!(app.picked.is_none());
     reload(&mut app);
@@ -1164,7 +1164,7 @@ fn branches_of_the_graph_are_chosen() {
     // Une branche choisie puis supprimée est oubliée au rafraîchissement ; comme
     // c'était la seule, le graphe revient à toutes les branches.
     app.apply(Action::PickBranches);
-    keys(&mut app, "a ");
+    keys(&mut app, "v ");
     app.apply(Action::PromptSubmit);
     assert_eq!(app.picked.as_ref().map(|picked| picked.len()), Some(1));
     git(&dir, &["branch", "-q", "-D", "feature"]);

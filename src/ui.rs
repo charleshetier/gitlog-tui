@@ -1373,7 +1373,7 @@ fn draw_picker(buf: &mut Buffer, app: &mut App, area: Rect) {
         };
         put_right(buf, x + 2, y, right.saturating_sub(1), &status, base.fg(DIM));
     } else {
-        put(buf, x0, y, right, "Space check · a all or none · / search", base.fg(DIM));
+        put(buf, x0, y, right, "Space check · v all or none · / search", base.fg(DIM));
     }
 }
 
