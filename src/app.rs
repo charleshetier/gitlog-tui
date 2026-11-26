@@ -1,6 +1,6 @@
 //! État de l'application et actions qui le modifient.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,10 @@ use anyhow::Result;
 use ratatui::layout::{Position, Rect};
 
 use crate::diff::{DiffLine, FileEntry, LineKind, SideBySide};
-use crate::git::{self, DiffMsg, DiffWorker, FileReq, Filter, Label, LogMsg, LogStream, Meta, MetaReader, Repo, SearchKind};
+use crate::git::{
+    self, DiffMsg, DiffWorker, FileReq, Filter, Head, Label, LogMsg, LogStream, Meta, MetaReader, RefKind, Repo, Revs,
+    SearchKind,
+};
 use crate::graph::{GraphStore, Oid};
 use crate::hierarchy::BranchRow;
 
@@ -335,6 +338,63 @@ impl CodeHit {
     }
 }
 
+/// Branches dont part le graphe, selon leur nature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Les branches locales et les branches distantes.
+    All,
+    /// Sans les branches distantes (`origin/…`).
+    Local,
+    /// Les branches distantes seules.
+    Remote,
+}
+
+/// Une branche : sa nature, locale ou distante, et son nom.
+pub type Branch = (RefKind, String);
+
+/// Liste des branches à cocher pour le graphe, ouverte par `b` `f`.
+pub struct Picker {
+    /// Toutes les branches : les locales, puis les distantes.
+    pub items: Vec<Branch>,
+    pub checked: Vec<bool>,
+    pub sel: usize,
+    pub top: usize,
+    /// Lignes visibles, renseignées par le rendu.
+    pub height: usize,
+    /// Recherche dans la liste, ouverte par `/` : elle ne filtre pas, elle
+    /// surligne les branches trouvées et y amène le curseur.
+    pub query: String,
+    /// La recherche est en cours de saisie.
+    pub typing: bool,
+    /// Curseur d'avant la saisie, d'où part la recherche.
+    origin: usize,
+}
+
+impl Picker {
+    /// La branche répond-elle à la recherche ? Sans majuscule dans celle-ci, la
+    /// casse est ignorée.
+    pub fn matches(&self, index: usize) -> bool {
+        let name = &self.items[index].1;
+        if self.query.is_empty() {
+            false
+        } else if self.query.chars().any(char::is_uppercase) {
+            name.contains(&self.query)
+        } else {
+            name.to_lowercase().contains(&self.query)
+        }
+    }
+
+    /// Branche trouvée la plus proche de `from`, dans le sens de `delta`, en boucle.
+    fn seek(&self, from: usize, delta: isize) -> Option<usize> {
+        let len = self.items.len() as isize;
+        (0..len).map(|step| (from as isize + delta * step).rem_euclid(len) as usize).find(|&index| self.matches(index))
+    }
+
+    fn step(&mut self, delta: isize) {
+        self.sel = self.sel.saturating_add_signed(delta).min(self.items.len().saturating_sub(1));
+    }
+}
+
 /// Zones cliquables mémorisées au dernier rendu.
 #[derive(Default)]
 pub struct HitMap {
@@ -370,6 +430,8 @@ pub enum Prompt {
     Input { kind: SearchKind, query: String },
     /// Recherche dans le code du diff au premier plan, ouverte par `/`.
     Code { query: String },
+    /// Sous-menu des branches, ouvert par `b` : la touche suivante choisit.
+    Branches,
 }
 
 pub enum Action {
@@ -407,7 +469,14 @@ pub enum Action {
     /// Relit le dépôt : branche courante, refs et historique.
     Refresh,
     /// Affiche ou masque les étiquettes des branches distantes.
+    /// `b` : ouvre le sous-menu des branches.
+    BranchMenu,
+    /// `b` `o` : montre ou cache les branches distantes dans le graphe.
     ToggleRemotes,
+    /// `b` `O` : ne montre que les branches distantes, ou revient à toutes.
+    OnlyRemotes,
+    /// `b` `f` : ouvre la liste des branches à montrer dans le graphe.
+    PickBranches,
     ToggleHelp,
     /// Ouvre le sous-menu de recherche.
     Search,
@@ -426,8 +495,12 @@ pub struct App {
     /// Coloration syntaxique des diffs ; demande un terminal 24 bits.
     pub syntax: bool,
     pub node_style: NodeStyle,
-    /// Étiquettes des branches distantes (`origin/…`) visibles dans le graphe.
-    pub show_remotes: bool,
+    /// Nature des branches dont part le graphe.
+    pub scope: Scope,
+    /// Branches choisies dans la liste (`b` `f`) ; `None` : toutes.
+    pub picked: Option<BTreeSet<Branch>>,
+    /// Liste des branches, quand elle est ouverte.
+    pub picker: Option<Picker>,
     pub store: GraphStore,
     pub labels: HashMap<Oid, Vec<Label>>,
     pub log_done: bool,
@@ -474,7 +547,7 @@ pub struct App {
 impl App {
     pub fn new(repo: Repo, plain: bool) -> Result<App> {
         // Le flux démarre en premier : git parcourt pendant que les refs sont lues.
-        let log = Some(git::spawn_log(repo.root.clone(), None));
+        let log = Some(git::spawn_log(repo.root.clone(), None, Revs::default()));
         let labels = git::load_labels(&repo)?;
         Ok(App {
             meta_reader: MetaReader::new(&repo.root)?,
@@ -483,7 +556,9 @@ impl App {
             plain,
             syntax: true,
             node_style: NodeStyle::Dots,
-            show_remotes: true,
+            scope: Scope::All,
+            picked: None,
+            picker: None,
             store: GraphStore::default(),
             labels,
             log_done: false,
@@ -906,6 +981,170 @@ impl App {
         }
     }
 
+    /// Toutes les branches du dépôt : les locales, puis les distantes.
+    fn branches(&self) -> Vec<Branch> {
+        let labels = self.labels.values().flatten();
+        // HEAD détaché porte une étiquette locale sans être une branche.
+        let branches = labels.filter(|label| label.kind != RefKind::Tag && !(label.is_head && label.name == "HEAD"));
+        let mut branches: Vec<Branch> = branches.map(|label| (label.kind, label.name.clone())).collect();
+        branches.sort();
+        branches
+    }
+
+    /// Une branche est-elle montrée dans le graphe ? Il faut que sa nature soit
+    /// visible, et qu'elle soit parmi les branches choisies.
+    fn shows_branch(&self, kind: RefKind, name: &str) -> bool {
+        let visible = match kind {
+            RefKind::Local => self.scope != Scope::Remote,
+            RefKind::Remote => self.scope != Scope::Local,
+            RefKind::Tag => return true,
+        };
+        visible && self.picked.as_ref().is_none_or(|picked| picked.iter().any(|(k, n)| *k == kind && n == name))
+    }
+
+    /// Une étiquette est-elle à poser sur son commit ? Les tags toujours, les
+    /// branches quand le graphe les montre.
+    pub fn shows(&self, label: &Label) -> bool {
+        if label.is_head && label.name == "HEAD" {
+            return self.scope != Scope::Remote;
+        }
+        self.shows_branch(label.kind, &label.name)
+    }
+
+    /// Ce qui restreint le graphe, pour l'en-tête : la nature des branches, et
+    /// le nombre de celles qui ont été choisies.
+    pub fn branch_note(&self) -> Option<String> {
+        let scope = match self.scope {
+            Scope::All => None,
+            Scope::Local => Some("no remotes".to_string()),
+            Scope::Remote => Some("remotes only".to_string()),
+        };
+        let picked = self.picked.as_ref().map(|picked| match picked.len() {
+            1 => "1 branch picked".to_string(),
+            count => format!("{count} branches picked"),
+        });
+        match (scope, picked) {
+            (Some(scope), Some(picked)) => Some(format!("{scope}, {picked}")),
+            (scope, picked) => scope.or(picked),
+        }
+    }
+
+    /// Références dont part `git log`, d'après la nature et le choix des branches.
+    fn revs(&self) -> Revs {
+        let Some(picked) = &self.picked else {
+            return match self.scope {
+                Scope::All => Revs::default(),
+                Scope::Local => Revs { args: vec!["--exclude=refs/remotes/*".to_string(), "--all".to_string()], head: true },
+                Scope::Remote => Revs { args: vec!["--remotes".to_string()], head: false },
+            };
+        };
+        let shown = picked.iter().filter(|(kind, name)| self.shows_branch(*kind, name));
+        let args = shown.map(|(kind, name)| match kind {
+            RefKind::Remote => format!("refs/remotes/{name}"),
+            _ => format!("refs/heads/{name}"),
+        });
+        let head = matches!(&self.repo.head, Head::Branch(name) if self.shows_branch(RefKind::Local, name));
+        Revs { args: args.collect(), head }
+    }
+
+    /// Les branches montrées ont changé : le graphe est relu, et le commit
+    /// sélectionné retrouvé s'il en fait toujours partie.
+    fn regraph(&mut self) {
+        let current = self.pane.as_ref().map(|pane| pane.oid).or_else(|| self.selected_oid());
+        self.close_pane();
+        self.restart_log(current, true);
+    }
+
+    /// `b` `o` montre ou cache les branches distantes ; `b` `O` ne garde
+    /// qu'elles, ou revient à toutes les branches.
+    fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
+        self.set_flash(match scope {
+            Scope::All => "Local and remote branches",
+            Scope::Local => "Remote branches hidden",
+            Scope::Remote => "Remote branches only",
+        });
+        self.regraph();
+    }
+
+    /// `b` `f` : ouvre la liste des branches, cochées quand le graphe les montre.
+    fn open_picker(&mut self) {
+        let items = self.branches();
+        if items.is_empty() {
+            return self.set_flash("No branch");
+        }
+        let checked = items.iter().map(|branch| self.picked.as_ref().is_none_or(|picked| picked.contains(branch)));
+        let checked: Vec<bool> = checked.collect();
+        self.picker = Some(Picker { items, checked, sel: 0, top: 0, height: 0, query: String::new(), typing: false, origin: 0 });
+    }
+
+    /// Touches de la liste des branches. Pendant la saisie d'une recherche, les
+    /// lettres sont du texte ; sinon ce sont des raccourcis.
+    fn apply_in_picker(&mut self, action: Action) {
+        let Some(picker) = &mut self.picker else { return };
+        if picker.typing {
+            match action {
+                Action::Quit => self.should_quit = true,
+                Action::PromptKey(key) => picker.query.push(key),
+                Action::PromptBackspace => {
+                    picker.query.pop();
+                }
+                Action::PromptSubmit => picker.typing = false,
+                Action::PromptCancel => {
+                    picker.typing = false;
+                    picker.query.clear();
+                }
+                _ => return,
+            }
+            // Le curseur suit la frappe, à partir de l'endroit où il était.
+            picker.sel = picker.seek(picker.origin, 1).unwrap_or(picker.origin);
+            return;
+        }
+        let page = picker.height.max(2) as isize - 1;
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::Move(delta) | Action::ScrollGraph(delta) | Action::ScrollPane(delta) => picker.step(delta),
+            Action::PromptKey('j') => picker.step(1),
+            Action::PromptKey('k') => picker.step(-1),
+            Action::Page(direction) => picker.step(direction * page),
+            Action::Top | Action::PromptKey('g') => picker.sel = 0,
+            Action::Bottom | Action::PromptKey('G') => picker.sel = picker.items.len() - 1,
+            Action::PromptKey(' ') => picker.checked[picker.sel] = !picker.checked[picker.sel],
+            Action::PromptKey('a') => {
+                // Tout cocher ; ou tout décocher si tout l'est déjà.
+                let all = picker.checked.iter().all(|&checked| checked);
+                picker.checked.fill(!all);
+            }
+            Action::PromptKey('/') => {
+                picker.typing = true;
+                picker.query.clear();
+                picker.origin = picker.sel;
+            }
+            Action::PromptKey(key @ ('n' | 'N')) => {
+                let delta = if key == 'n' { 1 } else { -1 };
+                let from = (picker.sel as isize + delta).rem_euclid(picker.items.len() as isize) as usize;
+                picker.sel = picker.seek(from, delta).unwrap_or(picker.sel);
+            }
+            // Échap quitte d'abord la recherche, puis la liste, sans rien changer.
+            Action::PromptCancel if !picker.query.is_empty() => picker.query.clear(),
+            Action::PromptCancel | Action::PromptKey('q') => self.picker = None,
+            Action::PromptSubmit => {
+                let chosen = picker.items.iter().zip(&picker.checked).filter(|(_, checked)| **checked);
+                let chosen: BTreeSet<Branch> = chosen.map(|(branch, _)| branch.clone()).collect();
+                if chosen.is_empty() {
+                    return self.set_flash("Pick at least one branch");
+                }
+                let picked = (chosen.len() < picker.items.len()).then_some(chosen);
+                self.picker = None;
+                if picked != self.picked {
+                    self.picked = picked;
+                    self.regraph();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Diff au premier plan : le fichier entier s'il est ouvert, sinon le diff.
     fn code_view(&mut self) -> Option<&mut DiffView> {
         self.pane.as_mut().and_then(|pane| pane.full.as_mut().or(pane.diff.as_mut()))
@@ -1040,6 +1279,18 @@ impl App {
     /// Saisie d'une recherche : le sous-menu choisit le type, puis le champ reçoit le texte.
     fn apply_in_prompt(&mut self, action: Action) {
         let Some(prompt) = self.prompt.take() else { return };
+        // Sous-menu des branches : la touche choisit, toute autre le referme.
+        if matches!(prompt, Prompt::Branches) {
+            let next = match action {
+                Action::Quit => Action::Quit,
+                Action::PromptKey('h') => Action::ToggleHierarchy,
+                Action::PromptKey('f') => Action::PickBranches,
+                Action::PromptKey('o') => Action::ToggleRemotes,
+                Action::PromptKey('O') => Action::OnlyRemotes,
+                _ => return,
+            };
+            return self.apply(next);
+        }
         // Les recherches rapides se relancent d'elles-mêmes, un instant après la dernière frappe.
         let live = |kind: SearchKind| kind.is_live().then(|| Instant::now() + LIVE_DELAY);
         self.prompt = match (prompt, action) {
@@ -1151,7 +1402,7 @@ impl App {
         self.want_all = self.goto.is_some();
         // L'ancien flux est lâché en premier : son git s'arrête, même en pleine recherche.
         self.log = None;
-        self.log = Some(git::spawn_log(self.repo.root.clone(), self.filter.clone()));
+        self.log = Some(git::spawn_log(self.repo.root.clone(), self.filter.clone(), self.revs()));
     }
 
     /// `R` : relit le dépôt, que d'autres commandes ont pu faire bouger. La branche
@@ -1165,6 +1416,13 @@ impl App {
                 self.labels = labels;
             }
             Err(err) => return self.set_flash(format!("Refresh failed: {err:#}")),
+        }
+        // Une branche choisie a pu disparaître : git refuserait son nom. S'il n'en
+        // reste aucune, le graphe revient à toutes les branches.
+        if let Some(picked) = self.picked.take() {
+            let branches: BTreeSet<Branch> = self.branches().into_iter().collect();
+            let left: BTreeSet<Branch> = picked.intersection(&branches).cloned().collect();
+            self.picked = Some(left).filter(|left| !left.is_empty());
         }
         if self.hierarchy.is_some() {
             self.hierarchy = None;
@@ -1335,20 +1593,36 @@ impl App {
             }
             return;
         }
+        if self.picker.is_some() {
+            return self.apply_in_picker(action);
+        }
         if self.prompt.is_some() {
             return self.apply_in_prompt(action);
         }
         if self.copy_from_header(&action) {
             return;
         }
-        // Valable dans toutes les vues, hiérarchie des branches comprise.
-        if matches!(action, Action::Refresh) {
-            return self.refresh();
-        }
-        if matches!(action, Action::ToggleRemotes) {
-            self.show_remotes = !self.show_remotes;
-            let state = if self.show_remotes { "shown" } else { "hidden" };
-            return self.set_flash(format!("Remote branches {state}"));
+        // Valables dans toutes les vues, hiérarchie des branches comprise.
+        match action {
+            Action::Refresh => return self.refresh(),
+            Action::BranchMenu => {
+                self.prompt = Some(Prompt::Branches);
+                return;
+            }
+            Action::PickBranches => return self.open_picker(),
+            // Cacher les branches distantes quand elles sont seules ramène aux locales.
+            Action::ToggleRemotes => {
+                return self.set_scope(if self.scope == Scope::Local { Scope::All } else { Scope::Local });
+            }
+            Action::OnlyRemotes => {
+                return self.set_scope(if self.scope == Scope::Remote { Scope::All } else { Scope::Remote });
+            }
+            // Depuis la hiérarchie, `b` `h` la referme.
+            Action::ToggleHierarchy if self.hierarchy.is_some() => {
+                self.hierarchy = None;
+                return;
+            }
+            _ => {}
         }
         if self.hierarchy.is_some() {
             return self.apply_in_hierarchy(action);
@@ -1452,7 +1726,7 @@ impl App {
             // Hors saisie, ces touches n'arrivent pas jusqu'ici.
             Action::PromptKey(_) | Action::PromptBackspace | Action::PromptSubmit | Action::PromptCancel => {}
             // Traitées plus haut, dans toutes les vues.
-            Action::Refresh | Action::ToggleRemotes => {}
+            Action::Refresh | Action::BranchMenu | Action::PickBranches | Action::ToggleRemotes | Action::OnlyRemotes => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,

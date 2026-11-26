@@ -208,6 +208,21 @@ impl SearchKind {
     }
 }
 
+/// Références dont part le graphe : toutes, ou celles que l'on a choisi de voir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revs {
+    /// Arguments de `git log` qui les désignent ; aucun quand il n'y a rien à montrer.
+    pub args: Vec<String>,
+    /// HEAD en fait partie : ce qui n'est pas encore commité peut s'y poser.
+    pub head: bool,
+}
+
+impl Default for Revs {
+    fn default() -> Revs {
+        Revs { args: vec!["--all".to_string()], head: true }
+    }
+}
+
 /// Recherche active : seuls les commits qui y répondent sont listés, sans casse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
@@ -258,12 +273,12 @@ impl Drop for LogStream {
 /// Lit `git log` dans un thread et envoie les lignes du graphe par lots sur un
 /// canal borné. Quand l'interface ne consomme plus, le thread se bloque sur le
 /// canal, puis git sur son tube : rien n'est lu d'avance au-delà de la file.
-pub fn spawn_log(root: PathBuf, filter: Option<Filter>) -> LogStream {
+pub fn spawn_log(root: PathBuf, filter: Option<Filter>, revs: Revs) -> LogStream {
     let (tx, rx) = mpsc::sync_channel(BATCH_QUEUE);
     let child = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&child);
     thread::spawn(move || {
-        if let Err(err) = read_log(&root, filter.as_ref(), &tx, &slot) {
+        if let Err(err) = read_log(&root, filter.as_ref(), &revs, &tx, &slot) {
             let _ = tx.send(LogMsg::Error(format!("{err:#}")));
         }
     });
@@ -305,9 +320,9 @@ fn regex_escape(text: &str) -> String {
 
 /// Options de `git log` qui restreignent l'historique aux commits recherchés.
 /// Le hash et le signe d'un hunk sont vérifiés à la lecture, ligne par ligne.
-fn log_command(root: &Path, filter: Option<&Filter>) -> Command {
+fn log_command(root: &Path, filter: Option<&Filter>, revs: &Revs) -> Command {
     let mut cmd = git(root);
-    cmd.args(["log", "--all", "--date-order"]);
+    cmd.arg("log").args(&revs.args).arg("--date-order");
     let Some(Filter { kind, query }) = filter else {
         cmd.arg("--format=%H %P");
         return cmd;
@@ -358,10 +373,15 @@ impl Sink<'_> {
 fn read_log(
     root: &Path,
     filter: Option<&Filter>,
+    revs: &Revs,
     tx: &SyncSender<LogMsg>,
     slot: &Mutex<Option<Child>>,
 ) -> Result<()> {
-    let mut child = log_command(root, filter)
+    // Sans référence, `git log` partirait de HEAD : il n'y a rien à lire.
+    if revs.args.is_empty() {
+        return Ok(());
+    }
+    let mut child = log_command(root, filter, revs)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -381,6 +401,7 @@ fn read_log(
     let mut sink = Sink { tx, layout: Layout::default(), batch: Batch::default(), limit: 64 };
     // Le graphe complet commence par ce qui n'est pas encore commité, posé sur HEAD.
     if filter.is_none()
+        && revs.head
         && let Some(head) = dirty_head(root)
     {
         sink.push(&Oid::worktree(&head), Some(&[head]));

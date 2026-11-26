@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Side};
+use crate::app::{App, CodeHit, DiffView, FilesState, Find, HierState, HitMap, NodeStyle, Prompt, Scope, Side};
 use crate::diff::{DiffLine, FileEntry, LineKind, NO_LINE, inline_changes};
 use crate::git::{Head, Label, RefKind};
 use crate::graph::{COMMIT, Cell, DOWN, LEFT, RIGHT, UP};
@@ -217,6 +217,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.hierarchy.is_some() {
         draw_hierarchy(buf, app, Rect::new(area.x, area.y, area.width, 1), Rect::new(area.x, body_y, area.width, body_h));
         draw_flash(buf, app, area);
+        draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
         if app.help {
             draw_help(buf, area);
         }
@@ -245,8 +246,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_flash(buf, app, area);
     if let Some(Prompt::Kind { sign }) = app.prompt {
-        draw_search_menu(buf, Rect::new(area.x, body_y, area.width, body_h), sign);
+        draw_menu(buf, Rect::new(area.x, body_y, area.width, body_h), " Search ", SEARCH_KINDS, sign);
     }
+    draw_branch_panels(buf, app, Rect::new(area.x, body_y, area.width, body_h));
     if app.help {
         draw_help(buf, area);
     }
@@ -294,7 +296,11 @@ fn draw_header(buf: &mut Buffer, app: &mut App, area: Rect) {
         Head::Detached(oid) => format!(" · detached HEAD at {}", oid.short()),
         Head::Unborn => String::new(),
     };
-    put(buf, x, area.y, text_end, &head, dim);
+    let x = put(buf, x, area.y, text_end, &head, dim);
+    // Le graphe ne part pas de toutes les branches : l'en-tête le rappelle.
+    if let Some(note) = app.branch_note() {
+        put(buf, x, area.y, text_end, &format!(" · {note}"), Style::new().fg(Color::Yellow));
+    }
 }
 
 fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
@@ -307,6 +313,7 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
         let (text, style) = match &app.log_error {
             Some(err) => (err.clone(), Style::new().fg(Color::Red)),
             None if app.log_done && app.filter.is_some() => ("No matching commits.".to_string(), dim),
+            None if app.log_done && app.branch_note().is_some() => ("No commits on the branches shown.".to_string(), dim),
             None if app.log_done => ("No commits.".to_string(), dim),
             None if app.filter.is_some() => ("Searching…".to_string(), dim),
             None => ("Loading…".to_string(), dim),
@@ -384,7 +391,7 @@ fn draw_graph(buf: &mut Buffer, app: &mut App, area: Rect) {
 
         let mut x = text_x;
         if let Some(labels) = app.labels.get(&oid) {
-            x = draw_labels(buf, x, y, text_end, labels, color, app.plain, app.show_remotes);
+            x = draw_labels(buf, x, y, text_end, labels, color, app.plain, |label| app.shows(label));
         }
         put(buf, x, y, text_end, &meta.subject, bright);
     }
@@ -397,9 +404,10 @@ fn copy_icon(plain: bool) -> &'static str {
 /// Étiquettes d'un commit avec leur texte, dans l'ordre d'affichage. Une branche
 /// distante posée sur le même commit que la branche locale du même nom la suit,
 /// réduite à « &origin » : son nom n'apprendrait rien de plus. Le booléen la
-/// signale : elle s'accole alors au cartouche de sa branche locale. `remotes` à
-/// faux écarte les branches distantes.
-fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label, bool)> {
+/// signale : elle s'accole alors au cartouche de sa branche locale. `shows`
+/// écarte les branches que le graphe ne montre pas.
+fn label_texts(labels: &[Label], shows: impl Fn(&Label) -> bool) -> Vec<(String, &Label, bool)> {
+    let labels: Vec<&Label> = labels.iter().filter(|label| shows(label)).collect();
     // Le dépôt distant, si `remote` est la branche `local` chez lui.
     let twin = |local: &Label, remote: &Label| -> Option<String> {
         let (origin, branch) = remote.name.split_once('/')?;
@@ -407,16 +415,14 @@ fn label_texts(labels: &[Label], remotes: bool) -> Vec<(String, &Label, bool)> {
             .then(|| format!("&{origin}"))
     };
     let mut out: Vec<(String, &Label, bool)> = Vec::new();
-    for label in labels {
+    for &label in &labels {
         match label.kind {
             RefKind::Local => {
                 out.push((label.name.clone(), label, false));
-                if remotes {
-                    out.extend(labels.iter().filter_map(|remote| Some((twin(label, remote)?, remote, true))));
-                }
+                out.extend(labels.iter().filter_map(|&remote| Some((twin(label, remote)?, remote, true))));
             }
             RefKind::Remote => {
-                if remotes && !labels.iter().any(|local| twin(local, label).is_some()) {
+                if !labels.iter().any(|&local| twin(local, label).is_some()) {
                     out.push((label.name.clone(), label, false));
                 }
             }
@@ -439,10 +445,10 @@ fn draw_labels(
     labels: &[Label],
     color: Color,
     plain: bool,
-    remotes: bool,
+    shows: impl Fn(&Label) -> bool,
 ) -> u16 {
     let arrow = if plain { ARROW_PLAIN } else { ARROW };
-    let labels = label_texts(labels, remotes);
+    let labels = label_texts(labels, shows);
     for (i, (name, label, joined)) in labels.iter().enumerate() {
         let name: String = if name.chars().count() > 32 {
             name.chars().take(31).chain(['…']).collect()
@@ -1047,11 +1053,11 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("", ""),
     ("", "Actions"),
     ("y", "Copy the commit hash, or the file path when on a file"),
-    ("h", "Branch hierarchy"),
+    ("b h · b f", "Branch hierarchy · pick the branches of the graph"),
+    ("b o · b O", "Hide the remote branches (origin) · show only them"),
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
     ("S", "Commit style: dots or rail"),
     ("R", "Refresh: reload the commits, branches and tags"),
-    ("o", "Show or hide the remote branches (origin)"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),
     ("", ""),
@@ -1100,18 +1106,27 @@ const SEARCH_KINDS: &[(&str, &str)] = &[
     ("-h", "hunk: removed lines"),
 ];
 
-/// Sous-menu de recherche, posé en bas à gauche au-dessus du champ de saisie.
-/// Après un `+` ou un `-`, seule la ligne qui peut encore suivre reste en évidence.
-fn draw_search_menu(buf: &mut Buffer, area: Rect, sign: Option<char>) {
+/// Commandes du sous-menu des branches : (touche, effet).
+const BRANCH_KEYS: &[(&str, &str)] = &[
+    ("h", "hierarchy of the branches"),
+    ("f", "pick the branches of the graph"),
+    ("o", "show or hide the remote branches"),
+    ("O", "remote branches only, or all"),
+];
+
+/// Sous-menu d'une touche à deux temps, posé en bas à gauche : celui de la
+/// recherche, au-dessus du champ de saisie, ou celui des branches. Après un `+`
+/// ou un `-`, seule la ligne qui peut encore suivre reste en évidence.
+fn draw_menu(buf: &mut Buffer, area: Rect, title: &str, entries: &[(&str, &str)], sign: Option<char>) {
     let key_w = 2;
-    let text_w = SEARCH_KINDS.iter().map(|(_, text)| width(text)).max().unwrap_or(0);
+    let text_w = entries.iter().map(|(_, text)| width(text)).max().unwrap_or(0);
     let w = (key_w + 2 + text_w + 6).min(area.width);
-    let h = (SEARCH_KINDS.len() as u16 + 2).min(area.height);
+    let h = (entries.len() as u16 + 2).min(area.height);
     let panel = Rect::new(area.x + 1.min(area.width - w), area.bottom() - h, w, h);
-    draw_panel(buf, panel, " Search ", " Esc to cancel ");
+    draw_panel(buf, panel, title, " Esc to cancel ");
     let base = Style::new().bg(PANEL_BG);
     let (x0, right) = (panel.x + 3, panel.right() - 1);
-    for (i, (keys, text)) in SEARCH_KINDS.iter().enumerate().take(h.saturating_sub(2) as usize) {
+    for (i, (keys, text)) in entries.iter().enumerate().take(h.saturating_sub(2) as usize) {
         let y = panel.y + 1 + i as u16;
         let reachable = sign.is_none_or(|sign| keys.starts_with(sign));
         let (key_style, text_style) = if reachable {
@@ -1121,6 +1136,84 @@ fn draw_search_menu(buf: &mut Buffer, area: Rect, sign: Option<char>) {
         };
         put(buf, x0, y, right, keys, key_style);
         put(buf, x0 + key_w + 2, y, right, text, text_style);
+    }
+}
+
+/// Panneaux des branches, par-dessus le graphe ou la hiérarchie : le sous-menu
+/// de `b`, puis la liste des branches à cocher.
+fn draw_branch_panels(buf: &mut Buffer, app: &mut App, area: Rect) {
+    if matches!(app.prompt, Some(Prompt::Branches)) {
+        draw_menu(buf, area, " Branches ", BRANCH_KEYS, None);
+    }
+    draw_picker(buf, app, area);
+}
+
+/// Liste des branches à cocher pour le graphe, au centre de l'écran. La recherche
+/// n'y filtre rien : elle surligne les branches trouvées, la ligne du bas la rappelle.
+fn draw_picker(buf: &mut Buffer, app: &mut App, area: Rect) {
+    let scope = app.scope;
+    let Some(picker) = &mut app.picker else { return };
+    let name_w = picker.items.iter().map(|(_, name)| width(name)).max().unwrap_or(0);
+    let w = (name_w + 12).clamp(58, 96).min(area.width.saturating_sub(2));
+    // Le cadre, la liste, puis une ligne pour les touches ou la recherche.
+    let h = (picker.items.len() as u16 + 3).min(area.height.saturating_sub(2));
+    if w < 20 || h < 4 {
+        return;
+    }
+    let panel = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    let checked = picker.checked.iter().filter(|&&checked| checked).count();
+    let title = format!(" Branches in the graph · {checked}/{} ", picker.items.len());
+    draw_panel(buf, panel, &title, " Enter to apply · Esc to cancel ");
+
+    // Le cadre laisse sa couleur aux cellules : le texte reprend celle du terminal.
+    let base = Style::new().bg(PANEL_BG).fg(Color::Reset);
+    let (x0, right) = (panel.x + 2, panel.right() - 1);
+    let rows = (h - 3) as usize;
+    picker.height = rows;
+    // Le curseur reste dans la partie visible de la liste.
+    picker.top = picker.top.min(picker.sel).max((picker.sel + 1).saturating_sub(rows));
+    for (i, index) in (picker.top..picker.items.len()).take(rows).enumerate() {
+        let y = panel.y + 1 + i as u16;
+        let (kind, name) = &picker.items[index];
+        let current = index == picker.sel;
+        let row = if current { base.bg(SEL_BG) } else { base };
+        buf.set_style(Rect::new(panel.x + 1, y, w - 2, 1), row);
+        let (mark, mark_style) = match picker.checked[index] {
+            true => ("[x]", row.fg(ACCENT).add_modifier(Modifier::BOLD)),
+            false => ("[ ]", row.fg(DIM)),
+        };
+        let x = put(buf, x0, y, right, mark, mark_style);
+        // En retrait : une branche que la nature choisie (`b` `o`, `b` `O`) écarte du graphe.
+        let hidden = matches!((scope, kind), (Scope::Local, RefKind::Remote) | (Scope::Remote, RefKind::Local));
+        let name_style = if hidden || !picker.checked[index] { row.fg(DIM) } else { row };
+        put(buf, x + 1, y, right, name, name_style);
+        if picker.matches(index) {
+            let exact = picker.query.chars().any(char::is_uppercase);
+            let folded = if exact { name.clone() } else { name.to_lowercase() };
+            if let Some(byte) = folded.find(&picker.query) {
+                let (from, len) = (folded[..byte].chars().count(), picker.query.chars().count());
+                let bg = if current { FIND_CURRENT_BG } else { FIND_BG };
+                mark_span(buf, (x + 1, y, right), 0, (from, from + len), Style::new().fg(Color::Black).bg(bg));
+            }
+        }
+    }
+
+    let y = panel.bottom() - 2;
+    let found = (0..picker.items.len()).filter(|&index| picker.matches(index)).count();
+    if picker.typing || !picker.query.is_empty() {
+        let x = put(buf, x0, y, right, "find:", base.fg(ACCENT).add_modifier(Modifier::BOLD));
+        let x = put(buf, x + 1, y, right, &picker.query, base);
+        if picker.typing {
+            put(buf, x, y, right, "▏", base.fg(ACCENT));
+        }
+        let status = match found {
+            0 => "no match".to_string(),
+            1 => "1 match".to_string(),
+            found => format!("{found} matches · n N"),
+        };
+        put_right(buf, x + 2, y, right.saturating_sub(1), &status, base.fg(DIM));
+    } else {
+        put(buf, x0, y, right, "Space check · a all or none · / search", base.fg(DIM));
     }
 }
 

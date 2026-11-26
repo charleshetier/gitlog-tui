@@ -51,8 +51,9 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       Enter on a diff opens the whole file in a floating window
       n N next / previous commit (file list), file (diff), change (whole file)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
-      h branch hierarchy · S commit style · R refresh · ? all shortcuts
-      o show or hide the remote branches (origin)
+      S commit style · R refresh · ? all shortcuts
+      b then h branch hierarchy · f pick the branches of the graph
+             o show or hide the remote branches (origin) · O remote branches only
       ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
 
 /// Durée d'attente d'un événement tant qu'un travail de fond est en cours.
@@ -187,6 +188,22 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return (key.code == KeyCode::Char('c')).then_some(Action::Quit);
     }
+    // La liste des branches reçoit les lettres telles quelles, et les touches de déplacement.
+    if app.picker.is_some() && !app.help {
+        return Some(match key.code {
+            KeyCode::Char(c) => Action::PromptKey(c),
+            KeyCode::Backspace => Action::PromptBackspace,
+            KeyCode::Enter => Action::PromptSubmit,
+            KeyCode::Esc => Action::PromptCancel,
+            KeyCode::Up => Action::Move(-1),
+            KeyCode::Down => Action::Move(1),
+            KeyCode::PageUp => Action::Page(-1),
+            KeyCode::PageDown => Action::Page(1),
+            KeyCode::Home => Action::Top,
+            KeyCode::End => Action::Bottom,
+            _ => return None,
+        });
+    }
     // Pendant la saisie d'une recherche, les lettres sont du texte, pas des raccourcis.
     if app.prompt.is_some() && !app.help {
         return Some(match key.code {
@@ -209,12 +226,11 @@ fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Action::Open,
         KeyCode::Left => Action::Horizontal(-4),
         KeyCode::Right => Action::Horizontal(4),
-        KeyCode::Char('h') => Action::ToggleHierarchy,
+        KeyCode::Char('b') => Action::BranchMenu,
         KeyCode::Char('s') => Action::Search,
         KeyCode::Char('/') => Action::Find,
         KeyCode::Char('S') => Action::CycleNodes,
         KeyCode::Char('R') => Action::Refresh,
-        KeyCode::Char('o') => Action::ToggleRemotes,
         KeyCode::Char('y') => Action::CopySelected,
         KeyCode::Char('n') => Action::Step(1),
         KeyCode::Char('N') => Action::Step(-1),

@@ -855,15 +855,166 @@ fn remote_branches_are_shortened_and_hidden() {
     assert!(line(&view, "Squelette initial").contains("◀ origin/feature "), "{view}");
     assert!(line(&view, "Travail sur la branche").contains("◀ feature  Travail"), "{view}");
 
-    // `o` masque les branches distantes, puis les rend.
+    // `b` `o` masque les branches distantes, puis les rend.
     app.apply(Action::ToggleRemotes);
     assert_eq!(app.flash(), Some("Remote branches hidden"));
+    wait(&mut app, "sans les distantes", |app| app.log_done);
     let view = screen(&mut app, 110, 12);
-    assert!(!view.contains("origin"), "{view}");
+    assert!(!view.contains("origin") && view.contains("· no remotes"), "{view}");
     assert!(view.contains("◀ HEAD → main  Merge de feature") && view.contains("◀ v0.1.0 "), "{view}");
     app.apply(Action::ToggleRemotes);
-    assert_eq!(app.flash(), Some("Remote branches shown"));
-    assert!(screen(&mut app, 110, 12).contains("&origin"));
+    assert_eq!(app.flash(), Some("Local and remote branches"));
+    wait(&mut app, "toutes", |app| app.log_done);
+    let view = screen(&mut app, 110, 12);
+    assert!(view.contains("&origin") && !view.contains("no remotes"), "{view}");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn branches_of_the_graph_are_chosen() {
+    let dir = make_repo("branches");
+    // origin/main suit main, puis main avance seule ; origin/extra n'existe que chez origin.
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "main"]);
+    git(&dir, &["checkout", "-q", "-b", "extra"]);
+    std::fs::write(dir.join("d.txt"), "distant\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Distant seulement"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/extra", "extra"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    git(&dir, &["branch", "-q", "-D", "extra"]);
+    std::fs::write(dir.join("e.txt"), "local\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "Local seulement"]);
+    // Du travail non commité, posé sur HEAD.
+    std::fs::write(dir.join("e.txt"), "local, en cours\n").unwrap();
+
+    let mut app = App::new(Repo::open(&dir).unwrap(), true).unwrap();
+    wait(&mut app, "historique", |app| app.log_done);
+    let reload = |app: &mut App| wait(app, "graphe", |app| app.log_done && !app.stale);
+    let keys = |app: &mut App, keys: &str| keys.chars().for_each(|key| app.apply(Action::PromptKey(key)));
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("Distant seulement") && view.contains("Local seulement") && view.contains("- changes -"), "{view}");
+
+    // `b` ouvre le sous-menu ; une touche qui n'en est pas le referme sans rien faire.
+    app.apply(Action::BranchMenu);
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains(" Branches ") && view.contains("pick the branches of the graph"), "{view}");
+    keys(&mut app, "x");
+    assert!(app.prompt.is_none() && app.picker.is_none() && app.hierarchy.is_none());
+    // `b` `h` : la hiérarchie, ouverte puis refermée.
+    app.apply(Action::BranchMenu);
+    keys(&mut app, "h");
+    assert!(app.hierarchy.is_some() && app.prompt.is_none());
+    app.apply(Action::BranchMenu);
+    assert!(screen(&mut app, 110, 16).contains(" Branches "));
+    keys(&mut app, "h");
+    assert!(app.hierarchy.is_none());
+
+    // `b` `o` : sans les branches distantes, le commit qui n'est que chez origin disparaît.
+    app.apply(Action::BranchMenu);
+    keys(&mut app, "o");
+    reload(&mut app);
+    let view = screen(&mut app, 110, 16);
+    assert!(!view.contains("Distant seulement") && !view.contains("origin"), "{view}");
+    assert!(view.contains("Local seulement") && view.contains("- changes -") && view.contains("· no remotes"), "{view}");
+    // `b` `O` : elles seules. Plus de commit local, ni de travail en cours ; les
+    // branches locales n'ont plus d'étiquette, les distantes ont leur nom entier.
+    app.apply(Action::BranchMenu);
+    keys(&mut app, "O");
+    assert_eq!(app.flash(), Some("Remote branches only"));
+    reload(&mut app);
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("◀ origin/extra  Distant seulement") && view.contains("◀ origin/main  Merge de feature"), "{view}");
+    assert!(!view.contains("Local seulement") && !view.contains("- changes -") && !view.contains("HEAD →"), "{view}");
+    assert!(!view.contains("◀ feature") && view.contains("◀ v0.1.0 ") && view.contains("· remotes only"), "{view}");
+    // `b` `o` les cache alors : il reste les locales. `b` `O` deux fois : seules, puis toutes.
+    app.apply(Action::ToggleRemotes);
+    assert_eq!(app.scope, crate::app::Scope::Local);
+    app.apply(Action::OnlyRemotes);
+    app.apply(Action::OnlyRemotes);
+    assert_eq!(app.flash(), Some("Local and remote branches"));
+    reload(&mut app);
+    assert!(screen(&mut app, 110, 16).contains("Distant seulement"));
+
+    // `b` `f` : la liste des branches, toutes cochées, locales d'abord.
+    app.apply(Action::BranchMenu);
+    keys(&mut app, "f");
+    let picker = app.picker.as_ref().expect("la liste est ouverte");
+    let names: Vec<&str> = picker.items.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(names, ["feature", "main", "origin/extra", "origin/main"]);
+    assert!(picker.checked.iter().all(|&checked| checked));
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("Branches in the graph · 4/4") && view.contains("[x] origin/extra"), "{view}");
+    // `a` décoche tout ; rien de coché ne s'applique pas.
+    keys(&mut app, "a");
+    app.apply(Action::PromptSubmit);
+    assert!(app.picker.is_some() && app.flash() == Some("Pick at least one branch"));
+    assert!(screen(&mut app, 110, 16).contains("Branches in the graph · 0/4"));
+    // `/` cherche sans filtrer : le curseur va sur la branche trouvée, la liste reste entière.
+    keys(&mut app, "/EXTRA");
+    assert_eq!(app.picker.as_ref().unwrap().sel, 0);
+    for _ in 0..5 {
+        app.apply(Action::PromptBackspace);
+    }
+    keys(&mut app, "extra");
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("find: extra") && view.contains("1 match") && view.contains("[ ] feature"), "{view}");
+    app.apply(Action::PromptSubmit);
+    assert!(app.picker.as_ref().is_some_and(|picker| picker.sel == 2 && !picker.typing));
+    // Espace coche la branche sous le curseur ; `n` et `N` passent d'une trouvée à l'autre.
+    keys(&mut app, " ");
+    keys(&mut app, "/main");
+    app.apply(Action::PromptSubmit);
+    assert_eq!(app.picker.as_ref().unwrap().sel, 3);
+    keys(&mut app, "n");
+    assert_eq!(app.picker.as_ref().unwrap().sel, 1);
+    keys(&mut app, "N");
+    assert_eq!(app.picker.as_ref().unwrap().sel, 3);
+    // Échap quitte la recherche, puis Entrée applique : le graphe part de origin/extra seule.
+    app.apply(Action::PromptCancel);
+    assert!(app.picker.as_ref().is_some_and(|picker| picker.query.is_empty()));
+    app.apply(Action::PromptSubmit);
+    assert!(app.picker.is_none());
+    reload(&mut app);
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("◀ origin/extra  Distant seulement") && view.contains("· 1 branch picked"), "{view}");
+    assert!(!view.contains("Local seulement") && !view.contains("origin/main") && !view.contains("HEAD →"), "{view}");
+    assert!(!view.contains("- changes -") && view.contains("Merge de feature"), "{view}");
+    // Une branche choisie que la nature écarte : il ne reste rien à montrer.
+    app.apply(Action::ToggleRemotes);
+    reload(&mut app);
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("No commits on the branches shown.") && view.contains("no remotes, 1 branch picked"), "{view}");
+    app.apply(Action::ToggleRemotes);
+
+    // La liste rouvre sur le choix en place. Échap la referme sans rien changer ;
+    // `a` puis Entrée reviennent à toutes les branches.
+    app.apply(Action::PickBranches);
+    assert_eq!(app.picker.as_ref().unwrap().checked, [false, false, true, false]);
+    keys(&mut app, "ja");
+    app.apply(Action::PromptCancel);
+    assert!(app.picker.is_none() && app.picked.as_ref().is_some_and(|picked| picked.len() == 1));
+    app.apply(Action::PickBranches);
+    keys(&mut app, "a");
+    app.apply(Action::PromptSubmit);
+    assert!(app.picked.is_none());
+    reload(&mut app);
+    let view = screen(&mut app, 110, 16);
+    assert!(view.contains("Local seulement") && view.contains("Distant seulement") && !view.contains("picked"), "{view}");
+
+    // Une branche choisie puis supprimée est oubliée au rafraîchissement ; comme
+    // c'était la seule, le graphe revient à toutes les branches.
+    app.apply(Action::PickBranches);
+    keys(&mut app, "a ");
+    app.apply(Action::PromptSubmit);
+    assert_eq!(app.picked.as_ref().map(|picked| picked.len()), Some(1));
+    git(&dir, &["branch", "-q", "-D", "feature"]);
+    app.apply(Action::Refresh);
+    reload(&mut app);
+    assert!(app.picked.is_none() && app.log_error.is_none());
+    assert!(screen(&mut app, 110, 16).contains("Local seulement"));
 
     drop(app);
     let _ = std::fs::remove_dir_all(&dir);
