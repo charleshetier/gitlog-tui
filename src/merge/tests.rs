@@ -182,13 +182,18 @@ fn taking_sides_undo_and_redo() {
     press(&mut app, "<");
     assert!(text(&app).contains("five\nsix\nseven"));
     assert_eq!(app.flash(), Some("Took theirs"));
-    press(&mut app, "}c");
+    press(&mut app, "}}");
     assert_eq!(app.flash(), Some("No more changes"));
-    // `Tab` vaut `]` : le conflit suivant, en boucle. Il n'en reste aucun.
-    press(&mut app, "C{");
+    press(&mut app, "{{");
     assert_eq!(app.sheet().unwrap().line(), Some("TWO ours"));
-    key(&mut app, KeyCode::Tab);
+    // `n` va au conflit suivant, en boucle. Il n'en reste aucun.
+    press(&mut app, "n");
     assert_eq!(app.flash(), Some("No conflict left in this file"));
+    // Tant qu'il attend, `n` y ramène d'où qu'on soit.
+    press(&mut app, "{{{{{uu");
+    assert_eq!(app.sheet().unwrap().unresolved(), 1);
+    press(&mut app, "GnN");
+    assert_eq!(app.sheet().unwrap().line(), Some("two"));
     // Hors d'un bloc, il n'y a rien à prendre.
     press(&mut app, "g>");
     assert_eq!(app.flash(), Some("No change under the cursor"));
@@ -200,8 +205,8 @@ fn taking_sides_undo_and_redo() {
 fn the_result_is_edited_in_insert_mode() {
     let dir = make_conflict("edit", &[]);
     let mut app = open(&dir);
-    // `x` garde la base ; `A` écrit à la fin de la ligne.
-    press(&mut app, "x");
+    // `Espace` garde la base ; `A` écrit à la fin de la ligne.
+    press(&mut app, " ");
     assert_eq!(app.sheet().unwrap().unresolved(), 0);
     press(&mut app, "A");
     assert_eq!(app.mode, Mode::Insert);
@@ -252,7 +257,7 @@ fn saving_writes_the_file_and_staging_resolves_it() {
     let mut app = open(&dir);
     // Tant qu'un conflit attend, le fichier n'est pas remis à git.
     press(&mut app, "S");
-    assert_eq!(app.flash(), Some("1 conflict left: take a side, or x keeps the result as it is"));
+    assert_eq!(app.flash(), Some("1 conflict left: take a side, or Space keeps the result as it is"));
     assert!(git_out(&dir, &["ls-files", "-u"]).contains("a.txt"));
     press(&mut app, ">");
     ctrl(&mut app, 's');
@@ -285,18 +290,22 @@ fn saving_writes_the_file_and_staging_resolves_it() {
 }
 
 #[test]
-fn n_walks_the_files_and_keeps_their_results() {
+fn tab_walks_the_files_and_keeps_their_results() {
     let dir = make_conflict("files", &[]);
     let mut app = open(&dir);
-    press(&mut app, ">n");
+    press(&mut app, ">");
+    key(&mut app, KeyCode::Tab);
     assert_eq!(app.current, 1);
     assert_eq!(text(&app), "alpha\nbeta\n");
-    press(&mut app, "n");
+    key(&mut app, KeyCode::Tab);
     assert_eq!((app.current, app.flash()), (1, Some("Last conflicted file")));
+    // `n` reste dans le fichier : il va à son conflit.
+    press(&mut app, "gn");
+    assert_eq!((app.current, app.sheet().unwrap().line()), (1, Some("beta")));
     // Le résultat du premier fichier attend, sans être écrit.
-    press(&mut app, "N");
+    key(&mut app, KeyCode::BackTab);
     assert!(text(&app).starts_with("one\nTWO ours"));
-    press(&mut app, "N");
+    key(&mut app, KeyCode::BackTab);
     assert_eq!((app.current, app.flash()), (0, Some("First conflicted file")));
     assert!(std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("<<<<<<<"));
     let _ = std::fs::remove_dir_all(dir);
@@ -316,7 +325,7 @@ fn search_highlights_and_moves_the_cursor() {
     let sheet = app.sheet().unwrap();
     assert_eq!((sheet.line(), sheet.col), (Some("eight"), 0));
     assert_eq!(sheet.find.as_ref().map(|find| find.hits.len()), Some(1));
-    // `n` parcourt alors les occurrences, pas les fichiers.
+    // `n` parcourt alors les occurrences, pas les conflits.
     press(&mut app, "/");
     key(&mut app, KeyCode::Esc);
     press(&mut app, "/I");
@@ -329,7 +338,7 @@ fn search_highlights_and_moves_the_cursor() {
     key(&mut app, KeyCode::Enter);
     assert_eq!(app.sheet().unwrap().find.as_ref().unwrap().hits.len(), 3);
     press(&mut app, "g>");
-    press(&mut app, "]>");
+    press(&mut app, "}>");
     assert_eq!(app.sheet().unwrap().find.as_ref().unwrap().hits.len(), 3, "{}", text(&app));
     press(&mut app, "N");
     assert_eq!(app.sheet().unwrap().line(), Some("eight"));
@@ -342,7 +351,10 @@ fn search_highlights_and_moves_the_cursor() {
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Esc);
     assert!(app.sheet().unwrap().find.is_none());
-    press(&mut app, "n");
+    // La recherche retirée, `n` revient aux conflits ; `Tab` change de fichier dans tous les cas.
+    press(&mut app, "un");
+    assert_eq!((app.current, app.sheet().unwrap().line()), (0, Some("two")));
+    key(&mut app, KeyCode::Tab);
     assert_eq!(app.current, 1);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -380,17 +392,18 @@ fn files_it_cannot_merge_are_shown_as_such() {
     );
     let mut app = open(&dir);
     assert_eq!(app.files.len(), 5);
-    press(&mut app, "nn");
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Tab);
     let view = screen(&mut app, 120, 16);
     assert!(view.contains("This conflict cannot be resolved here: our side deleted this file."), "{view}");
     assert!(view.contains("result · c.txt"), "{view}");
     // Les touches d'édition n'y font rien.
     press(&mut app, "ix>");
     assert_eq!(app.mode, Mode::Normal);
-    press(&mut app, "n");
+    key(&mut app, KeyCode::Tab);
     assert!(matches!(&app.files[3].state, FileState::Refused(why) if why == "this is a binary file"));
     // Un fichier vide à la base : tout ce que chaque côté y a mis est en conflit.
-    press(&mut app, "n");
+    key(&mut app, KeyCode::Tab);
     assert_eq!((app.sheet().unwrap().unresolved(), text(&app).as_str()), (1, ""));
     press(&mut app, "><");
     assert_eq!(text(&app), "new ours\nnew theirs\n");
@@ -429,14 +442,16 @@ fn long_lines_wrap_or_scroll() {
     let (ours, theirs) = (format!("{long}ours\nend\n"), format!("{long}theirs\nend\n"));
     let dir = make_conflict("wrap", &[("z.txt", "short\nend\n", Some(&ours), Some(&theirs))]);
     let mut app = open(&dir);
-    press(&mut app, "nn>");
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Tab);
+    press(&mut app, ">");
     let cut = screen(&mut app, 120, 24);
     assert_eq!(cut.matches("a long line").count(), 3 * 2, "{cut}");
     // À la fin de la ligne, la vue a défilé de côté pour montrer le curseur.
     press(&mut app, "$");
     assert!(screen(&mut app, 120, 24).contains("line: ours"));
     assert!(app.sheet().unwrap().x > 0);
-    press(&mut app, "w");
+    press(&mut app, "z");
     let wrapped = screen(&mut app, 120, 24);
     assert!(wrapped.matches("a long line").count() > 30, "{wrapped}");
     assert!(wrapped.contains("line: ours") && wrapped.contains("line: theirs"), "{wrapped}");
@@ -452,8 +467,9 @@ fn any_keys_at_any_size_keep_the_document_sound() {
     let keys = [
         KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('>'), KeyCode::Char('<'), KeyCode::Char('x'), KeyCode::Char('i'),
         KeyCode::Char('a'), KeyCode::Char('o'), KeyCode::Char('O'), KeyCode::Char('d'), KeyCode::Char('u'), KeyCode::Char('A'),
-        KeyCode::Char(']'), KeyCode::Char('}'), KeyCode::Char('{'), KeyCode::Char('G'), KeyCode::Char('g'), KeyCode::Char('w'),
+        KeyCode::Char(' '), KeyCode::Char('}'), KeyCode::Char('{'), KeyCode::Char('G'), KeyCode::Char('g'), KeyCode::Char('w'),
         KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Char('l'), KeyCode::Char('h'), KeyCode::Char('$'), KeyCode::Char('z'),
+        KeyCode::Char('b'), KeyCode::Char('e'), KeyCode::BackTab,
         KeyCode::Esc, KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete, KeyCode::Tab, KeyCode::Up, KeyCode::Down, KeyCode::Left,
         KeyCode::Right, KeyCode::Home, KeyCode::End, KeyCode::PageDown, KeyCode::PageUp, KeyCode::Esc, KeyCode::Backspace,
     ];

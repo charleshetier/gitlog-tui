@@ -24,7 +24,7 @@ const LOOKAHEAD: usize = 2000;
 const BATCHES_PER_TICK: usize = 64;
 /// Entrées du cache de métadonnées avant remise à zéro.
 const META_CACHE: usize = 4096;
-/// Lignes de contexte gardées au-dessus d'une modification atteinte par `n` ou `p`.
+/// Lignes de contexte gardées au-dessus d'une modification atteinte par `n` ou `N`.
 const CHANGE_MARGIN: usize = 3;
 /// Pause dans la frappe avant de lancer une recherche en direct : un seul git par mot tapé.
 const LIVE_DELAY: Duration = Duration::from_millis(200);
@@ -455,8 +455,12 @@ pub enum Action {
     CopyFolder,
     /// Copie l'URL du remote `origin`.
     CopyRemote,
-    /// Élément voisin : fichier dans un diff, commit dans la liste des fichiers.
+    /// `n` / `N` : dans du code, la modification suivante ou précédente ; pendant
+    /// une recherche, l'occurrence.
     Step(isize),
+    /// `Tab` / `Maj+Tab` : le voisin du niveau au-dessus, sans quitter la vue. Le
+    /// commit suivant depuis la liste des fichiers, le fichier suivant depuis un diff.
+    Sibling(isize),
     ScrollGraph(isize),
     ScrollPane(isize),
     Horizontal(isize),
@@ -469,9 +473,9 @@ pub enum Action {
     /// Relit le dépôt : branche courante, refs et historique.
     Refresh,
     /// Affiche ou masque les étiquettes des branches distantes.
-    /// `w` : replie ou non les lignes trop longues, dans le graphe et dans le code.
+    /// `z` : replie ou non les lignes trop longues, dans le graphe et dans le code.
     ToggleWrap,
-    /// `h` : amène le curseur sur le commit de HEAD, sans l'ouvrir.
+    /// `H` : amène le curseur sur le commit de HEAD, sans l'ouvrir.
     GotoHead,
     /// `b` : ouvre le sous-menu des branches.
     BranchMenu,
@@ -503,6 +507,9 @@ pub struct App {
     pub node_style: NodeStyle,
     /// Les lignes trop longues sont repliées, dans le graphe comme dans le code.
     pub wrap: bool,
+    /// Le fichier entier du diff en cours de lecture s'ouvrira dès qu'il sera lu :
+    /// on est passé au fichier voisin depuis la fenêtre du fichier entier.
+    full_next: bool,
     /// Nature des branches dont part le graphe.
     pub scope: Scope,
     /// Branches choisies dans la liste (`b` `f`) ; `None` : toutes.
@@ -573,6 +580,7 @@ impl App {
             syntax: true,
             node_style: NodeStyle::Dots,
             wrap: false,
+            full_next: false,
             scope: Scope::All,
             picked: None,
             picker: None,
@@ -823,6 +831,11 @@ impl App {
                         }
                         changed = true;
                     }
+                    // Le diff du fichier voisin est lu : sa fenêtre du fichier entier s'ouvre.
+                    if self.full_next && pane.full.is_none() && pane.diff.as_ref().is_some_and(|diff| diff.done) {
+                        self.full_next = false;
+                        self.open_full();
+                    }
                 }
                 DiffMsg::Hierarchy { id, result } => {
                     if let Some(view) = self.hierarchy.as_mut().filter(|h| h.req == id) {
@@ -859,7 +872,7 @@ impl App {
         }
     }
 
-    /// `h` : dans le graphe, amène le curseur sur le commit de HEAD et la vue
+    /// `H` : dans le graphe, amène le curseur sur le commit de HEAD et la vue
     /// jusqu'à lui, en chargeant l'historique s'il le faut. Le commit n'est pas ouvert.
     fn goto_head(&mut self) {
         let head = self.labels.iter().find(|(_, labels)| labels.iter().any(|label| label.is_head));
@@ -993,12 +1006,15 @@ impl App {
         }
     }
 
-    /// `n` / `N` dans le fichier entier : modification suivante ou précédente.
+    /// `n` / `N` dans un diff ou dans le fichier entier : modification suivante
+    /// ou précédente.
     fn step_change(&mut self, delta: isize) {
-        let Some(view) = self.pane.as_mut().and_then(|p| p.full.as_mut()) else { return };
+        let Some(view) = self.pane.as_mut().and_then(|p| p.full.as_mut().or(p.diff.as_mut())) else { return };
         let top = view.top;
         let target = if delta > 0 {
-            view.change_tops().find(|&t| t > top)
+            // Une modification à une rangée près de sa place est celle où l'on se
+            // trouve : un diff qu'on vient d'ouvrir montre déjà la première.
+            view.change_tops().find(|&t| t > top + 1)
         } else {
             view.change_tops().take_while(|&t| t < top).last()
         };
@@ -1546,25 +1562,26 @@ impl App {
         }
     }
 
-    /// `n` / `N` : fichier voisin dans un diff, commit voisin dans la liste des fichiers.
-    fn step(&mut self, delta: isize) {
+    /// `Tab` / `Maj+Tab` : fichier voisin depuis un diff ou depuis le fichier
+    /// entier, commit voisin depuis la liste des fichiers.
+    fn sibling(&mut self, delta: isize) {
         let neighbour = |value: usize, len: usize| value.saturating_add_signed(delta).min(len.saturating_sub(1));
         match self.depth() {
-            4 => self.step_change(delta),
-            3 => {
+            depth @ (3 | 4) => {
                 let Some(pane) = &self.pane else { return };
                 let FilesState::Ready(files) = &pane.files else { return };
                 let current = pane.diff.as_ref().map_or(0, |d| d.file);
                 let next = neighbour(current, files.len());
                 if next != current {
                     self.open_file(next);
+                    // Depuis le fichier entier, on y reste : il s'ouvre dès que le diff est lu.
+                    self.full_next = depth == 4;
                 } else {
                     self.set_flash(if delta < 0 { "First file of the commit" } else { "Last file of the commit" });
                 }
             }
             // Pas de commit voisin dans `gitchange` : la liste des fichiers est seule.
-            2 if self.tool == Tool::Changes => {}
-            2 => {
+            2 if self.tool == Tool::Log => {
                 let next = neighbour(self.selected, self.store.len());
                 if next != self.selected {
                     self.open_commit(next);
@@ -1573,7 +1590,7 @@ impl App {
                     self.set_flash(if delta < 0 { "First commit" } else { "Last commit" });
                 }
             }
-            _ => self.move_by(delta),
+            _ => {}
         }
     }
 
@@ -1616,7 +1633,7 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Back { .. } | Action::ToggleHierarchy => self.hierarchy = None,
-            Action::Move(delta) | Action::ScrollGraph(delta) | Action::Step(delta) => self.move_by(delta),
+            Action::Move(delta) | Action::ScrollGraph(delta) => self.move_by(delta),
             Action::Page(direction) => self.move_by(direction * self.pane_height.max(2) as isize - direction),
             Action::Top => self.move_by(isize::MIN),
             Action::Bottom => self.move_by(isize::MAX),
@@ -1639,6 +1656,8 @@ impl App {
     }
 
     pub fn apply(&mut self, action: Action) {
+        // Toute action renonce au fichier entier attendu ; passer au voisin le redemande.
+        self.full_next = false;
         // Le panneau des raccourcis recouvre tout : il ne laisse passer que sa fermeture.
         if self.help || matches!(action, Action::ToggleHelp) {
             match action {
@@ -1771,9 +1790,10 @@ impl App {
             Action::Step(delta) => {
                 // Pendant une recherche dans le code, `n` et `N` suivent ses occurrences.
                 if !self.find_step(delta) {
-                    self.step(delta);
+                    self.step_change(delta);
                 }
             }
+            Action::Sibling(delta) => self.sibling(delta),
             Action::Find => self.open_find(),
             Action::GotoHead => {
                 if self.pane.is_none() {

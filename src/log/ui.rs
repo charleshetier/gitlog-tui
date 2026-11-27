@@ -658,7 +658,7 @@ fn draw_full(buf: &mut Buffer, app: &mut App, area: Rect) {
     let room = panel.width.saturating_sub(width(&count) + 9);
     let title = format!(" {} · {count} ", tail(path, room));
     // Pendant une recherche dans le code, ces touches lui reviennent.
-    let keys = if full.find.is_some() { " n N matches · Esc to clear the search " } else { " n N changes · Esc to close " };
+    let keys = if full.find.is_some() { " n N matches · Esc to clear the search " } else { " n N changes · Tab files · Esc to close " };
     draw_panel(buf, panel, &title, keys);
     // L'intérieur reprend le fond du terminal : les couleurs du diff y restent celles du volet.
     for y in inner.top()..inner.bottom() {
@@ -1050,11 +1050,12 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("↑ ↓  j k", "Move the selection, scroll a diff"),
     ("PgUp PgDn", "Move by one page"),
     ("g G  Home End", "Jump to the first / last item"),
-    ("h", "Jump to the HEAD commit in the graph, without opening it"),
+    ("H", "Jump to the HEAD commit in the graph, without opening it"),
     ("Enter", "Open the commit, the file diff, then the whole file"),
-    ("n N", "Next / previous commit, file or change, by level"),
+    ("n N", "Next / previous change in a diff or in the whole file"),
+    ("Tab", "Next commit or file, one level up; Shift+Tab: previous"),
     ("/", "Search the code of a diff; then n N for the matches"),
-    ("← →", "Scroll a diff sideways"),
+    ("← →  h l", "Scroll a diff sideways"),
     ("1 2 3 4", "Go to a level: graph, files, diff, whole file"),
     ("q  Esc", "Go back one level, leave a search; q quits from the graph"),
     ("", ""),
@@ -1063,10 +1064,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("b h · b f", "Branch hierarchy · pick the branches of the graph"),
     ("b o · b O", "Hide the remote branches (origin) · show only them"),
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
-    ("S · w", "Commit style: dots or rail · wrap the long lines"),
+    ("S · z", "Commit style: dots or rail · wrap the long lines"),
     ("R", "Refresh: reload the commits, branches and tags"),
-    ("?", "Show or hide this panel"),
-    ("Ctrl+C", "Quit"),
+    ("? · Ctrl+C", "Show or hide this panel · quit"),
     ("", ""),
     ("", "Mouse"),
     ("Click", "Open a commit or a file"),
@@ -1083,15 +1083,16 @@ const CHANGES_SHORTCUTS: &[(&str, &str)] = &[
     ("PgUp PgDn", "Move by one page"),
     ("g G  Home End", "Jump to the first / last item"),
     ("Enter", "Open the file diff, then the whole file"),
-    ("n N", "Next / previous file (diff) or change (whole file)"),
+    ("n N", "Next / previous change in a diff or in the whole file"),
+    ("Tab", "Next file, without leaving the view; Shift+Tab: previous"),
     ("/", "Search the code of a diff; then n N for the matches"),
-    ("← →", "Scroll a diff sideways"),
+    ("← →  h l", "Scroll a diff sideways"),
     ("1 2 3", "Go to a level: files, diff, whole file"),
     ("q  Esc", "Go back one level, leave a search; q quits from the files"),
     ("", ""),
     ("", "Actions"),
     ("y", "Copy the path of the file under the cursor"),
-    ("w", "Wrap or cut the long lines"),
+    ("z", "Wrap or cut the long lines"),
     ("R", "Refresh: read the changes again"),
     ("?", "Show or hide this panel"),
     ("Ctrl+C", "Quit"),

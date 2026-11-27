@@ -277,15 +277,15 @@ pub enum Action {
     /// Molette : la vue défile, le curseur suit s'il sort de l'écran.
     Scroll(isize),
     Edit(Edit),
-    /// `n` / `N` : fichier suivant ou précédent ; pendant une recherche, occurrence.
+    /// `n` / `N` : conflit suivant ou précédent ; pendant une recherche, occurrence.
     Next(isize),
-    /// `]` / `[` : conflit suivant ou précédent.
-    Conflict(isize),
+    /// `Tab` / `Maj+Tab` : fichier en conflit suivant ou précédent.
+    File(isize),
     /// `}` / `{` : changement suivant ou précédent.
     Change(isize),
     /// `>` / `<` : prendre notre côté, ou celui qui arrive.
     Take(Side),
-    /// `x` : tenir le conflit pour réglé tel qu'il est.
+    /// `Espace` : tenir le conflit pour réglé tel qu'il est.
     Dismiss,
     Save,
     Stage,
@@ -440,10 +440,10 @@ impl App {
             Action::Edit(edit) => self.edit(edit),
             Action::Next(delta) => {
                 if !self.find_step(delta) {
-                    self.switch_file(delta);
+                    self.jump(delta, true);
                 }
             }
-            Action::Conflict(delta) => self.jump(delta, true),
+            Action::File(delta) => self.switch_file(delta),
             Action::Change(delta) => self.jump(delta, false),
             Action::Take(side) => {
                 let seg = self.sheet().map(|sheet| sheet.pos().seg);
@@ -522,6 +522,7 @@ impl App {
             Edit::FirstWord => sheet.col = edit::first_word(&line),
             Edit::WordNext => sheet.col = edit::word_next(&line, sheet.col).min(edit::last_col(&line, mode)),
             Edit::WordPrev => sheet.col = edit::word_prev(&line, sheet.col),
+            Edit::WordEnd => sheet.col = edit::word_end(&line, sheet.col).min(edit::last_col(&line, mode)),
             Edit::Insert(entry) => {
                 sheet.record();
                 next_mode = Mode::Insert;
@@ -740,8 +741,8 @@ impl App {
         let Some(sheet) = self.sheet() else { return };
         match sheet.unresolved() {
             0 => {}
-            1 => return self.flash.set("1 conflict left: take a side, or x keeps the result as it is"),
-            n => return self.flash.set(format!("{n} conflicts left: take a side, or x keeps the result as it is")),
+            1 => return self.flash.set("1 conflict left: take a side, or Space keeps the result as it is"),
+            n => return self.flash.set(format!("{n} conflicts left: take a side, or Space keeps the result as it is")),
         }
         if (sheet.dirty || !sheet.saved) && !self.write() {
             return;

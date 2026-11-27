@@ -266,35 +266,60 @@ fn copy_step_and_help_shortcuts() {
     app.apply(Action::Move(1));
     assert_eq!(app.copy_target().as_deref(), Some("b.txt"));
 
-    // Au clavier : n pour le suivant, N (Maj+n) pour le précédent ; p n'est plus une touche.
+    // Au clavier : n et N (Maj+n) pour les modifications, Tab et Maj+Tab pour le
+    // voisin du niveau au-dessus ; p n'est plus une touche.
     {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: char, modifiers| crate::log::keys::on_key(&app, KeyEvent::new(KeyCode::Char(c), modifiers));
+        let press = |code: KeyCode, modifiers| crate::log::keys::on_key(&app, KeyEvent::new(code, modifiers));
+        let key = |c: char, modifiers| press(KeyCode::Char(c), modifiers);
         assert!(matches!(key('n', KeyModifiers::NONE), Some(Action::Step(1))));
         assert!(matches!(key('N', KeyModifiers::SHIFT), Some(Action::Step(-1))));
+        assert!(matches!(press(KeyCode::Tab, KeyModifiers::NONE), Some(Action::Sibling(1))));
+        assert!(matches!(press(KeyCode::BackTab, KeyModifiers::SHIFT), Some(Action::Sibling(-1))));
         assert!(key('p', KeyModifiers::NONE).is_none());
+        // h et l doublent les flèches ; HEAD est sur H, le repli des lignes sur z.
+        assert!(matches!(key('h', KeyModifiers::NONE), Some(Action::Horizontal(-4))));
+        assert!(matches!(key('l', KeyModifiers::NONE), Some(Action::Horizontal(4))));
+        assert!(matches!(key('H', KeyModifiers::SHIFT), Some(Action::GotoHead)));
+        assert!(matches!(key('z', KeyModifiers::NONE), Some(Action::ToggleWrap)));
+        assert!(key('w', KeyModifiers::NONE).is_none());
     }
 
-    // n / N dans la liste des fichiers : commit suivant, précédent.
-    app.apply(Action::Step(1));
+    // Tab / Maj+Tab dans la liste des fichiers : commit suivant, précédent.
+    app.apply(Action::Sibling(1));
     assert_eq!((app.depth(), app.selected), (2, 1));
     assert_eq!(app.pane.as_ref().map(|p| p.oid), Some(app.store.oid(1)));
-    app.apply(Action::Step(-1));
-    app.apply(Action::Step(-1));
+    app.apply(Action::Sibling(-1));
+    app.apply(Action::Sibling(-1));
     assert_eq!((app.depth(), app.selected), (2, 0));
     assert_eq!(app.flash(), Some("First commit"));
+    // `n` n'y fait rien : il n'y a pas de code à parcourir.
+    app.apply(Action::Step(1));
+    assert_eq!((app.depth(), app.selected), (2, 0));
 
-    // n / N dans un diff : fichier suivant, précédent, sans sortir du commit.
+    // Tab / Maj+Tab dans un diff : fichier suivant, précédent, sans sortir du commit.
     wait(&mut app, "fichiers", files_ready);
     app.apply(Action::Open);
     assert_eq!(diff_file(&app), Some(0));
-    app.apply(Action::Step(1));
+    app.apply(Action::Sibling(1));
     assert_eq!(diff_file(&app), Some(1));
     assert_eq!(app.copy_target().as_deref(), Some("b.txt"));
-    app.apply(Action::Step(1));
+    app.apply(Action::Sibling(1));
     assert_eq!(diff_file(&app), Some(1));
     assert_eq!(app.flash(), Some("Last file of the commit"));
-    app.apply(Action::Step(-1));
+    app.apply(Action::Sibling(-1));
+    assert_eq!(diff_file(&app), Some(0));
+
+    // Depuis le fichier entier, Tab passe au fichier voisin sans quitter la fenêtre.
+    wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
+    app.apply(Action::Open);
+    assert_eq!(app.depth(), 4);
+    app.apply(Action::Sibling(1));
+    wait(&mut app, "fichier entier du voisin", |app| app.pane.as_ref().and_then(|p| p.full.as_ref()).is_some_and(|d| d.file == 1 && d.done));
+    assert_eq!(app.depth(), 4);
+    app.apply(Action::Back { quit: false });
+    assert_eq!((app.depth(), diff_file(&app)), (3, Some(1)));
+    app.apply(Action::Sibling(-1));
     assert_eq!(diff_file(&app), Some(0));
 
     // ? : panneau flottant, qui ne laisse passer que sa fermeture.
@@ -342,6 +367,20 @@ fn whole_file_window() {
     wait(&mut app, "diff", |app| app.pane.as_ref().and_then(|p| p.diff.as_ref()).is_some_and(|d| d.done));
     let hunks = app.pane.as_ref().unwrap().diff.as_ref().unwrap().len();
     assert!(hunks < 40, "le diff ne porte que les hunks : {hunks} lignes");
+    // Dans le diff déjà, n et N vont d'une modification à l'autre.
+    let diff = |app: &App| {
+        let view = app.pane.as_ref().unwrap().diff.as_ref().unwrap();
+        (view.top, view.change_tops().collect::<Vec<_>>())
+    };
+    let hunk_tops = diff(&app).1;
+    assert_eq!(hunk_tops.len(), 3);
+    app.apply(Action::Step(1));
+    assert_eq!(diff(&app).0, hunk_tops[1]);
+    app.apply(Action::Step(1));
+    app.apply(Action::Step(1));
+    assert_eq!((diff(&app).0, app.flash()), (hunk_tops[2], Some("Last change")));
+    app.apply(Action::Step(-1));
+    assert_eq!((diff(&app).0, app.depth()), (hunk_tops[1], 3));
 
     // Entrée sur le diff : le fichier entier, placé sur la première modification.
     app.apply(Action::Open);
@@ -753,7 +792,7 @@ fn slash_searches_the_code_of_a_diff() {
     assert_eq!(backgrounds(&buffer, line(&buffer, "\"hello\""), "hello"), [other]);
 
     // Entrée garde la recherche ; `n` et `N` parcourent les occurrences, en boucle,
-    // au lieu de changer de fichier.
+    // au lieu d'aller d'une modification à l'autre.
     app.apply(Action::PromptSubmit);
     assert_eq!(app.code_find(), Some(("hello", false, Some(0), 2)));
     app.apply(Action::Step(1));
@@ -927,13 +966,13 @@ fn gitchange_shows_the_uncommitted_changes() {
     assert_eq!(app.depth(), 4);
     app.apply(Action::GoLevel(1));
     assert!(app.depth() == 2 && app.pane.is_some());
-    // `n` passe au fichier suivant depuis un diff : le fichier indexé, puis le fichier non suivi.
+    // `Tab` passe au fichier suivant depuis un diff : le fichier indexé, puis le fichier non suivi.
     app.apply(Action::GoLevel(2));
     wait(&mut app, "diff", diff_done);
-    app.apply(Action::Step(1));
+    app.apply(Action::Sibling(1));
     wait(&mut app, "diff", diff_done);
     assert!(screen(&mut app, 110, 14).contains("branche, puis indexé"));
-    app.apply(Action::Step(1));
+    app.apply(Action::Sibling(1));
     wait(&mut app, "diff", diff_done);
     assert!(screen(&mut app, 110, 14).contains("tout neuf"));
 
@@ -1355,8 +1394,8 @@ fn uncommitted_changes_head_the_graph() {
     wait(&mut app, "diff", diff_done);
     assert_eq!(texts(&app), ["cinq"]);
     // Un fichier non suivi se lit en entier, comme un ajout.
-    app.apply(Action::Step(1));
-    app.apply(Action::Step(1));
+    app.apply(Action::Sibling(1));
+    app.apply(Action::Sibling(1));
     wait(&mut app, "diff", diff_done);
     assert_eq!(texts(&app), ["fn main() {}", "fn other() {}"]);
     assert_eq!(app.copy_target().as_deref(), Some("untracked.rs"));

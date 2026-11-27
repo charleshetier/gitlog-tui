@@ -52,6 +52,8 @@ pub enum Edit {
     FirstWord,
     WordNext,
     WordPrev,
+    /// Dernier caractère du mot, ou du suivant si l'on y est déjà.
+    WordEnd,
     Insert(Entry),
     /// `Esc` : retour au mode normal.
     Leave,
@@ -131,6 +133,10 @@ impl Keys {
                     '0' => Edit::LineStart,
                     '$' => Edit::LineEnd,
                     '^' => Edit::FirstWord,
+                    'w' => Edit::WordNext,
+                    'b' => Edit::WordPrev,
+                    'e' => Edit::WordEnd,
+                    'x' => Edit::Delete,
                     'i' => Edit::Insert(Entry::Here),
                     'a' => Edit::Insert(Entry::After),
                     'I' => Edit::Insert(Entry::LineStart),
@@ -190,6 +196,20 @@ pub fn word_next(line: &str, col: usize) -> usize {
         }
     }
     while chars.get(at).is_some_and(|&c| class(c) == 0) {
+        at += 1;
+    }
+    at
+}
+
+/// Dernier caractère du mot où l'on se trouve ou, si l'on y est déjà, du suivant.
+pub fn word_end(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut at = (col + 1).min(chars.len());
+    while chars.get(at).is_some_and(|&c| class(c) == 0) {
+        at += 1;
+    }
+    let Some(&first) = chars.get(at) else { return chars.len().saturating_sub(1) };
+    while chars.get(at + 1).is_some_and(|&c| class(c) == class(first)) {
         at += 1;
     }
     at
@@ -256,6 +276,11 @@ mod tests {
         assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('i'))), Read::Edit(Edit::Insert(Entry::Here)));
         assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('h'))), Read::Edit(Edit::Left));
         assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('z'))), Read::Pass);
+        // Les réflexes de vi : les mots, et `x` qui supprime un caractère.
+        assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('w'))), Read::Edit(Edit::WordNext));
+        assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('b'))), Read::Edit(Edit::WordPrev));
+        assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('e'))), Read::Edit(Edit::WordEnd));
+        assert_eq!(keys.read(Mode::Normal, key(KeyCode::Char('x'))), Read::Edit(Edit::Delete));
         assert_eq!(keys.read(Mode::Normal, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)), Read::Edit(Edit::Redo));
         assert_eq!(keys.read(Mode::Normal, KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)), Read::Edit(Edit::WordNext));
     }
@@ -303,6 +328,10 @@ mod tests {
         assert_eq!(word_prev(line, 10), 4);
         assert_eq!(word_prev(line, 6), 4);
         assert_eq!(word_prev(line, 0), 0);
+        assert_eq!(word_end(line, 0), 2);
+        assert_eq!(word_end(line, 2), 8);
+        assert_eq!(word_end(line, 11), 12);
+        assert_eq!(word_end(line, 23), 23);
         assert_eq!(first_word("    x"), 4);
         assert_eq!((last_col("abc", Mode::Normal), last_col("abc", Mode::Insert), last_col("", Mode::Normal)), (2, 3, 0));
     }

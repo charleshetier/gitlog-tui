@@ -30,14 +30,15 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       drag the mouse over a diff to select code: it is copied on release
       / search the code of a diff, then n N next / previous match, Esc to clear
       Enter on a diff opens the whole file in a floating window
-      n N next / previous commit (file list), file (diff), change (whole file)
+      n N next / previous change, in a diff and in the whole file
+      Tab Shift+Tab next / previous commit (from the file list) or file (from a diff)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       S commit style · R refresh · ? all shortcuts
       b then h branch hierarchy · f pick the branches of the graph
              o show or hide the remote branches (origin) · O remote branches only
-      ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
-      h jump to the HEAD commit in the graph, without opening it
-      w wrap or cut the long lines, in the graph and in the code";
+      ←→ h l scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
+      H jump to the HEAD commit in the graph, without opening it
+      z wrap or cut the long lines, in the graph and in the code";
 
 const CHANGES_HELP: &str = "\
 gitchange: the changes of a git repository that are not committed yet
@@ -55,9 +56,10 @@ Keys: ↑↓ j k move · Enter open · Esc go back · q go back, quit from the l
       drag the mouse over a diff to select code: it is copied on release
       / search the code of a diff, then n N next / previous match, Esc to clear
       Enter on a diff opens the whole file in a floating window
-      n N next / previous file (diff), change (whole file)
-      R read the changes again · w wrap or cut the long lines · ? all shortcuts
-      ←→ scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
+      n N next / previous change, in a diff and in the whole file
+      Tab Shift+Tab next / previous file, without leaving the diff
+      R read the changes again · z wrap or cut the long lines · ? all shortcuts
+      ←→ h l scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit";
 
 const MERGE_HELP: &str = "\
 gitmerge: resolve the conflicted files of a merge, a rebase or a cherry-pick
@@ -73,14 +75,15 @@ Usage: gitmerge [OPTIONS] [PATH]
 Three columns: ours on the left, theirs on the right, the result in the middle.
 The changes of one side only are already in the result; a conflict waits.
 
-Keys: ↑↓ j k move · ] [ or Tab Shift+Tab next / previous conflict · } { or c C change
+Keys: ↑↓ j k move · n N next / previous conflict · } { next / previous change
+      Tab Shift+Tab next / previous conflicted file
       > take ours · < take theirs · the other one then adds its lines below
-      x keep the result as it is · u undo · Ctrl+R redo
-      i a I A o O or Enter edit the result, Esc back to normal mode · dd delete a line
-      n N next / previous conflicted file
+      Space keep the result as it is · u undo · Ctrl+R redo
+      i a I A o O or Enter edit the result, Esc back to normal mode
+      h l w b e 0 $ move in the line · x delete a character · dd a line
       Ctrl+S write the result to the file · S write it and stage it (git add)
       / search the result, then n N next / previous match, Esc to clear
-      w wrap or cut the long lines · y copy the line · R read the conflicts again
+      z wrap or cut the long lines · y copy the line · R read the conflicts again
       ? all shortcuts · q quit";
 
 struct Args {
