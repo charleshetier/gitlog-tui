@@ -475,6 +475,8 @@ pub enum Action {
     /// Affiche ou masque les étiquettes des branches distantes.
     /// `z` : replie ou non les lignes trop longues, dans le graphe et dans le code.
     ToggleWrap,
+    /// `r` : fait de la branche sous le curseur la racine de l'arbre.
+    RootHere,
     /// `H` : amène le curseur sur le commit de HEAD, sans l'ouvrir.
     GotoHead,
     /// `b` : ouvre le sous-menu des branches.
@@ -528,6 +530,8 @@ pub struct App {
     pub pane_height: usize,
     pub pane: Option<Pane>,
     pub hierarchy: Option<Hierarchy>,
+    /// Racine choisie dans la vue hiérarchique, pour cette session.
+    hier_root: Option<String>,
     /// Panneau flottant des raccourcis.
     pub help: bool,
     pub prompt: Option<Prompt>,
@@ -595,6 +599,7 @@ impl App {
             pane_height: 0,
             pane: None,
             hierarchy: None,
+            hier_root: None,
             help: false,
             prompt: None,
             filter: None,
@@ -1627,9 +1632,23 @@ impl App {
     fn toggle_hierarchy(&mut self) {
         if self.hierarchy.take().is_none() {
             // Recalculée à chaque ouverture : les branches bougent hors de gitlog.
-            let req = self.diffs.request_hierarchy();
+            let req = self.diffs.request_hierarchy(self.hier_root.clone());
             self.hierarchy = Some(Hierarchy { state: HierState::Loading, sel: 0, top: 0, req });
         }
+    }
+
+    /// `r` : la branche sous le curseur devient la racine de l'arbre, le temps
+    /// de la session. Sur la racine choisie, l'arbre revient à son choix d'origine.
+    fn root_here(&mut self) {
+        let Some(branch) = self.selected_branch() else { return };
+        let (name, was_root) = (branch.name.clone(), Some(&branch.name) == self.hier_root.as_ref());
+        self.hier_root = (!was_root).then(|| name.clone());
+        self.hierarchy = None;
+        self.toggle_hierarchy();
+        self.set_flash(match was_root {
+            true => "Root back to the usual branch".to_string(),
+            false => format!("{name} is the root of the tree"),
+        });
     }
 
     /// Actions de la vue hiérarchie, qui recouvre le reste de l'écran.
@@ -1660,6 +1679,7 @@ impl App {
                     self.goto_commit(oid);
                 }
             }
+            Action::RootHere => self.root_here(),
             Action::CopySelected | Action::CopyHash => {
                 let branch = self.selected_branch().cloned();
                 match (branch, action) {
@@ -1792,8 +1812,8 @@ impl App {
                 self.open_commit(row);
             }
             Action::ClickFile(index) => self.open_file(index),
-            // Déjà traitées plus haut, quelle que soit la vue.
-            Action::ClickBranch(_) | Action::ToggleHelp | Action::CopyFolder | Action::CopyRemote => {}
+            // Déjà traitées plus haut, quelle que soit la vue, ou propres à la hiérarchie.
+            Action::ClickBranch(_) | Action::ToggleHelp | Action::CopyFolder | Action::CopyRemote | Action::RootHere => {}
             Action::CopySelected => {
                 if let Some(text) = self.copy_target() {
                     self.copy(text);

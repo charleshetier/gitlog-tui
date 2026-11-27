@@ -2,7 +2,9 @@
 //! branche est rattachée à la branche dont elle est partie, sans les commits.
 //!
 //! L'arbre est déduit du graphe : une branche a pour parent la branche déjà
-//! placée par rapport à laquelle elle a le moins de commits propres.
+//! placée par rapport à laquelle elle a le moins de commits propres. Deux
+//! branches sur le même commit sont frères : rien ne dit laquelle vient de
+//! l'autre.
 
 use crate::log::graph::Oid;
 
@@ -56,16 +58,18 @@ pub struct BranchRow {
 }
 
 /// Construit l'arbre. `ab[b][p]` donne (commits de `b` absents de `p`,
-/// commits de `p` absents de `b`).
-pub fn build(branches: &[Branch], ab: &[Vec<(u32, u32)>]) -> Vec<BranchRow> {
+/// commits de `p` absents de `b`). `wanted` impose la racine, quand on l'a
+/// choisie dans la vue.
+pub fn build(branches: &[Branch], ab: &[Vec<(u32, u32)>], wanted: Option<&str>) -> Vec<BranchRow> {
     let n = branches.len();
     if n == 0 {
         return Vec::new();
     }
-    // Racine : un nom conventionnel, sinon la branche la plus contenue dans les autres.
-    let root = ROOT_NAMES
-        .iter()
-        .find_map(|name| branches.iter().position(|b| b.name == *name))
+    // Racine : celle qu'on a choisie, sinon un nom conventionnel, sinon la
+    // branche la plus contenue dans les autres.
+    let root = wanted
+        .and_then(|name| branches.iter().position(|b| b.name == name))
+        .or_else(|| ROOT_NAMES.iter().find_map(|name| branches.iter().position(|b| b.name == *name)))
         .unwrap_or_else(|| {
             (0..n)
                 .min_by_key(|&b| {
@@ -103,6 +107,9 @@ pub fn build(branches: &[Branch], ab: &[Vec<(u32, u32)>]) -> Vec<BranchRow> {
                         .unwrap()
                 })
         };
+        // Même commit : l'une ne vient pas de l'autre, elles sont frères. La
+        // racine n'en a pas : ce qui la rejoint reste son enfant.
+        let p = if ab[b][p] == (0, 0) && p != root { parent[p] } else { p };
         sync[b] = match ab[b][p] {
             (0, behind) if behind > 0 => Sync::Merged,
             (_, 0) => Sync::UpToDate,
@@ -117,8 +124,14 @@ pub fn build(branches: &[Branch], ab: &[Vec<(u32, u32)>]) -> Vec<BranchRow> {
     for &b in &order {
         children[parent[b]].push(b);
     }
+    // Les branches qui n'en portent pas d'autres d'abord, et la plus grosse
+    // descendance en dernier : les longs traits de l'arbre restent en bas.
+    let mut carried = vec![0usize; n];
+    for &b in order.iter().rev() {
+        carried[parent[b]] += carried[b] + 1;
+    }
     for list in &mut children {
-        list.sort_by(|&a, &b| branches[a].name.cmp(&branches[b].name));
+        list.sort_by(|&a, &b| (carried[a], &branches[a].name).cmp(&(carried[b], &branches[b].name)));
     }
 
     // Parcours en profondeur, sans récursion.
@@ -168,7 +181,7 @@ mod tests {
             .iter()
             .map(|(_, b)| branches.iter().map(|(_, p)| (missing(b, p), missing(p, b))).collect())
             .collect();
-        build(&infos, &ab)
+        build(&infos, &ab, None)
             .into_iter()
             .map(|r| (r.branch.name, r.depth, r.sync, r.ahead, r.behind))
             .collect()
@@ -207,6 +220,7 @@ mod tests {
 
     #[test]
     fn merged_and_identical_branches() {
+        // x et y sont sur le même commit : frères, et non l'une sous l'autre.
         let rows = tree(&[("main", &[1, 2]), ("old", &[1]), ("x", &[1, 2, 3]), ("y", &[1, 2, 3])]);
         assert_eq!(
             rows,
@@ -214,9 +228,42 @@ mod tests {
                 row("main", 0, Sync::Root, 0, 0),
                 row("old", 1, Sync::Merged, 0, 1),
                 row("x", 1, Sync::UpToDate, 1, 0),
-                row("y", 2, Sync::UpToDate, 0, 0),
+                row("y", 1, Sync::UpToDate, 1, 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_branch_on_the_root_commit_stays_under_it() {
+        // La racine ne peut pas avoir de frère : ce qui est sur son commit reste dessous.
+        let rows = tree(&[("main", &[1]), ("same", &[1]), ("topic", &[1, 2])]);
+        assert_eq!(
+            rows,
+            [
+                row("main", 0, Sync::Root, 0, 0),
+                row("same", 1, Sync::UpToDate, 0, 0),
+                row("topic", 1, Sync::UpToDate, 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_root_can_be_chosen() {
+        let infos: Vec<Branch> = ["main", "release", "topic"]
+            .iter()
+            .map(|name| Branch { name: name.to_string(), oid: Oid::from_bytes(&[0; 20]), is_head: false, remote: Remote::Untracked })
+            .collect();
+        // release ⊂ main ⊂ topic : par son nom, main est la racine d'office.
+        let sets: [&[u32]; 3] = [&[1, 2], &[1], &[1, 2, 3]];
+        let missing = |a: &[u32], b: &[u32]| a.iter().filter(|c| !b.contains(c)).count() as u32;
+        let ab: Vec<Vec<(u32, u32)>> =
+            sets.iter().map(|b| sets.iter().map(|p| (missing(b, p), missing(p, b))).collect()).collect();
+        let shape = |rows: Vec<BranchRow>| -> Vec<(String, u16)> { rows.into_iter().map(|r| (r.branch.name, r.depth)).collect() };
+        assert_eq!(shape(build(&infos, &ab, None)), [("main".into(), 0), ("release".into(), 1), ("topic".into(), 1)]);
+        // Choisie, release passe au-dessus et main devient son enfant.
+        assert_eq!(shape(build(&infos, &ab, Some("release"))), [("release".into(), 0), ("main".into(), 1), ("topic".into(), 2)]);
+        // Un nom qui n'est plus là ne change rien.
+        assert_eq!(shape(build(&infos, &ab, Some("gone"))), shape(build(&infos, &ab, None)));
     }
 
     #[test]
@@ -237,21 +284,21 @@ mod tests {
                 remote: Remote::Untracked,
             })
             .collect();
-        // main ← a ← a1, main ← b
+        // main ← a ← a1, main ← b ; b, sans descendance, passe avant a.
         let sets: [&[u32]; 4] = [&[1], &[1, 2], &[1, 2, 3], &[1, 4]];
         let missing = |a: &[u32], b: &[u32]| a.iter().filter(|c| !b.contains(c)).count() as u32;
         let ab: Vec<Vec<(u32, u32)>> =
             sets.iter().map(|b| sets.iter().map(|p| (missing(b, p), missing(p, b))).collect()).collect();
-        let rows = build(&infos, &ab);
+        let rows = build(&infos, &ab, None);
         let shape: Vec<(&str, Vec<bool>, bool)> =
             rows.iter().map(|r| (r.branch.name.as_str(), r.guides.clone(), r.last)).collect();
         assert_eq!(
             shape,
             [
                 ("main", vec![], true),
-                ("a", vec![], false),
-                ("a1", vec![true], true),
-                ("b", vec![], true),
+                ("b", vec![], false),
+                ("a", vec![], true),
+                ("a1", vec![false], true),
             ]
         );
     }

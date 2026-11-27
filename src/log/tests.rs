@@ -1735,7 +1735,30 @@ fn branch_hierarchy_view() {
     let meta = app.meta(app.selected);
     assert_eq!(meta.subject, "Suite du brouillon");
 
+    // r fait de la branche sous le curseur la racine de l'arbre.
+    app.apply(Action::ToggleHierarchy);
+    let ready = |app: &App| app.hierarchy.as_ref().is_some_and(|h| matches!(h.state, HierState::Ready { .. }));
+    wait(&mut app, "hiérarchie", ready);
+    app.apply(Action::Bottom);
+    assert_eq!(app.copy_target().as_deref(), Some("wip-suite"));
+    app.apply(Action::RootHere);
+    wait(&mut app, "hiérarchie", ready);
+    assert_eq!(app.flash(), Some("wip-suite is the root of the tree"));
+    let view = screen(&mut app, 100, 12);
+    let lines: Vec<&str> = view.lines().collect();
+    assert!(lines[2].contains("◀ wip-suite ") && !lines[2].contains("├─"), "{view}");
+    // main est passée dessous, avec tout ce qu'elle porte.
+    assert!(view.lines().skip(3).any(|line| line.contains("◀ main ")), "{view}");
+    // Sur la racine choisie, r rend l'arbre à son choix d'origine.
+    app.apply(Action::Top);
+    app.apply(Action::RootHere);
+    wait(&mut app, "hiérarchie", ready);
+    assert_eq!(app.flash(), Some("Root back to the usual branch"));
+    assert!(screen(&mut app, 100, 12).lines().nth(2).is_some_and(|line| line.contains("◀ main ")));
+
     // h ouvre et referme la vue.
+    app.apply(Action::ToggleHierarchy);
+    assert!(app.hierarchy.is_none());
     app.apply(Action::ToggleHierarchy);
     assert!(app.hierarchy.is_some());
     app.apply(Action::ToggleHierarchy);

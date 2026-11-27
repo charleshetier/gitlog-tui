@@ -34,7 +34,8 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       Tab Shift+Tab next / previous commit (from the file list) or file (from a diff)
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       S commit style · R refresh · ? all shortcuts
-      b then h branch hierarchy · f pick the branches of the graph
+      b then h branch hierarchy, where r roots the tree on a branch
+             f pick the branches of the graph
              o show or hide the remote branches (origin) · O remote branches only
       ←→ h l scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
       H jump to the HEAD commit in the graph, without opening it

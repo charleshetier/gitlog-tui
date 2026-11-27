@@ -495,7 +495,7 @@ pub enum DiffReq {
     /// `filter` : recherche active, qui ne garde que les fichiers concernés.
     Files { id: u64, oid: Oid, filter: Option<Filter> },
     File { id: u64, req: FileReq },
-    Hierarchy { id: u64 },
+    Hierarchy { id: u64, root: Option<String> },
 }
 
 pub enum DiffMsg {
@@ -534,10 +534,10 @@ impl DiffWorker {
                         msg_tx.send(DiffMsg::Files { id, result }).is_ok()
                     }
                     DiffReq::File { id, req } => stream_diff(&root, id, &req, &latest_in_thread, &msg_tx),
-                    DiffReq::Hierarchy { id } => {
+                    DiffReq::Hierarchy { id, root } => {
                         // Le dépôt est relu : la branche courante a pu changer hors de gitlog.
                         let result = Repo::open(&repo.root)
-                            .and_then(|repo| load_hierarchy(&repo))
+                            .and_then(|repo| load_hierarchy(&repo, root.as_deref()))
                             .map_err(|e| format!("{e:#}"));
                         msg_tx.send(DiffMsg::Hierarchy { id, result }).is_ok()
                     }
@@ -566,9 +566,9 @@ impl DiffWorker {
         id
     }
 
-    pub fn request_hierarchy(&self) -> u64 {
+    pub fn request_hierarchy(&self, root: Option<String>) -> u64 {
         let id = self.next_id();
-        let _ = self.tx.send(DiffReq::Hierarchy { id });
+        let _ = self.tx.send(DiffReq::Hierarchy { id, root });
         id
     }
 
@@ -886,7 +886,7 @@ const MAX_HIERARCHY_BRANCHES: usize = 150;
 /// Lit les branches locales et leurs écarts deux à deux, puis construit
 /// l'arbre. Tous les écarts viennent d'un seul `git for-each-ref`, grâce au
 /// champ `ahead-behind` (git 2.41 ou plus récent).
-fn load_hierarchy(repo: &Repo) -> Result<(Vec<BranchRow>, usize)> {
+fn load_hierarchy(repo: &Repo, root: Option<&str>) -> Result<(Vec<BranchRow>, usize)> {
     let list = output(
         &repo.root,
         &[
@@ -965,7 +965,7 @@ fn load_hierarchy(repo: &Repo) -> Result<(Vec<BranchRow>, usize)> {
                 .collect()
         })
         .collect();
-    Ok((hierarchy::build(&branches, &ab), hidden))
+    Ok((hierarchy::build(&branches, &ab, root), hidden))
 }
 
 #[cfg(test)]

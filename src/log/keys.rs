@@ -90,6 +90,7 @@ pub fn on_key(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Action::Find,
         KeyCode::Char('S') => Action::CycleNodes,
         KeyCode::Char('R') => Action::Refresh,
+        KeyCode::Char('r') => Action::RootHere,
         KeyCode::Char('y') => Action::CopySelected,
         KeyCode::Char('n') => Action::Step(1),
         KeyCode::Char('N') => Action::Step(-1),
