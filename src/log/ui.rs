@@ -39,9 +39,6 @@ const TAG_ICON_PLAIN: &str = "◇";
 /// Fond d'un tag : un gris à peine plus clair que celui du graphe. Un tag se
 /// tient en retrait, l'icône seule porte sa couleur.
 const TAG_BG: Color = Color::Indexed(238);
-/// Bouts arrondis du cartouche d'un tag (Powerline Extra, dans les Nerd Fonts).
-const CAP_LEFT: &str = "\u{e0b6}";
-const CAP_RIGHT: &str = "\u{e0b4}";
 /// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
 const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
@@ -431,7 +428,7 @@ fn label_texts(labels: &[Label], shows: impl Fn(&Label) -> bool) -> Vec<(String,
 /// réduite à « &origin » prolonge le cartouche de sa branche locale : un simple
 /// rectangle, sans flèche ni espace entre les deux. La branche courante
 /// s'annonce comme dans `git log` : « HEAD → nom ». Un tag ne pointe rien : son
-/// cartouche est une pastille aux bouts arrondis, derrière son icône.
+/// cartouche est un simple rectangle, derrière son icône.
 #[allow(clippy::too_many_arguments)]
 fn draw_labels(
     buf: &mut Buffer,
@@ -458,11 +455,11 @@ fn draw_labels(
         let reserve = if remaining > 1 { 4 } else { 0 };
         let tag = label.kind == RefKind::Tag;
         // Flèche (sauf accolée), marges du nom, espace qui suit ; un tag porte
-        // en plus ses bouts arrondis, son icône et l'espace qui l'en sépare.
+        // son icône et l'espace qui l'en sépare, mais aucune flèche.
         let chrome = match (*joined, tag) {
             (true, _) => 3,
             (false, false) => 4,
-            (false, true) => 5 + if plain { 0 } else { 2 },
+            (false, true) => 5,
         };
         if x + width(&name) + chrome + reserve > end {
             // Le cartouche précédent attendait sa jumelle : l'espace lui revient.
@@ -479,20 +476,13 @@ fn draw_labels(
         if label.is_head {
             style = style.add_modifier(Modifier::BOLD);
         }
-        let cap = Style::new().fg(bg);
         if tag {
-            if !plain {
-                x = put(buf, x, y, end, CAP_LEFT, cap);
-            }
             let icon = if plain { TAG_ICON_PLAIN } else { TAG_ICON };
             x = put(buf, x, y, end, &format!(" {icon}"), style.fg(TAG_COLOR));
         } else if !joined {
-            x = put(buf, x, y, end, arrow, cap);
+            x = put(buf, x, y, end, arrow, Style::new().fg(bg));
         }
         x = put(buf, x, y, end, &format!(" {name} "), style);
-        if tag && !plain {
-            x = put(buf, x, y, end, CAP_RIGHT, cap);
-        }
         // Pas d'espace avant une étiquette accolée.
         if !labels.get(i + 1).is_some_and(|next| next.2) {
             x += 1;
