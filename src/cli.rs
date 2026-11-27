@@ -35,7 +35,7 @@ Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
       s search, then c hash · m message · f file name · h hunk · +h added · -h removed
       S commit style · R refresh · ? all shortcuts
       b then h branch hierarchy, where r roots the tree on a branch
-             f pick the branches of the graph
+             f pick the branches of the graph · t show or hide the tags
              o show or hide the remote branches (origin) · O remote branches only
       ←→ h l scroll the diff sideways · PgUp PgDn g G · Ctrl+C quit
       H jump to the HEAD commit in the graph, without opening it

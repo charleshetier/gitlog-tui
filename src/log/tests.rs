@@ -95,7 +95,8 @@ fn three_levels_end_to_end() {
     assert_eq!(app.folder_path().contains('/'), !cfg!(windows));
     assert!(lines[2].contains("◉─╮") && lines[2].contains("◀ HEAD → main ") && lines[2].contains("Merge de feature"));
     assert!(!lines[2].contains("⧉") && lines[2].contains("Alice"));
-    assert!(level1.contains("◀ feature ") && level1.contains("◀ v0.1.0 "));
+    // Un tag porte son icône, sans flèche : il ne pointe rien.
+    assert!(level1.contains("◀ feature ") && level1.contains("◇ v0.1.0 ") && !level1.contains("◀ v0.1.0"));
     assert!(lines[5].contains("●─╯") && lines[5].contains("Squelette initial"));
     assert_eq!(app.depth(), 1);
 
@@ -901,7 +902,7 @@ fn remote_branches_are_shortened_and_hidden() {
     wait(&mut app, "sans les distantes", |app| app.log_done);
     let view = screen(&mut app, 110, 12);
     assert!(!view.contains("origin") && view.contains("· no remotes"), "{view}");
-    assert!(view.contains("◀ HEAD → main  Merge de feature") && view.contains("◀ v0.1.0 "), "{view}");
+    assert!(view.contains("◀ HEAD → main  Merge de feature") && view.contains("◇ v0.1.0 "), "{view}");
     app.apply(Action::ToggleRemotes);
     assert_eq!(app.flash(), Some("Local and remote branches"));
     wait(&mut app, "toutes", |app| app.log_done);
@@ -1240,7 +1241,17 @@ fn branches_of_the_graph_are_chosen() {
     let view = screen(&mut app, 110, 16);
     assert!(view.contains("◀ origin/extra  Distant seulement") && view.contains("◀ origin/main  Merge de feature"), "{view}");
     assert!(!view.contains("Local seulement") && !view.contains("- changes -") && !view.contains("HEAD →"), "{view}");
-    assert!(!view.contains("◀ feature") && view.contains("◀ v0.1.0 ") && view.contains("· remotes only"), "{view}");
+    assert!(!view.contains("◀ feature") && view.contains("◇ v0.1.0 ") && view.contains("· remotes only"), "{view}");
+
+    // b t cache les tags : leur cartouche s'en va, et le graphe ne part plus d'eux.
+    app.apply(Action::ToggleTags);
+    wait(&mut app, "graphe", |app| app.log_done);
+    let view = screen(&mut app, 110, 14);
+    assert!(!view.contains("v0.1.0") && view.contains("remotes only, no tags"), "{view}");
+    app.apply(Action::ToggleTags);
+    wait(&mut app, "graphe", |app| app.log_done);
+    assert_eq!(app.flash(), Some("Tags shown"));
+    assert!(screen(&mut app, 110, 14).contains("◇ v0.1.0 "));
     // `b` `o` les cache alors : il reste les locales. `b` `O` deux fois : seules, puis toutes.
     app.apply(Action::ToggleRemotes);
     assert_eq!(app.scope, crate::log::app::Scope::Local);

@@ -485,6 +485,8 @@ pub enum Action {
     ToggleRemotes,
     /// `b` `O` : ne montre que les branches distantes, ou revient à toutes.
     OnlyRemotes,
+    /// `b` `t` : montre ou cache les tags.
+    ToggleTags,
     /// `b` `f` : ouvre la liste des branches à montrer dans le graphe.
     PickBranches,
     ToggleHelp,
@@ -514,6 +516,8 @@ pub struct App {
     full_next: bool,
     /// Nature des branches dont part le graphe.
     pub scope: Scope,
+    /// Les tags sont montrés dans le graphe.
+    show_tags: bool,
     /// Branches choisies dans la liste (`b` `f`) ; `None` : toutes.
     pub picked: Option<BTreeSet<Branch>>,
     /// Liste des branches, quand elle est ouverte.
@@ -586,6 +590,7 @@ impl App {
             wrap: false,
             full_next: false,
             scope: Scope::All,
+            show_tags: true,
             picked: None,
             picker: None,
             store: GraphStore::default(),
@@ -1067,7 +1072,7 @@ impl App {
         let visible = match kind {
             RefKind::Local => self.scope != Scope::Remote,
             RefKind::Remote => self.scope != Scope::Local,
-            RefKind::Tag => return true,
+            RefKind::Tag => return self.show_tags,
         };
         visible && self.picked.as_ref().is_none_or(|picked| picked.iter().any(|(k, n)| *k == kind && n == name))
     }
@@ -1084,10 +1089,13 @@ impl App {
     /// Ce qui restreint le graphe, pour l'en-tête : la nature des branches, et
     /// le nombre de celles qui ont été choisies.
     pub fn branch_note(&self) -> Option<String> {
-        let scope = match self.scope {
-            Scope::All => None,
-            Scope::Local => Some("no remotes".to_string()),
-            Scope::Remote => Some("remotes only".to_string()),
+        let scope = match (self.scope, self.show_tags) {
+            (Scope::All, true) => None,
+            (Scope::All, false) => Some("no tags".to_string()),
+            (Scope::Local, true) => Some("no remotes".to_string()),
+            (Scope::Local, false) => Some("no remotes or tags".to_string()),
+            (Scope::Remote, true) => Some("remotes only".to_string()),
+            (Scope::Remote, false) => Some("remotes only, no tags".to_string()),
         };
         let picked = self.picked.as_ref().map(|picked| match picked.len() {
             1 => "1 branch picked".to_string(),
@@ -1101,10 +1109,16 @@ impl App {
 
     /// Références dont part `git log`, d'après la nature et le choix des branches.
     fn revs(&self) -> Revs {
+        // `--exclude` ne vaut que pour le `--all` qui le suit.
+        let without = |refs: &[&str]| -> Vec<String> {
+            let tags = (!self.show_tags).then_some("refs/tags/*");
+            refs.iter().copied().chain(tags).map(|glob| format!("--exclude={glob}")).chain(["--all".to_string()]).collect()
+        };
         let Some(picked) = &self.picked else {
             return match self.scope {
-                Scope::All => Revs::default(),
-                Scope::Local => Revs { args: vec!["--exclude=refs/remotes/*".to_string(), "--all".to_string()], head: true },
+                Scope::All if self.show_tags => Revs::default(),
+                Scope::All => Revs { args: without(&[]), head: true },
+                Scope::Local => Revs { args: without(&["refs/remotes/*"]), head: true },
                 Scope::Remote => Revs { args: vec!["--remotes".to_string()], head: false },
             };
         };
@@ -1134,6 +1148,13 @@ impl App {
             Scope::Local => "Remote branches hidden",
             Scope::Remote => "Remote branches only",
         });
+        self.regraph();
+    }
+
+    /// `b` `t` : montre ou cache les tags, dans le graphe et sur les commits.
+    fn toggle_tags(&mut self) {
+        self.show_tags = !self.show_tags;
+        self.set_flash(if self.show_tags { "Tags shown" } else { "Tags hidden" });
         self.regraph();
     }
 
@@ -1359,6 +1380,7 @@ impl App {
                 Action::PromptKey('f') => Action::PickBranches,
                 Action::PromptKey('o') => Action::ToggleRemotes,
                 Action::PromptKey('O') => Action::OnlyRemotes,
+                Action::PromptKey('t') => Action::ToggleTags,
                 _ => return,
             };
             return self.apply(next);
@@ -1723,6 +1745,7 @@ impl App {
                 | Action::PickBranches
                 | Action::ToggleRemotes
                 | Action::OnlyRemotes
+                | Action::ToggleTags
                 | Action::ToggleHierarchy
                 | Action::GotoHead
                 | Action::CycleNodes
@@ -1750,6 +1773,7 @@ impl App {
             Action::OnlyRemotes => {
                 return self.set_scope(if self.scope == Scope::Remote { Scope::All } else { Scope::Remote });
             }
+            Action::ToggleTags => return self.toggle_tags(),
             // Depuis la hiérarchie, `b` `h` la referme.
             Action::ToggleHierarchy if self.hierarchy.is_some() => {
                 self.hierarchy = None;
@@ -1872,7 +1896,8 @@ impl App {
             | Action::BranchMenu
             | Action::PickBranches
             | Action::ToggleRemotes
-            | Action::OnlyRemotes => {}
+            | Action::OnlyRemotes
+            | Action::ToggleTags => {}
             Action::CycleNodes => {
                 self.node_style = match self.node_style {
                     NodeStyle::Dots => NodeStyle::Rail,

@@ -49,7 +49,9 @@ Press `H` in the graph to jump to the HEAD commit, without opening it.
 
 Press `z` to wrap the long lines instead of cutting them, in the graph and in the code of a diff; press it again to cut them.
 
-Press `y` on a branch to copy its name, and `r` to make it the root of the tree, for the rest of the session — useful when the trunk of the repository is not one of `main`, `master`, `trunk` or `develop`, which is what the view takes as its root otherwise. Two branches on the same commit are shown side by side rather than one under the other, and among the branches of one level those that carry none come first. Press `b` for the branch commands: `b` `f` opens the list of branches, to pick with `Space` the ones the graph shows (`v` checks all or none, `/` searches the list, `Enter` applies); `b` `o` shows or hides the remote branches, `b` `O` shows the remote branches only; `b` `h` opens the branch hierarchy.
+Press `b` for the branch commands: `b` `f` opens the list of branches, to pick with `Space` the ones the graph shows (`v` checks all or none, `/` searches the list, `Enter` applies); `b` `o` shows or hides the remote branches, `b` `O` shows the remote branches only; `b` `t` shows or hides the tags; `b` `h` opens the branch hierarchy.
+
+In the hierarchy, `y` copies the name of the branch under the cursor and `r` makes it the root of the tree, for the rest of the session — useful when the trunk of the repository is not one of `main`, `master`, `trunk` or `develop`, which is what the view takes as its root otherwise. Two branches on the same commit are shown side by side rather than one under the other, and among the branches of one level those that carry none come first.
 
 Press `/` on a diff to search its code. The matches follow the typing; `Enter` keeps the search, then `n` and `N` go to the next and previous match, and `Esc` clears it. The case is ignored unless the search has a capital letter.
 

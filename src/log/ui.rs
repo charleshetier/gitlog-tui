@@ -32,7 +32,16 @@ const PALETTE: [Color; 8] = [
     Color::Green,
     Color::Magenta,
 ];
+/// Icône d'un tag, et sa couleur.
 const TAG_COLOR: Color = Color::Yellow;
+const TAG_ICON: &str = "\u{f02b}";
+const TAG_ICON_PLAIN: &str = "◇";
+/// Fond d'un tag : un gris à peine plus clair que celui du graphe. Un tag se
+/// tient en retrait, l'icône seule porte sa couleur.
+const TAG_BG: Color = Color::Indexed(238);
+/// Bouts arrondis du cartouche d'un tag (Powerline Extra, dans les Nerd Fonts).
+const CAP_LEFT: &str = "\u{e0b6}";
+const CAP_RIGHT: &str = "\u{e0b4}";
 /// Bande d'une colonne du graphe : elle relie les puces, qu'un trait ne peut pas traverser.
 const LANE_BG: Color = Color::Indexed(236);
 const LANE_SEL_BG: Color = Color::Indexed(240);
@@ -421,7 +430,8 @@ fn label_texts(labels: &[Label], shows: impl Fn(&Label) -> bool) -> Vec<(String,
 /// Étiquettes en flèche pointant vers le commit, à gauche. Une branche distante
 /// réduite à « &origin » prolonge le cartouche de sa branche locale : un simple
 /// rectangle, sans flèche ni espace entre les deux. La branche courante
-/// s'annonce comme dans `git log` : « HEAD → nom ».
+/// s'annonce comme dans `git log` : « HEAD → nom ». Un tag ne pointe rien : son
+/// cartouche est une pastille aux bouts arrondis, derrière son icône.
 #[allow(clippy::too_many_arguments)]
 fn draw_labels(
     buf: &mut Buffer,
@@ -446,8 +456,14 @@ fn draw_labels(
         let remaining = labels.len() - i;
         // Place gardée pour le compteur « +N » des étiquettes non affichées.
         let reserve = if remaining > 1 { 4 } else { 0 };
-        // Flèche (sauf accolée), marges du nom, espace qui suit.
-        let chrome = if *joined { 3 } else { 4 };
+        let tag = label.kind == RefKind::Tag;
+        // Flèche (sauf accolée), marges du nom, espace qui suit ; un tag porte
+        // en plus ses bouts arrondis, son icône et l'espace qui l'en sépare.
+        let chrome = match (*joined, tag) {
+            (true, _) => 3,
+            (false, false) => 4,
+            (false, true) => 5 + if plain { 0 } else { 2 },
+        };
         if x + width(&name) + chrome + reserve > end {
             // Le cartouche précédent attendait sa jumelle : l'espace lui revient.
             x += u16::from(*joined);
@@ -457,16 +473,26 @@ fn draw_labels(
         let (bg, fg) = match label.kind {
             RefKind::Local => (color, Color::Black),
             RefKind::Remote => (REMOTE_BG, color),
-            RefKind::Tag => (TAG_COLOR, Color::Black),
+            RefKind::Tag => (TAG_BG, Color::Gray),
         };
         let mut style = Style::new().fg(fg).bg(bg);
         if label.is_head {
             style = style.add_modifier(Modifier::BOLD);
         }
-        if !joined {
-            x = put(buf, x, y, end, arrow, Style::new().fg(bg));
+        let cap = Style::new().fg(bg);
+        if tag {
+            if !plain {
+                x = put(buf, x, y, end, CAP_LEFT, cap);
+            }
+            let icon = if plain { TAG_ICON_PLAIN } else { TAG_ICON };
+            x = put(buf, x, y, end, &format!(" {icon}"), style.fg(TAG_COLOR));
+        } else if !joined {
+            x = put(buf, x, y, end, arrow, cap);
         }
         x = put(buf, x, y, end, &format!(" {name} "), style);
+        if tag && !plain {
+            x = put(buf, x, y, end, CAP_RIGHT, cap);
+        }
         // Pas d'espace avant une étiquette accolée.
         if !labels.get(i + 1).is_some_and(|next| next.2) {
             x += 1;
@@ -1062,8 +1088,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("", "Actions"),
     ("y", "Copy the commit hash, the file path or the branch name"),
     ("b h · b f", "Branch hierarchy · pick the branches of the graph"),
+    ("b t · r", "Show or hide the tags · in the hierarchy, root here"),
     ("b o · b O", "Hide the remote branches (origin) · show only them"),
-    ("r", "In the hierarchy: the branch under the cursor is the root"),
+
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),
     ("S · z · R", "Commit style · wrap the long lines · refresh"),
     ("? · Ctrl+C", "Show or hide this panel · quit"),
@@ -1120,6 +1147,7 @@ const BRANCH_KEYS: &[(&str, &str)] = &[
     ("f", "pick the branches of the graph"),
     ("o", "show or hide the remote branches"),
     ("O", "remote branches only, or all"),
+    ("t", "show or hide the tags"),
 ];
 
 /// Panneaux des branches, par-dessus le graphe ou la hiérarchie : le sous-menu
