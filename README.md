@@ -60,6 +60,7 @@ Run `gitmerge` when a merge, a rebase or a cherry-pick stops on conflicts. It sh
 The three columns are aligned block by block. A change made by one side only is already in the result, as git would take it; a conflict waits, with the common ancestor in the result, until you settle it:
 
 - `>` takes ours, `<` takes theirs. In a conflict, taking the other side afterwards adds its lines below the first; taking a side twice keeps that side alone. The same keys work on any changed block, to put a change back or leave it out. The arrows `»` and `«` beside a block do the same with a click.
+- `m` merges a conflict word to word, when the two sides changed different words of the same lines: such a conflict is shown in ocre rather than red, and the status bar calls it a simple conflict. `M` does the same for every simple conflict of the file, in one step that `u` undoes as a whole. The criterion is the one of IntelliJ's magic wand: git merges whole lines, this merges the words inside a line, and gives up on the conflict as a whole as soon as the two sides touched the same word. Two different words of the same line do merge, even when the result makes no sense — read it before you save.
 - `Space` keeps the result as it is, and the conflict is settled.
 - `n` and `N` jump to the next and previous conflict, `}` and `{` to the next and previous change, conflict or not.
 

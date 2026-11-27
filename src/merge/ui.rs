@@ -18,6 +18,10 @@ use crate::merge::model::{Kind, Row, Segment, Side, State};
 
 /// Fond d'un côté écarté, et du résultat d'un bloc où rien n'a été pris.
 const IGNORED_BG: Color = Color::Indexed(238);
+/// Fond d'un conflit qui se fusionne mot à mot : ni rouge, puisqu'il n'y a rien à
+/// décider, ni vert, puisque rien n'est encore fait.
+const SIMPLE_BG: Color = Color::Indexed(58);
+const SIMPLE_SYNTAX_BG: Color = Color::Rgb(66, 50, 0);
 /// Fond d'un passage du résultat retouché à la main. Sous la coloration
 /// syntaxique il est plus sombre, comme les autres fonds, mais reste bleu une
 /// fois ramené à 256 couleurs.
@@ -166,6 +170,23 @@ struct View {
     syntax: bool,
 }
 
+/// Fonds des blocs, selon que la coloration syntaxique est active.
+#[derive(Clone, Copy)]
+struct Palette {
+    tones: Tones,
+    manual: Color,
+    simple: Color,
+}
+
+impl Palette {
+    fn new(syntax: bool) -> Palette {
+        match syntax {
+            true => Palette { tones: SYNTAX_TONES, manual: MANUAL_SYNTAX_BG, simple: SIMPLE_SYNTAX_BG },
+            false => Palette { tones: TONES, manual: MANUAL_BG, simple: SIMPLE_BG },
+        }
+    }
+}
+
 /// Colonne d'une rangée.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Column {
@@ -173,19 +194,20 @@ enum Column {
     Result,
 }
 
-/// Fond d'un bloc dans une colonne : rouge tant que le conflit attend, vert pour
-/// ce qui est pris, gris pour ce qui est écarté.
-fn tone(seg: &Segment, column: Column, tones: Tones, manual: Color) -> Option<Color> {
+/// Fond d'un bloc dans une colonne : rouge tant que le conflit attend, ocre s'il
+/// se fusionne mot à mot, vert pour ce qui est pris, gris pour ce qui est écarté.
+fn tone(seg: &Segment, column: Column, palette: Palette, simple: bool) -> Option<Color> {
+    let (tones, pending) = (palette.tones, if simple { palette.simple } else { palette.tones.del });
     match column {
         Column::Side(side) => seg.changed(side).then(|| match seg.state(side) {
-            State::Pending => tones.del,
+            State::Pending => pending,
             State::Applied => tones.add,
             State::Ignored => IGNORED_BG,
         }),
         Column::Result => match seg.kind {
             Kind::Equal => None,
-            Kind::Manual => Some(manual),
-            _ if seg.pending() => Some(tones.del),
+            Kind::Manual => Some(palette.manual),
+            _ if seg.pending() => Some(pending),
             _ if [Side::Left, Side::Right].iter().any(|&side| seg.changed(side) && seg.state(side) == State::Applied) => Some(tones.add),
             _ => Some(IGNORED_BG),
         },
@@ -297,8 +319,19 @@ fn draw_sheet(buf: &mut Buffer, sheet: &mut Sheet, body: Rect, cols: Columns, vi
     sheet.tints[2].extend(right_upto, sheet.doc.theirs.iter().skip(from).map(String::as_str));
 
     let doc = &sheet.doc;
-    let tones = if view.syntax { SYNTAX_TONES } else { TONES };
-    let manual = if view.syntax { MANUAL_SYNTAX_BG } else { MANUAL_BG };
+    // Les conflits visibles qui se fusionnent mot à mot : leur fond les distingue.
+    // Un seul essai par bloc, et seulement pour ceux qu'on montre.
+    let mut simple: Vec<usize> = Vec::new();
+    let mut tried = None;
+    for row in &shown {
+        if tried != Some(row.seg) {
+            tried = Some(row.seg);
+            if doc.segs[row.seg].pending() && doc.simple(row.seg).is_some() {
+                simple.push(row.seg);
+            }
+        }
+    }
+    let palette = Palette::new(view.syntax);
     let dim = Style::new().fg(DIM);
     let current_seg = sheet.pos().seg;
     let (mut y, bottom) = (body.y, body.bottom());
@@ -316,6 +349,7 @@ fn draw_sheet(buf: &mut Buffer, sheet: &mut Sheet, body: Rect, cols: Columns, vi
         let on_cursor = row.row == sheet.row;
         // Le bloc où se trouve le curseur ressort : c'est lui que les touches règlent.
         let bar = if row.seg == current_seg && seg.kind != Kind::Equal { Style::new().fg(ACCENT) } else { dim };
+        let easy = simple.contains(&row.seg);
         for part in 0..row_height(row) {
             if y >= bottom {
                 break;
@@ -326,12 +360,12 @@ fn draw_sheet(buf: &mut Buffer, sheet: &mut Sheet, body: Rect, cols: Columns, vi
             };
             let side = |buf: &mut Buffer, at: (u16, u16, u16), content: Option<(usize, String, Vec<Tint>)>, column: Column, skip: usize| {
                 let content = content.as_ref().map(|(number, text, tints)| (*number, text.as_str(), tints.as_slice()));
-                draw_cell(buf, at, y, content, tone(seg, column, tones, manual), (skip, part));
+                draw_cell(buf, at, y, content, tone(seg, column, palette, easy), (skip, part));
             };
             side(buf, (cols.left.0, left_x, cols.left.1), content(left, &left_text, 0), Column::Side(Side::Left), skip(left_room));
             side(buf, (cols.right.0, right_x, cols.right.1), content(right, &right_text, 2), Column::Side(Side::Right), skip(right_room));
             let mid = (mid_x, y, cols.mid.1);
-            let mid_bg = tone(seg, Column::Result, tones, manual).or(on_cursor.then_some(SEL_BG));
+            let mid_bg = tone(seg, Column::Result, palette, easy).or(on_cursor.then_some(SEL_BG));
             let mid_content = content(row.number, &mid_text, 1);
             match &mid_content {
                 Some((number, text, tints)) => {
@@ -363,6 +397,7 @@ fn draw_sheet(buf: &mut Buffer, sheet: &mut Sheet, body: Rect, cols: Columns, vi
                 for (side, x, arrow) in [(Side::Left, cols.left_gutter, TAKE_LEFT), (Side::Right, cols.right_gutter, TAKE_RIGHT)] {
                     if seg.changed(side) {
                         let style = match seg.state(side) {
+                            State::Pending if easy => Style::new().fg(Color::Yellow),
                             State::Pending => Style::new().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
                             State::Applied => Style::new().fg(Color::LightGreen),
                             State::Ignored => dim,
@@ -431,6 +466,10 @@ fn draw_status(buf: &mut Buffer, app: &App, area: Rect) {
     let Some(seg) = sheet.doc.segs.get(pos.seg) else { return };
     let (what, keys) = match seg.kind {
         Kind::Equal => return,
+        // Un conflit que `m` règle de lui-même : les deux côtés ont changé des mots différents.
+        Kind::Conflict if seg.pending() && sheet.doc.simple(pos.seg).is_some() => {
+            ("simple conflict", "m merge   > ours   < theirs   Space keep as is")
+        }
         Kind::Conflict if seg.pending() => ("conflict", "> ours   < theirs   Space keep as is"),
         Kind::Conflict => ("conflict, settled", "> ours   < theirs"),
         Kind::Left => ("changed by ours", "> ours   < theirs"),
@@ -456,6 +495,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("", "Merge"),
     ("> <", "Take ours (left) / theirs (right); the other then adds up"),
     ("Space", "Keep the result as it is: the conflict is settled"),
+    ("m M", "Merge a simple conflict word to word / all of the file"),
     ("Ctrl+S", "Write the result to the file"),
     ("S", "Write it and stage the file (git add): conflict resolved"),
     ("R", "Read the conflicts again from git"),
@@ -469,8 +509,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("", ""),
     ("", "Other"),
     ("y  z", "Copy the line; wrap or cut the long lines"),
-    ("?", "Show or hide this panel"),
-    ("q  Ctrl+C", "Quit; asks first when a result is not saved"),
+    ("? · q", "Show or hide this panel · quit, asking if a result waits"),
     ("Click", "On » or «: take that side; in the result: put the cursor"),
     ("Wheel", "Scroll"),
 ];

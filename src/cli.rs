@@ -73,11 +73,14 @@ Usage: gitmerge [OPTIONS] [PATH]
   -h, --help   show this help
 
 Three columns: ours on the left, theirs on the right, the result in the middle.
-The changes of one side only are already in the result; a conflict waits.
+The changes of one side only are already in the result; a conflict waits. A
+conflict whose two sides changed different words of the same lines is shown in
+ocre: m merges it word to word, M does so for the whole file.
 
 Keys: ↑↓ j k move · n N next / previous conflict · } { next / previous change
       Tab Shift+Tab next / previous conflicted file
       > take ours · < take theirs · the other one then adds its lines below
+      m M merge a simple conflict word to word / all of them in the file
       Space keep the result as it is · u undo · Ctrl+R redo
       i a I A o O or Enter edit the result, Esc back to normal mode
       h l w b e 0 $ move in the line · x delete a character · dd a line

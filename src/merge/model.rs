@@ -267,56 +267,23 @@ impl Doc {
         let (base, _, _) = split_lines(base);
         let (ours, crlf, newline) = split_lines(ours);
         let (theirs, _, their_newline) = split_lines(theirs);
-        let ours_hunks = changes(&base, &ours);
-        let theirs_hunks = changes(&base, &theirs);
-        let mut segs = Vec::new();
-        // Décalage d'une ligne de la base à sa place dans chaque version, hors des blocs.
-        let (mut pos, mut left_shift, mut right_shift) = (0usize, 0isize, 0isize);
-        let (mut i, mut j) = (0, 0);
-        let at = |pos: usize, shift: isize| (pos as isize + shift) as usize;
-        loop {
-            let next = match (ours_hunks.get(i), theirs_hunks.get(j)) {
-                (None, None) => break,
-                (Some(a), None) => a.0.start,
-                (None, Some(b)) => b.0.start,
-                (Some(a), Some(b)) => a.0.start.min(b.0.start),
-            };
-            if next > pos {
-                segs.push(Rc::new(equal(&base[pos..next], at(pos, left_shift), at(pos, right_shift))));
+        let mut segs: Vec<Rc<Segment>> = Vec::new();
+        // Fin du dernier bloc, dans la base et dans chaque version.
+        let (mut pos, mut left, mut right) = (0usize, 0usize, 0usize);
+        for block in blocks(&base, &ours, &theirs) {
+            if block.base.start > pos {
+                segs.push(Rc::new(equal(&base[pos..block.base.start], left, right)));
             }
-            // Le bloc s'étend tant qu'un changement d'un côté touche ce qu'il couvre déjà.
-            let (first_i, first_j, mut end) = (i, j, next);
-            loop {
-                let before = (i, j);
-                while ours_hunks.get(i).is_some_and(|h| h.0.start <= end) {
-                    end = end.max(ours_hunks[i].0.end);
-                    i += 1;
-                }
-                while theirs_hunks.get(j).is_some_and(|h| h.0.start <= end) {
-                    end = end.max(theirs_hunks[j].0.end);
-                    j += 1;
-                }
-                if before == (i, j) {
-                    break;
-                }
-            }
-            // Ce que chaque côté met à la place de la base, sur toute l'étendue du bloc.
-            let span = |hunks: &[(Range<usize>, Range<usize>)], shift: isize| match (hunks.first(), hunks.last()) {
-                (Some(first), Some(last)) => first.1.start - (first.0.start - next)..last.1.end + (end - last.0.end),
-                _ => at(next, shift)..at(end, shift),
-            };
-            let left = span(&ours_hunks[first_i..i], left_shift);
-            let right = span(&theirs_hunks[first_j..j], right_shift);
-            let kind = match (i > first_i, j > first_j) {
+            let kind = match (block.left_changed, block.right_changed) {
                 (true, false) => Kind::Left,
                 (false, true) => Kind::Right,
-                _ if ours[left.clone()] == theirs[right.clone()] => Kind::Both,
+                _ if ours[block.left.clone()] == theirs[block.right.clone()] => Kind::Both,
                 _ => Kind::Conflict,
             };
             let lines = match kind {
-                Kind::Right => theirs[right.clone()].to_vec(),
-                Kind::Conflict => base[next..end].to_vec(),
-                _ => ours[left.clone()].to_vec(),
+                Kind::Right => theirs[block.right.clone()].to_vec(),
+                Kind::Conflict => base[block.base.clone()].to_vec(),
+                _ => ours[block.left.clone()].to_vec(),
             };
             let (left_state, right_state) = match kind {
                 Kind::Left => (State::Applied, State::Ignored),
@@ -324,13 +291,12 @@ impl Doc {
                 Kind::Conflict => (State::Pending, State::Pending),
                 _ => (State::Applied, State::Applied),
             };
-            left_shift = left.end as isize - end as isize;
-            right_shift = right.end as isize - end as isize;
-            segs.push(Rc::new(Segment { kind, left, right, base: base[next..end].to_vec(), lines, left_state, right_state }));
-            pos = end;
+            (pos, left, right) = (block.base.end, block.left.end, block.right.end);
+            let base = base[block.base].to_vec();
+            segs.push(Rc::new(Segment { kind, left: block.left, right: block.right, base, lines, left_state, right_state }));
         }
         if pos < base.len() {
-            segs.push(Rc::new(equal(&base[pos..], at(pos, left_shift), at(pos, right_shift))));
+            segs.push(Rc::new(equal(&base[pos..], left, right)));
         }
         Doc { ours, theirs, segs, crlf, newline: newline || their_newline }
     }
@@ -429,6 +395,27 @@ impl Doc {
             pos.line += 1;
             Some(out)
         })
+    }
+
+    /// Un conflit qui se règle de lui-même, mot à mot : les deux côtés ont changé
+    /// les mêmes lignes, mais pas les mêmes mots. Donne les lignes de la fusion.
+    pub fn simple(&self, seg: usize) -> Option<Vec<String>> {
+        let segment = self.segs.get(seg).filter(|segment| segment.pending())?;
+        let join = |lines: &[String]| lines.join("\n");
+        let ours = join(&self.ours[segment.left.clone()]);
+        let theirs = join(&self.theirs[segment.right.clone()]);
+        let merged = merge_words(&join(&segment.base), &ours, &theirs)?;
+        Some(if merged.is_empty() { Vec::new() } else { merged.split('\n').map(str::to_string).collect() })
+    }
+
+    /// Règle un conflit en fusionnant mot à mot ; faux s'il n'a rien d'évident.
+    pub fn merge_simple(&mut self, seg: usize) -> bool {
+        let Some(lines) = self.simple(seg) else { return false };
+        let segment = self.seg_mut(seg);
+        segment.lines = lines;
+        (segment.left_state, segment.right_state) = (State::Applied, State::Applied);
+        self.prune();
+        true
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -716,6 +703,114 @@ impl Doc {
         let seg = (0..pos.seg).rev().find(|&seg| !self.segs[seg].lines.is_empty())?;
         Some(Pos { seg, line: self.segs[seg].lines.len() - 1 })
     }
+}
+
+/// Un passage de la base qu'au moins un côté a changé, et ce que chaque côté met
+/// à sa place.
+struct Block {
+    base: Range<usize>,
+    left: Range<usize>,
+    right: Range<usize>,
+    left_changed: bool,
+    right_changed: bool,
+}
+
+/// Les passages changés, dans l'ordre. Un bloc s'étend tant qu'un changement d'un
+/// côté touche ce qu'il couvre déjà : les deux côtés s'y opposent alors.
+fn blocks<T: PartialEq>(base: &[T], ours: &[T], theirs: &[T]) -> Vec<Block> {
+    let ours_hunks = changes(base, ours);
+    let theirs_hunks = changes(base, theirs);
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    // Décalage d'un élément de la base à sa place dans chaque version, hors des blocs.
+    let (mut left_shift, mut right_shift) = (0isize, 0isize);
+    let at = |pos: usize, shift: isize| (pos as isize + shift) as usize;
+    loop {
+        let start = match (ours_hunks.get(i), theirs_hunks.get(j)) {
+            (None, None) => return out,
+            (Some(a), None) => a.0.start,
+            (None, Some(b)) => b.0.start,
+            (Some(a), Some(b)) => a.0.start.min(b.0.start),
+        };
+        let (first_i, first_j, mut end) = (i, j, start);
+        loop {
+            let before = (i, j);
+            while ours_hunks.get(i).is_some_and(|hunk| hunk.0.start <= end) {
+                end = end.max(ours_hunks[i].0.end);
+                i += 1;
+            }
+            while theirs_hunks.get(j).is_some_and(|hunk| hunk.0.start <= end) {
+                end = end.max(theirs_hunks[j].0.end);
+                j += 1;
+            }
+            if before == (i, j) {
+                break;
+            }
+        }
+        // Ce que chaque côté met à la place de la base, sur toute l'étendue du bloc.
+        let span = |hunks: &[(Range<usize>, Range<usize>)], shift: isize| match (hunks.first(), hunks.last()) {
+            (Some(first), Some(last)) => first.1.start - (first.0.start - start)..last.1.end + (end - last.0.end),
+            _ => at(start, shift)..at(end, shift),
+        };
+        let left = span(&ours_hunks[first_i..i], left_shift);
+        let right = span(&theirs_hunks[first_j..j], right_shift);
+        left_shift = left.end as isize - end as isize;
+        right_shift = right.end as isize - end as isize;
+        out.push(Block { base: start..end, left, right, left_changed: i > first_i, right_changed: j > first_j });
+    }
+}
+
+/// Au-delà de ce nombre de mots, un bloc est trop gros pour qu'on cherche à le
+/// fusionner mot à mot.
+const MAX_WORDS: usize = 20_000;
+
+/// Découpe un texte en mots : une suite de lettres et de chiffres, une suite
+/// d'espaces et de tabulations, ou tout autre caractère seul, le passage à la
+/// ligne compris. Recollés, les mots rendent le texte d'origine.
+fn words(text: &str) -> Vec<&str> {
+    // Les blancs forment un mot à eux : un côté peut changer le retrait d'une
+    // ligne sans toucher à ce que l'autre y a écrit.
+    let kind = |c: char| match c {
+        c if c.is_alphanumeric() || c == '_' => 1,
+        ' ' | '\t' => 2,
+        _ => 0,
+    };
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        let len = match kind(first) {
+            0 => first.len_utf8(),
+            k => rest.chars().take_while(|&c| kind(c) == k).map(char::len_utf8).sum(),
+        };
+        let (word, tail) = rest.split_at(len);
+        out.push(word);
+        rest = tail;
+    }
+    out
+}
+
+/// Fusionne trois textes mot à mot, comme git le fait ligne à ligne : le
+/// changement d'un seul côté est pris. `None` si les deux côtés ont changé les
+/// mêmes mots, car il n'y a alors pas de fusion évidente.
+pub fn merge_words(base: &str, ours: &str, theirs: &str) -> Option<String> {
+    let (base, ours, theirs) = (words(base), words(ours), words(theirs));
+    if base.len() + ours.len() + theirs.len() > MAX_WORDS {
+        return None;
+    }
+    let mut out = String::new();
+    let mut pos = 0;
+    for block in blocks(&base, &ours, &theirs) {
+        out.extend(base[pos..block.base.start].iter().copied());
+        let taken = match (block.left_changed, block.right_changed) {
+            (true, true) if ours[block.left.clone()] != theirs[block.right.clone()] => return None,
+            (false, true) => &theirs[block.right],
+            _ => &ours[block.left],
+        };
+        out.extend(taken.iter().copied());
+        pos = block.base.end;
+    }
+    out.extend(base[pos..].iter().copied());
+    Some(out)
 }
 
 /// Passage commun : mêmes lignes à gauche, à droite et dans le résultat.
@@ -1018,6 +1113,59 @@ mod tests {
         assert_eq!(rows[3], Row { row: 4, seg: 2, line: 0, number: Some(3) });
         assert_eq!(doc.walk(0).count(), 8);
         assert_eq!(doc.walk(8).count(), 0);
+    }
+
+    #[test]
+    fn words_cut_the_text_without_losing_it() {
+        assert_eq!(words("let x = f(a);"), ["let", " ", "x", " ", "=", " ", "f", "(", "a", ")", ";"]);
+        assert_eq!(words("\tif x {\n  y\n"), ["\t", "if", " ", "x", " ", "{", "\n", "  ", "y", "\n"]);
+        for text in ["", "a", "  ", "été_1 + b", "a\n\nb"] {
+            assert_eq!(words(text).concat(), text);
+        }
+    }
+
+    #[test]
+    fn words_merge_when_the_two_sides_touch_different_ones() {
+        // Le début et la fin de la même ligne, chacun changé d'un côté.
+        assert_eq!(merge_words("foo(a, b)", "foo(a, b, c)", "bar(a, b)").as_deref(), Some("bar(a, b, c)"));
+        // Le même mot changé des deux côtés : rien d'évident.
+        assert_eq!(merge_words("foo(a)", "foo(b)", "foo(c)"), None);
+        // Un côté change le retrait, l'autre le texte.
+        assert_eq!(merge_words("  x = 1;", "\tx = 1;", "  x = 2;").as_deref(), Some("\tx = 2;"));
+        // Un côté supprime ce que l'autre modifie.
+        assert_eq!(merge_words("a b c", "a c", "a B c"), None);
+        // La limite du critère : deux mots différents de la même ligne se fusionnent,
+        // même quand le résultat n'a pas de sens.
+        assert_eq!(merge_words("let a = f(x);", "let a = g(x);", "let b = f(x);").as_deref(), Some("let b = g(x);"));
+        // Sur plusieurs lignes, les lignes ajoutées d'un côté tiennent avec le mot changé de l'autre.
+        assert_eq!(merge_words("a\nb", "a\nb\nc", "A\nb").as_deref(), Some("A\nb\nc"));
+        assert_eq!(merge_words("", "a", "b"), None);
+    }
+
+    #[test]
+    fn a_simple_conflict_merges_itself() {
+        let base = "one\nlet total = sum(items);\nthree\n";
+        let ours = "one\nlet total = sum(items, 0);\nthree\n";
+        let theirs = "one\nlet count = sum(items);\nthree\n";
+        let mut doc = Doc::new(base, ours, theirs);
+        assert_eq!(kinds(&doc), [Kind::Equal, Kind::Conflict, Kind::Equal]);
+        assert_eq!(doc.simple(1).as_deref(), Some(["let count = sum(items, 0);".to_string()].as_slice()));
+        assert!(doc.merge_simple(1));
+        assert_eq!(doc.text(), "one\nlet count = sum(items, 0);\nthree\n");
+        // Le conflit est réglé, et les deux côtés sont tenus pour pris.
+        assert_eq!(doc.unresolved(), 0);
+        assert_eq!((doc.segs[1].kind, doc.segs[1].left_state), (Kind::Conflict, State::Applied));
+        // Une fois réglé, il n'y a plus rien à fusionner ; prendre un côté reste possible.
+        assert!(!doc.merge_simple(1) && doc.simple(1).is_none());
+        assert!(doc.take(1, Side::Right));
+        assert_eq!(doc.text(), "one\nlet count = sum(items);\nthree\n");
+
+        // Les deux côtés sur le même mot : rien ne se fusionne de lui-même.
+        let mut doc = Doc::new(base, "one\nlet total = sum(items, 0);\nthree\n", "one\nlet total = sum(items, 1);\nthree\n");
+        assert!(doc.simple(1).is_none() && !doc.merge_simple(1));
+        assert_eq!(doc.unresolved(), 1);
+        // Hors d'un conflit, il n'y a rien à faire.
+        assert!(!doc.merge_simple(0));
     }
 
     #[test]

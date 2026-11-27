@@ -287,6 +287,9 @@ pub enum Action {
     Take(Side),
     /// `Espace` : tenir le conflit pour réglé tel qu'il est.
     Dismiss,
+    /// `m` / `M` : fusionner mot à mot le conflit sous le curseur, ou tous ceux
+    /// du fichier qui s'y prêtent.
+    Merge { all: bool },
     Save,
     Stage,
     Reload,
@@ -452,6 +455,7 @@ impl App {
                 }
             }
             Action::Dismiss => self.dismiss(),
+            Action::Merge { all } => self.merge_simple(all),
             Action::Save => self.save(),
             Action::Stage => self.stage(),
             Action::Reload => match self.unsaved() {
@@ -653,6 +657,38 @@ impl App {
         sheet.doc.dismiss(seg);
         sheet.changed(usize::MAX);
         let said = format!("Kept the result as it is · {}", Self::left_to_do(sheet));
+        self.flash.set(said);
+    }
+
+    /// `m` / `M` : règle mot à mot le conflit sous le curseur, ou tous ceux du
+    /// fichier qui s'y prêtent, en un seul pas à défaire.
+    fn merge_simple(&mut self, all: bool) {
+        let Some(sheet) = self.sheet_mut() else { return };
+        let here = sheet.pos().seg;
+        let segs: Vec<usize> = if all { (0..sheet.doc.segs.len()).collect() } else { vec![here] };
+        sheet.record();
+        let merged: Vec<usize> = segs.into_iter().filter(|&seg| sheet.doc.merge_simple(seg)).collect();
+        if merged.is_empty() {
+            sheet.undo.pop();
+            let pending = sheet.doc.segs.get(here).is_some_and(|segment| segment.pending());
+            self.flash.set(match (all, pending) {
+                (true, _) => "No conflict in this file merges word to word".to_string(),
+                (false, true) => "The two sides changed the same words here".to_string(),
+                (false, false) => "No pending conflict under the cursor".to_string(),
+            });
+            return;
+        }
+        // Le curseur suit son bloc, dont les lignes ont changé.
+        let row = sheet.doc.seg_row(here.min(sheet.doc.segs.len().saturating_sub(1)));
+        (sheet.row, sheet.col) = (row, 0);
+        sheet.changed(sheet.doc.line_number(Pos { seg: merged[0], line: 0 }));
+        sheet.settle(Mode::Normal);
+        sheet.keep_column();
+        let what = match merged.len() {
+            1 => "Merged a conflict word to word".to_string(),
+            n => format!("Merged {n} conflicts word to word"),
+        };
+        let said = format!("{what} · {}", Self::left_to_do(sheet));
         self.flash.set(said);
     }
 

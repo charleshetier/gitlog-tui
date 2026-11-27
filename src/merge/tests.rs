@@ -359,6 +359,59 @@ fn search_highlights_and_moves_the_cursor() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Un fichier dont les deux conflits se fusionnent mot à mot : chaque côté a
+/// changé des mots différents de la même ligne.
+const SIMPLE: (&str, &str, Option<&str>, Option<&str>) = (
+    "w.txt",
+    "let total = sum(items);\nmid\nfn draw(a, b) {\n",
+    Some("let total = sum(items, 0);\nmid\nfn draw(a, b, c) {\n"),
+    Some("let count = sum(items);\nmid\nfn paint(a, b) {\n"),
+);
+
+#[test]
+fn simple_conflicts_merge_word_to_word() {
+    let dir = make_conflict("simple", &[SIMPLE]);
+    let mut app = open(&dir);
+    // Les deux côtés ont changé le même mot dans a.txt : rien ne se fusionne.
+    press(&mut app, "m");
+    assert_eq!(app.flash(), Some("The two sides changed the same words here"));
+    press(&mut app, "g m");
+    assert_eq!(app.flash(), Some("No pending conflict under the cursor"));
+    press(&mut app, "M");
+    assert_eq!(app.flash(), Some("No conflict in this file merges word to word"));
+    assert!(!app.sheet().unwrap().dirty, "rien n'a bougé");
+
+    // w.txt : le conflit s'annonce comme simple, et `m` le règle.
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Tab);
+    }
+    let view = screen(&mut app, 120, 16);
+    assert!(view.contains("result · w.txt") && view.contains("2 conflicts"), "{view}");
+    assert!(view.contains("simple conflict") && view.contains("m merge"), "{view}");
+    press(&mut app, "m");
+    assert_eq!(app.flash(), Some("Merged a conflict word to word · 1 conflict left"));
+    // Seul le bloc sous le curseur : le second conflit garde encore la base.
+    assert_eq!(text(&app), "let count = sum(items, 0);\nmid\nfn draw(a, b) {\n");
+    // Réglé, le bloc garde les deux côtés : `>` et `<` restent possibles.
+    assert_eq!(app.sheet().unwrap().unresolved(), 1);
+    assert!(screen(&mut app, 120, 16).contains("conflict, settled"));
+    press(&mut app, "u");
+    assert_eq!(text(&app), "let total = sum(items);\nmid\nfn draw(a, b) {\n");
+
+    // `M` règle les deux d'un coup, en un seul pas à défaire.
+    press(&mut app, "M");
+    assert_eq!(app.flash(), Some("Merged 2 conflicts word to word · no conflict left: Ctrl+S saves, S stages"));
+    assert_eq!(text(&app), "let count = sum(items, 0);\nmid\nfn paint(a, b, c) {\n");
+    press(&mut app, "u");
+    assert_eq!((app.sheet().unwrap().unresolved(), text(&app).as_str()), (2, "let total = sum(items);\nmid\nfn draw(a, b) {\n"));
+    ctrl(&mut app, 'r');
+    // Enregistré puis remis à git comme les autres.
+    press(&mut app, "S");
+    assert_eq!(std::fs::read_to_string(dir.join("w.txt")).unwrap(), "let count = sum(items, 0);\nmid\nfn paint(a, b, c) {\n");
+    assert!(!git_out(&dir, &["ls-files", "-u"]).contains("w.txt"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn quitting_asks_before_losing_a_result() {
     let dir = make_conflict("quit", &[]);
@@ -469,7 +522,7 @@ fn any_keys_at_any_size_keep_the_document_sound() {
         KeyCode::Char('a'), KeyCode::Char('o'), KeyCode::Char('O'), KeyCode::Char('d'), KeyCode::Char('u'), KeyCode::Char('A'),
         KeyCode::Char(' '), KeyCode::Char('}'), KeyCode::Char('{'), KeyCode::Char('G'), KeyCode::Char('g'), KeyCode::Char('w'),
         KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Char('l'), KeyCode::Char('h'), KeyCode::Char('$'), KeyCode::Char('z'),
-        KeyCode::Char('b'), KeyCode::Char('e'), KeyCode::BackTab,
+        KeyCode::Char('b'), KeyCode::Char('e'), KeyCode::BackTab, KeyCode::Char('m'), KeyCode::Char('M'),
         KeyCode::Esc, KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete, KeyCode::Tab, KeyCode::Up, KeyCode::Down, KeyCode::Left,
         KeyCode::Right, KeyCode::Home, KeyCode::End, KeyCode::PageDown, KeyCode::PageUp, KeyCode::Esc, KeyCode::Backspace,
     ];

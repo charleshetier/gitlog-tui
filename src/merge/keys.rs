@@ -100,6 +100,8 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('>') => Action::Take(Side::Left),
         KeyCode::Char('<') => Action::Take(Side::Right),
         KeyCode::Char(' ') => Action::Dismiss,
+        KeyCode::Char('m') => Action::Merge { all: false },
+        KeyCode::Char('M') => Action::Merge { all: true },
         KeyCode::Char('S') => Action::Stage,
         KeyCode::Char('R') => Action::Reload,
         KeyCode::Char('z') => Action::Wrap,
