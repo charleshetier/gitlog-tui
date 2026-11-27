@@ -1060,7 +1060,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("q  Esc", "Go back one level, leave a search; q quits from the graph"),
     ("", ""),
     ("", "Actions"),
-    ("y", "Copy the commit hash, or the file path when on a file"),
+    ("y", "Copy the commit hash, the file path or the branch name"),
     ("b h · b f", "Branch hierarchy · pick the branches of the graph"),
     ("b o · b O", "Hide the remote branches (origin) · show only them"),
     ("s", "Search: c hash, m message, f file, h +h -h hunk"),

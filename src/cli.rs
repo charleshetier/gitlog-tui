@@ -26,7 +26,7 @@ Usage: gitlog [OPTIONS] [PATH]
   -h, --help   show this help
 
 Keys: ↑↓ j k move · Enter open · q or Esc go back · 1 2 3 level
-      y copy the commit hash, or the path of the file under the cursor
+      y copy the commit hash, the path of a file or the name of a branch
       drag the mouse over a diff to select code: it is copied on release
       / search the code of a diff, then n N next / previous match, Esc to clear
       Enter on a diff opens the whole file in a floating window

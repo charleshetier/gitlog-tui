@@ -331,7 +331,7 @@ fn copy_step_and_help_shortcuts() {
     app.apply(Action::ToggleHelp);
     let help = screen(&mut app, 110, 30);
     println!("{help}");
-    assert!(help.contains("Keyboard shortcuts") && help.contains("Copy the commit hash, or the file path"));
+    assert!(help.contains("Keyboard shortcuts") && help.contains("Copy the commit hash, the file path"));
     assert!(help.contains("╰") && help.contains("Scroll the graph or the pane"));
     app.apply(Action::Move(1));
     app.apply(Action::Back { quit: true });
@@ -1719,8 +1719,17 @@ fn branch_hierarchy_view() {
     // Aucun commit dans cette vue.
     assert!(!view.contains("Brouillon") && !view.contains("Merge de feature"));
 
-    // Entrée sur une branche ramène au graphe, sur son dernier commit.
+    // y copie le nom de la branche sous le curseur, et non le hash du commit.
+    app.apply(Action::Move(1));
+    assert_eq!(app.copy_target().as_deref(), Some("feature"));
+    app.apply(Action::CopySelected);
+    // Sans presse-papier dans l'environnement de test, le message le dit ;
+    // c'est bien la copie qui a été tentée.
+    assert!(app.flash().is_some_and(|said| said.contains("feature") || said == "Clipboard unavailable"));
     app.apply(Action::Bottom);
+    assert_eq!(app.copy_target().as_deref(), Some("wip-suite"));
+
+    // Entrée sur une branche ramène au graphe, sur son dernier commit.
     app.apply(Action::Open);
     assert!(app.hierarchy.is_none());
     let meta = app.meta(app.selected);

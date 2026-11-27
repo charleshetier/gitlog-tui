@@ -16,7 +16,7 @@ use crate::log::git::{
     SearchKind,
 };
 use crate::log::graph::{GraphStore, Oid};
-use crate::log::hierarchy::BranchRow;
+use crate::log::hierarchy::{self, BranchRow};
 
 /// Lignes gardées d'avance sous le bas de l'écran avant de laisser git en pause.
 const LOOKAHEAD: usize = 2000;
@@ -1552,6 +1552,10 @@ impl App {
 
     /// Texte copié par `y` : le chemin du fichier sous le curseur, sinon le hash du commit.
     pub fn copy_target(&self) -> Option<String> {
+        // Dans la hiérarchie, c'est le nom de la branche sous le curseur.
+        if self.hierarchy.is_some() {
+            return self.selected_branch().map(|branch| branch.name.clone());
+        }
         let file = self.pane.as_ref().and_then(|pane| {
             let FilesState::Ready(files) = &pane.files else { return None };
             files.get(pane.diff.as_ref().map_or(pane.file_sel, |d| d.file))
@@ -1629,6 +1633,15 @@ impl App {
     }
 
     /// Actions de la vue hiérarchie, qui recouvre le reste de l'écran.
+    /// Branche sous le curseur dans la vue hiérarchique.
+    fn selected_branch(&self) -> Option<&hierarchy::Branch> {
+        let view = self.hierarchy.as_ref()?;
+        match &view.state {
+            HierState::Ready { rows, .. } => Some(&rows.get(view.sel)?.branch),
+            _ => None,
+        }
+    }
+
     fn apply_in_hierarchy(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
@@ -1643,12 +1656,16 @@ impl App {
                 }
             }
             Action::Open => {
-                let oid = self.hierarchy.as_ref().and_then(|view| match &view.state {
-                    HierState::Ready { rows, .. } => rows.get(view.sel).map(|r| r.branch.oid),
-                    _ => None,
-                });
-                if let Some(oid) = oid {
+                if let Some(oid) = self.selected_branch().map(|branch| branch.oid) {
                     self.goto_commit(oid);
+                }
+            }
+            Action::CopySelected | Action::CopyHash => {
+                let branch = self.selected_branch().cloned();
+                match (branch, action) {
+                    (Some(branch), Action::CopyHash) => self.copy(branch.oid.to_hex()),
+                    (Some(branch), _) => self.copy(branch.name),
+                    (None, _) => {}
                 }
             }
             _ => {}
